@@ -142,7 +142,7 @@ void BenchmarkInsert(SharedPtr<Infinity> infinity, const String &db_name, const 
 
     profiler.Begin();
     SizeT num_rows = 0;
-    const int batch_size = 500;
+    const int batch_size = 1;
     Vector<Tuple<char *, char *, char *>> batch;
     batch.reserve(batch_size);
 

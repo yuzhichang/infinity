@@ -179,7 +179,7 @@ SizeT MemoryIndexer::CommitSync(SizeT wait_if_empty_ms) {
     u64 seq_commit = this->ring_inverted_.GetBatch(inverters);
     SizeT num_sorted = inverters.size();
     SizeT num_generated = 0;
-    SizeT num_merged = 0;
+    // SizeT num_merged = 0;
     if (num_sorted > 0) {
         ColumnInverter::Merge(inverters);
         inverters[0]->Sort();
@@ -192,7 +192,7 @@ SizeT MemoryIndexer::CommitSync(SizeT wait_if_empty_ms) {
         goto QUIT;
     generating = true;
     this->ring_sorted_.GetBatch(inverters, wait_if_empty_ms);
-    num_merged = inverters.size();
+    // num_merged = inverters.size();
     for (auto &inverter : inverters) {
         inverter->GeneratePosting();
         num_generated += inverter->GetMerged();
