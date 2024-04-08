@@ -410,7 +410,7 @@ void MemoryIndexer::OfflineDump() {
     fs.DeleteFile(fst_file);
 
     String column_length_file = index_prefix + LENGTH_SUFFIX;
-    UniquePtr<FileHandler> file_handler = fs.OpenFile(path, FileFlags::WRITE_FLAG | FileFlags::TRUNCATE_CREATE, FileLockType::kNoLock);
+    UniquePtr<FileHandler> file_handler = fs.OpenFile(column_length_file, FileFlags::WRITE_FLAG | FileFlags::TRUNCATE_CREATE, FileLockType::kNoLock);
     Vector<u32> &unsafe_column_lengths = column_lengths_.UnsafeVec();
     fs.Write(*file_handler, &unsafe_column_lengths[0], sizeof(unsafe_column_lengths[0]) * unsafe_column_lengths.size());
     fs.Close(*file_handler);

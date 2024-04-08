@@ -85,11 +85,6 @@ TEST_F(ColumnInverterTest, Invert) {
     }
     Vector<ExpectedPosting> expected_postings = {{"fst", {0, 1, 2}, {4, 2, 2}}, {"automaton", {0, 3}, {2, 5}}, {"transducer", {0, 4}, {1, 4}}};
 
-    auto fake_segment_index_entry = SegmentIndexEntry::CreateFakeEntry();
-    String folder = "/tmp/infinity/test_column_inverter/chunk1";
-    auto fs = MakeUnique<LocalFileSystem>();
-    fs->CreateDirectory(folder);
-    String column_length_file_path = folder + LENGTH_SUFFIX;
     PostingWriterProvider provider = [this](const String &term) -> SharedPtr<PostingWriter> { return GetOrAddPosting(term); };
     ColumnInverter inverter1("standard", provider, column_lengths_);
     ColumnInverter inverter2("standard", provider, column_lengths_);
