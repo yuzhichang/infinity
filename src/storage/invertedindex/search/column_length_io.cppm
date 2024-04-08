@@ -26,40 +26,6 @@ class IndexReader;
 class FileSystem;
 class FileHandler;
 
-// write array of u32 to file
-// multiple threads will write to different offsets of the file at different times
-export class FullTextColumnLengthFileHandler {
-public:
-    FullTextColumnLengthFileHandler(UniquePtr<FileSystem> file_system, const String &path, SegmentIndexEntry *segment_index_entry);
-    ~FullTextColumnLengthFileHandler();
-    void WriteColumnLength(const u32 *column_length_array, u32 column_length_count, u32 start_from_offset);
-
-private:
-    std::mutex mutex_;
-    UniquePtr<FileSystem> file_system_;
-    UniquePtr<FileHandler> file_handler_;
-    SegmentIndexEntry *segment_index_entry_;
-};
-
-export class FullTextColumnLengthUpdateJob {
-public:
-    FullTextColumnLengthUpdateJob(SharedPtr<FullTextColumnLengthFileHandler> file_handler,
-                                  u32 column_length_count,
-                                  u32 start_from_offset,
-                                  std::shared_mutex &memory_indexer_mutex,
-                                  Vector<u32> &memory_indexer_array);
-    u32 *GetColumnLengthArray() { return column_length_array_.get(); }
-    void DumpToFile();
-
-private:
-    SharedPtr<FullTextColumnLengthFileHandler> file_handler_;
-    UniquePtr<u32[]> column_length_array_;
-    u32 column_length_count_;
-    u32 start_from_offset_;
-    std::shared_mutex &memory_indexer_mutex_;
-    Vector<u32> &memory_indexer_array_;
-};
-
 export class FullTextColumnLengthReader {
 public:
     FullTextColumnLengthReader(UniquePtr<FileSystem> file_system,

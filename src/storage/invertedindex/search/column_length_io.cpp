@@ -30,63 +30,6 @@ import local_file_system;
 
 namespace infinity {
 
-FullTextColumnLengthFileHandler::FullTextColumnLengthFileHandler(UniquePtr<FileSystem> file_system,
-                                                                 const String &path,
-                                                                 SegmentIndexEntry *segment_index_entry)
-    : file_system_(std::move(file_system)), segment_index_entry_(segment_index_entry) {
-    u8 file_flags = FileFlags::WRITE_FLAG | FileFlags::CREATE_FLAG;
-    file_handler_ = file_system_->OpenFile(path, file_flags, FileLockType::kNoLock);
-}
-
-FullTextColumnLengthFileHandler::~FullTextColumnLengthFileHandler() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    file_handler_->Sync();
-    file_handler_->Close();
-}
-
-void FullTextColumnLengthFileHandler::WriteColumnLength(const u32 *column_length_array, u32 column_length_count, u32 start_from_offset) {
-    // 1. update column length info in segment index entry
-    u64 total_column_len_sum = 0;
-    for (u32 i = 0; i < column_length_count; i++) {
-        total_column_len_sum += column_length_array[i];
-    }
-    segment_index_entry_->UpdateFulltextColumnLenInfo(total_column_len_sum, column_length_count);
-    // 2. write column length info to file
-    std::lock_guard<std::mutex> lock(mutex_);
-    file_system_->Seek(*file_handler_, start_from_offset * sizeof(u32));
-    u32 expect_write_count = column_length_count * sizeof(u32);
-    i64 write_count = file_system_->Write(*file_handler_, column_length_array, expect_write_count);
-    if (write_count != expect_write_count) {
-        UnrecoverableError("WriteColumnLength: write_count != expect_write_count");
-    }
-    file_handler_->Sync();
-}
-
-FullTextColumnLengthUpdateJob::FullTextColumnLengthUpdateJob(SharedPtr<FullTextColumnLengthFileHandler> file_handler,
-                                                             u32 column_length_count,
-                                                             u32 start_from_offset,
-                                                             std::shared_mutex &memory_indexer_mutex,
-                                                             Vector<u32> &memory_indexer_array)
-    : file_handler_(std::move(file_handler)), column_length_count_(column_length_count), start_from_offset_(start_from_offset),
-      memory_indexer_mutex_(memory_indexer_mutex), memory_indexer_array_(memory_indexer_array) {
-    column_length_array_ = MakeUniqueForOverwrite<u32[]>(column_length_count);
-}
-
-void FullTextColumnLengthUpdateJob::DumpToFile() {
-    // 1. update column length info in memory indexer
-    {
-        std::unique_lock lock(memory_indexer_mutex_);
-        if (memory_indexer_array_.size() < start_from_offset_ + column_length_count_) {
-            memory_indexer_array_.resize(start_from_offset_ + column_length_count_);
-        }
-        Copy(column_length_array_.get(), column_length_array_.get() + column_length_count_, memory_indexer_array_.data() + start_from_offset_);
-    }
-    // 2. write to file
-    file_handler_->WriteColumnLength(column_length_array_.get(), column_length_count_, start_from_offset_);
-    file_handler_.reset();
-    column_length_array_.reset();
-}
-
 FullTextColumnLengthReader::FullTextColumnLengthReader(UniquePtr<FileSystem> file_system,
                                                        const String &index_dir,
                                                        const Vector<String> &base_names,

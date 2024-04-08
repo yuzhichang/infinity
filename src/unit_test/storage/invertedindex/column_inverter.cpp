@@ -92,23 +92,11 @@ TEST_F(ColumnInverterTest, Invert) {
     auto fs = MakeUnique<LocalFileSystem>();
     fs->CreateDirectory(folder);
     String column_length_file_path = folder + LENGTH_SUFFIX;
-    auto column_length_file_handler =
-        MakeShared<FullTextColumnLengthFileHandler>(std::move(fs), column_length_file_path, fake_segment_index_entry.get());
-    auto update_length_job_1 =
-        MakeShared<FullTextColumnLengthUpdateJob>(column_length_file_handler, 3, 0, column_length_mutex_, column_length_array_);
-    auto update_length_job_2 =
-        MakeShared<FullTextColumnLengthUpdateJob>(std::move(column_length_file_handler), 2, 3, column_length_mutex_, column_length_array_);
     PostingWriterProvider provider = [this](const String &term) -> SharedPtr<PostingWriter> { return GetOrAddPosting(term); };
     ColumnInverter inverter1("standard", provider);
     ColumnInverter inverter2("standard", provider);
     inverter1.InvertColumn(column, 0, 3, 0);
     inverter2.InvertColumn(column, 3, 2, 3);
-    inverter1.GetTermListLength(update_length_job_1->GetColumnLengthArray());
-    inverter2.GetTermListLength(update_length_job_2->GetColumnLengthArray());
-    update_length_job_1->DumpToFile();
-    update_length_job_2->DumpToFile();
-    update_length_job_1.reset();
-    update_length_job_2.reset();
 
     inverter1.Merge(inverter2);
 
