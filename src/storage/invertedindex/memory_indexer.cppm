@@ -29,6 +29,7 @@ import ring;
 import skiplist;
 import internal_types;
 import map_with_lock;
+import vector_with_lock;
 
 namespace infinity {
 
@@ -142,7 +143,6 @@ private:
     bool is_spilled_{false};
 
     // for column length info
-    std::shared_mutex column_length_mutex_;
-    Vector<u32> column_length_array_;
+    VectorWithLock<u32> column_lengths_;
 };
 } // namespace infinity

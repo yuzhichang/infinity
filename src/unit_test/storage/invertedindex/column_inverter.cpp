@@ -32,7 +32,7 @@ import internal_types;
 import logical_type;
 import local_file_system;
 import segment_index_entry;
-import column_length_io;
+import vector_with_lock;
 
 using namespace infinity;
 
@@ -42,8 +42,7 @@ protected:
     RecyclePool buffer_pool_{};
     optionflag_t flag_{OPTION_FLAG_ALL};
     Map<String, SharedPtr<PostingWriter>> postings_;
-    std::shared_mutex column_length_mutex_;
-    Vector<u32> column_length_array_;
+    VectorWithLock<u32> column_lengths_;
 
 public:
     struct ExpectedPosting {
@@ -62,8 +61,7 @@ public:
         if (it != postings_.end()) {
             return it->second;
         }
-        SharedPtr<PostingWriter> posting =
-            MakeShared<PostingWriter>(&byte_slice_pool_, &buffer_pool_, PostingFormatOption(flag_), column_length_mutex_, column_length_array_);
+        SharedPtr<PostingWriter> posting = MakeShared<PostingWriter>(&byte_slice_pool_, &buffer_pool_, PostingFormatOption(flag_), column_lengths_);
         postings_[term] = posting;
         return posting;
     }
@@ -93,8 +91,8 @@ TEST_F(ColumnInverterTest, Invert) {
     fs->CreateDirectory(folder);
     String column_length_file_path = folder + LENGTH_SUFFIX;
     PostingWriterProvider provider = [this](const String &term) -> SharedPtr<PostingWriter> { return GetOrAddPosting(term); };
-    ColumnInverter inverter1("standard", provider);
-    ColumnInverter inverter2("standard", provider);
+    ColumnInverter inverter1("standard", provider, column_lengths_);
+    ColumnInverter inverter2("standard", provider, column_lengths_);
     inverter1.InvertColumn(column, 0, 3, 0);
     inverter2.InvertColumn(column, 3, 2, 3);
 

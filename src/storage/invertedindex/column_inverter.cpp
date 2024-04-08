@@ -29,6 +29,7 @@ import term;
 import radix_sort;
 import index_defines;
 import posting_writer;
+import vector_with_lock;
 import infinity_exception;
 import third_party;
 import status;
@@ -41,8 +42,8 @@ static u32 Align(u32 unaligned) {
     return (unaligned + T - 1) & (-T);
 }
 
-ColumnInverter::ColumnInverter(const String &analyzer, PostingWriterProvider posting_writer_provider)
-    : analyzer_(AnalyzerPool::instance().Get(analyzer)), posting_writer_provider_(posting_writer_provider) {
+ColumnInverter::ColumnInverter(const String &analyzer, PostingWriterProvider posting_writer_provider, VectorWithLock<u32> &column_lengths)
+    : analyzer_(AnalyzerPool::instance().Get(analyzer)), posting_writer_provider_(posting_writer_provider), column_lengths_(column_lengths) {
     if (analyzer_.get() == nullptr) {
         RecoverableError(Status::UnexpectedError(fmt::format("Invalid analyzer: {}", analyzer)));
     }
@@ -55,16 +56,20 @@ bool ColumnInverter::CompareTermRef::operator()(const u32 lhs, const u32 rhs) co
 void ColumnInverter::InvertColumn(SharedPtr<ColumnVector> column_vector, u32 row_offset, u32 row_count, u32 begin_doc_id) {
     begin_doc_id_ = begin_doc_id;
     doc_count_ = row_count;
+    Vector<u32> column_lengths(row_count);
     for (SizeT i = 0; i < row_count; ++i) {
         String data = column_vector->ToString(row_offset + i);
-        InvertColumn(begin_doc_id + i, data);
+        column_lengths[i] = InvertColumn(begin_doc_id + i, data);
     }
+    column_lengths_.SetBatch(begin_doc_id, column_lengths);
 }
 
-void ColumnInverter::InvertColumn(u32 doc_id, const String &val) {
+SizeT ColumnInverter::InvertColumn(u32 doc_id, const String &val) {
     auto terms_once_ = MakeUnique<TermList>();
     analyzer_->Analyze(val, *terms_once_);
+    SizeT term_count = terms_once_->size();
     terms_per_doc_.push_back(Pair<u32, UniquePtr<TermList>>(doc_id, std::move(terms_once_)));
+    return term_count;
 }
 
 u32 ColumnInverter::AddTerm(StringRef term) {
@@ -122,12 +127,6 @@ void ColumnInverter::Merge(Vector<SharedPtr<ColumnInverter>> &inverters) {
     for (SizeT i = 1; i < end; i++) {
         SharedPtr<ColumnInverter> &rhs = inverters[i];
         inverters[0]->Merge(*rhs);
-    }
-}
-
-void ColumnInverter::GetTermListLength(u32 *term_list_length_ptr) const {
-    for (const auto &[_, term_list] : terms_per_doc_) {
-        *(term_list_length_ptr++) = term_list->size();
     }
 }
 

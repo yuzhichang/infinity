@@ -26,6 +26,7 @@ import column_index_merger;
 import internal_types;
 import logical_type;
 import infinity_exception;
+import vector_with_lock;
 
 using namespace infinity;
 
@@ -154,15 +155,14 @@ TEST_F(PostingMergerTest, Basic) {
         merge_base_rowid = std::min(merge_base_rowid, row_id);
     }
 
-    std::shared_mutex column_length_mutex;
-    Vector<u32> column_length_array;
+    VectorWithLock<u32> column_length_array;
+    Vector<u32> &unsafe_column_length_array = column_length_array.UnsafeVec();
     {
         LocalFileSystem fs;
         // prepare column length info
         // the indexes to be merged should be from the same segment
         // otherwise the range of row_id will be very large ( >= 2^32)
-        std::unique_lock<std::shared_mutex> lock(column_length_mutex);
-        column_length_array.clear();
+        unsafe_column_length_array.clear();
         for (u32 i = 0; i < base_names.size(); ++i) {
             String column_len_file = (Path(index_dir) / base_names[i]).string() + LENGTH_SUFFIX;
             RowID base_row_id = row_ids[i];
@@ -170,8 +170,8 @@ TEST_F(PostingMergerTest, Basic) {
             UniquePtr<FileHandler> file_handler = fs.OpenFile(column_len_file, FileFlags::READ_FLAG, FileLockType::kNoLock);
             const u32 file_size = fs.GetFileSize(*file_handler);
             u32 file_read_array_len = file_size / sizeof(u32);
-            column_length_array.resize(id_offset + file_read_array_len);
-            const i64 read_count = fs.Read(*file_handler, column_length_array.data() + id_offset, file_size);
+            unsafe_column_length_array.resize(id_offset + file_read_array_len);
+            const i64 read_count = fs.Read(*file_handler, unsafe_column_length_array.data() + id_offset, file_size);
             file_handler->Close();
             if (read_count != file_size) {
                 UnrecoverableError("ColumnIndexMerger: when loading column length file, read_count != file_size");
@@ -179,7 +179,7 @@ TEST_F(PostingMergerTest, Basic) {
         }
     }
 
-    auto posting_merger = MakeShared<PostingMerger>(memory_pool_, buffer_pool_, flag_, column_length_mutex, column_length_array);
+    auto posting_merger = MakeShared<PostingMerger>(memory_pool_, buffer_pool_, flag_, column_length_array);
 
     posting_merger->Merge(segment_term_postings, merge_base_rowid);
     EXPECT_EQ(posting_merger->GetDF(), static_cast<u32>(2));

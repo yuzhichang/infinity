@@ -53,6 +53,7 @@ import file_reader;
 import logger;
 import file_system;
 import file_system_type;
+import vector_with_lock;
 
 namespace infinity {
 constexpr int MAX_TUPLE_LENGTH = 1024; // we assume that analyzed term, together with docid/offset info, will never exceed such length
@@ -75,7 +76,7 @@ MemoryIndexer::MemoryIndexer(const String &index_dir,
     : index_dir_(index_dir), base_name_(base_name), base_row_id_(base_row_id), flag_(flag), analyzer_(analyzer), byte_slice_pool_(byte_slice_pool),
       buffer_pool_(buffer_pool), thread_pool_(thread_pool), ring_inverted_(13UL), ring_sorted_(13UL) {
     posting_table_ = MakeShared<PostingTable>();
-    prepared_posting_ = MakeShared<PostingWriter>(nullptr, nullptr, PostingFormatOption(flag_), column_length_mutex_, column_length_array_);
+    prepared_posting_ = MakeShared<PostingWriter>(nullptr, nullptr, PostingFormatOption(flag_), column_lengths_);
     Path path = Path(index_dir) / "tmp.merge";
     spill_full_path_ = path.string();
 }
@@ -98,25 +99,22 @@ void MemoryIndexer::Insert(SharedPtr<ColumnVector> column_vector, u32 row_offset
         seq_inserted = seq_inserted_++;
         doc_count = doc_count_;
         doc_count_ += row_count;
-        column_length_array_.resize(doc_count_);
     }
     auto task = MakeShared<BatchInvertTask>(seq_inserted, column_vector, row_offset, row_count, doc_count);
     if (offline) {
-        auto inverter = MakeShared<ColumnInverter>(this->analyzer_, nullptr);
+        auto inverter = MakeShared<ColumnInverter>(this->analyzer_, nullptr, column_lengths_);
         auto func = [this, task, inverter](int id) {
             inverter->InvertColumn(task->column_vector_, task->row_offset_, task->row_count_, task->start_doc_id_);
-            inverter->GetTermListLength(&this->column_length_array_[task->start_doc_id_]);
             inverter->SortForOfflineDump();
             this->ring_sorted_.Put(task->task_seq_, inverter);
         };
         thread_pool_.push(std::move(func));
     } else {
         PostingWriterProvider provider = [this](const String &term) -> SharedPtr<PostingWriter> { return GetOrAddPosting(term); };
-        auto inverter = MakeShared<ColumnInverter>(this->analyzer_, provider);
+        auto inverter = MakeShared<ColumnInverter>(this->analyzer_, provider, column_lengths_);
         auto func = [this, task, inverter](int id) {
             // LOG_INFO(fmt::format("online inverter {} begin", id));
             inverter->InvertColumn(task->column_vector_, task->row_offset_, task->row_count_, task->start_doc_id_);
-            inverter->GetTermListLength(&this->column_length_array_[task->start_doc_id_]);
             this->ring_inverted_.Put(task->task_seq_, inverter);
             // LOG_INFO(fmt::format("online inverter {} end", id));
         };
@@ -261,8 +259,9 @@ void MemoryIndexer::Dump(bool offline, bool spill) {
     }
 
     String column_length_file = index_prefix + LENGTH_SUFFIX + (spill ? SPILL_SUFFIX : "");
-    UniquePtr<FileHandler> file_handler = fs.OpenFile(path, FileFlags::WRITE_FLAG | FileFlags::TRUNCATE_CREATE, FileLockType::kNoLock);
-    fs.Write(*file_handler, &column_length_array_[0], sizeof(column_length_array_[0]) * column_length_array_.size());
+    UniquePtr<FileHandler> file_handler = fs.OpenFile(column_length_file, FileFlags::WRITE_FLAG | FileFlags::TRUNCATE_CREATE, FileLockType::kNoLock);
+    Vector<u32> &column_length_array = column_lengths_.UnsafeVec();
+    fs.Write(*file_handler, &column_length_array[0], sizeof(column_length_array[0]) * column_length_array.size());
     fs.Close(*file_handler);
 
     is_spilled_ = spill;
@@ -295,8 +294,9 @@ void MemoryIndexer::Load() {
 
     String column_length_file = index_prefix + LENGTH_SUFFIX + SPILL_SUFFIX;
     UniquePtr<FileHandler> file_handler = fs.OpenFile(path, FileFlags::READ_FLAG, FileLockType::kNoLock);
-    column_length_array_.resize(doc_count_);
-    fs.Read(*file_handler, &column_length_array_[0], sizeof(column_length_array_[0]) * column_length_array_.size());
+    Vector<u32> &column_length_array = column_lengths_.UnsafeVec();
+    column_length_array.Resize(doc_count_);
+    fs.Read(*file_handler, &column_length_array[0], sizeof(column_length_array[0]) * column_length_array.size());
     fs.Close(*file_handler);
 
     is_spilled_ = false;
@@ -308,7 +308,7 @@ SharedPtr<PostingWriter> MemoryIndexer::GetOrAddPosting(const String &term) {
     PostingPtr posting;
     bool found = posting_store.GetOrAdd(term, posting, prepared_posting_);
     if (!found) {
-        prepared_posting_ = MakeShared<PostingWriter>(nullptr, nullptr, PostingFormatOption(flag_), column_length_mutex_, column_length_array_);
+        prepared_posting_ = MakeShared<PostingWriter>(nullptr, nullptr, PostingFormatOption(flag_), column_lengths_);
     }
     return posting;
 }
@@ -317,7 +317,7 @@ void MemoryIndexer::Reset() {
     if (posting_table_.get()) {
         posting_table_->store_.Clear();
     }
-    column_length_array_.clear();
+    column_lengths_.Clear();
 }
 
 void MemoryIndexer::OfflineDump() {
@@ -379,8 +379,7 @@ void MemoryIndexer::OfflineDump() {
                 term_meta_dumpler.Dump(dict_file_writer, term_meta);
                 fst_builder.Insert((u8 *)last_term.data(), last_term.length(), term_meta_offset);
             }
-            posting =
-                MakeUnique<PostingWriter>(&byte_slice_pool_, &buffer_pool_, PostingFormatOption(flag_), column_length_mutex_, column_length_array_);
+            posting = MakeUnique<PostingWriter>(&byte_slice_pool_, &buffer_pool_, PostingFormatOption(flag_), column_length_mutex_, column_lengths_);
             // printf("\nswitched-term-%d-<%s>\n", i.term_num_, term.data());
             last_term_str = String(tuple.term_);
             last_term = std::string_view(last_term_str);
@@ -412,7 +411,8 @@ void MemoryIndexer::OfflineDump() {
 
     String column_length_file = index_prefix + LENGTH_SUFFIX;
     UniquePtr<FileHandler> file_handler = fs.OpenFile(path, FileFlags::WRITE_FLAG | FileFlags::TRUNCATE_CREATE, FileLockType::kNoLock);
-    fs.Write(*file_handler, &column_length_array_[0], sizeof(column_length_array_[0]) * column_length_array_.size());
+    Vector<u32> &unsafe_column_lengths = column_lengths_.UnsafeVec();
+    fs.Write(*file_handler, &unsafe_column_lengths[0], sizeof(unsafe_column_lengths[0]) * unsafe_column_lengths.size());
     fs.Close(*file_handler);
 
     std::filesystem::remove(spill_full_path_);
