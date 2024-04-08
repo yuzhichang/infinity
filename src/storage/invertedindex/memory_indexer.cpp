@@ -293,7 +293,7 @@ void MemoryIndexer::Load() {
     }
 
     String column_length_file = index_prefix + LENGTH_SUFFIX + SPILL_SUFFIX;
-    UniquePtr<FileHandler> file_handler = fs.OpenFile(path, FileFlags::READ_FLAG, FileLockType::kNoLock);
+    UniquePtr<FileHandler> file_handler = fs.OpenFile(column_length_file, FileFlags::READ_FLAG, FileLockType::kNoLock);
     Vector<u32> &column_lengths = column_lengths_.UnsafeVec();
     column_lengths.resize(doc_count_);
     fs.Read(*file_handler, &column_lengths[0], sizeof(column_lengths[0]) * column_lengths.size());

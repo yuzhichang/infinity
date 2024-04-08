@@ -114,7 +114,7 @@ TEST_F(MemoryIndexerTest, Insert) {
         indexer1("/tmp/infinity/fulltext_tbl1_col1", "chunk1", RowID(0U, 0U), flag_, "standard", byte_slice_pool_, buffer_pool_, thread_pool_);
     indexer1.Insert(column_, 0, 1);
     indexer1.Insert(column_, 1, 3);
-    indexer1.Dump();
+    indexer1.ump();
 
     auto indexer2 = MakeUnique<MemoryIndexer>("/tmp/infinity/fulltext_tbl1_col1",
                                               "chunk2",
