@@ -294,9 +294,9 @@ void MemoryIndexer::Load() {
 
     String column_length_file = index_prefix + LENGTH_SUFFIX + SPILL_SUFFIX;
     UniquePtr<FileHandler> file_handler = fs.OpenFile(path, FileFlags::READ_FLAG, FileLockType::kNoLock);
-    Vector<u32> &column_length_array = column_lengths_.UnsafeVec();
-    column_length_array.Resize(doc_count_);
-    fs.Read(*file_handler, &column_length_array[0], sizeof(column_length_array[0]) * column_length_array.size());
+    Vector<u32> &column_lengths = column_lengths_.UnsafeVec();
+    column_lengths.resize(doc_count_);
+    fs.Read(*file_handler, &column_lengths[0], sizeof(column_lengths[0]) * column_lengths.size());
     fs.Close(*file_handler);
 
     is_spilled_ = false;
@@ -379,7 +379,7 @@ void MemoryIndexer::OfflineDump() {
                 term_meta_dumpler.Dump(dict_file_writer, term_meta);
                 fst_builder.Insert((u8 *)last_term.data(), last_term.length(), term_meta_offset);
             }
-            posting = MakeUnique<PostingWriter>(&byte_slice_pool_, &buffer_pool_, PostingFormatOption(flag_), column_length_mutex_, column_lengths_);
+            posting = MakeUnique<PostingWriter>(&byte_slice_pool_, &buffer_pool_, PostingFormatOption(flag_), column_lengths_);
             // printf("\nswitched-term-%d-<%s>\n", i.term_num_, term.data());
             last_term_str = String(tuple.term_);
             last_term = std::string_view(last_term_str);
