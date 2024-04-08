@@ -88,11 +88,11 @@ QueryResult QueryContext::Query(const String &query) {
 
     if (parsed_result->IsError()) {
         StopProfile(QueryPhase::kParser);
-        UnrecoverableError(parsed_result->error_message_);
+        RecoverableError(Status::ParserError(parsed_result->error_message_));
     }
 
     if (parsed_result->statements_ptr_->size() != 1) {
-        UnrecoverableError("Only support single statement.");
+        RecoverableError(Status::ParserError("Only support single statement."));
     }
     StopProfile(QueryPhase::kParser);
     for (BaseStatement *statement : *parsed_result->statements_ptr_) {
