@@ -32,7 +32,7 @@ import simd_init;
 
 namespace {
 
-#define THRIFT_SERVER_TYPE 0
+#define THRIFT_SERVER_TYPE 1
 
 #if THRIFT_SERVER_TYPE == 0
 
@@ -230,7 +230,7 @@ auto main(int argc, char **argv) -> int {
 
 #elif THRIFT_SERVER_TYPE == 1
 
-    non_block_pool_thrift_server.join();
+    non_block_pool_thrift_thread.join();
 
 #else
 

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from thrift.protocol import TBinaryProtocol
-from thrift.protocol import TCompactProtocol
 from thrift.transport import TSocket
 from thrift.transport.TTransport import TTransportException
 
@@ -39,9 +38,9 @@ class ThriftInfinityClient:
         if self.transport is not None:
             self.transport.close()
             self.transport = None
-        # self.transport = TTransport.TFramedTransport(TSocket.TSocket(self.uri.ip, self.uri.port))  # async
-        self.transport = TTransport.TBufferedTransport(
-            TSocket.TSocket(self.uri.ip, self.uri.port))  # sync
+        self.transport = TTransport.TFramedTransport(TSocket.TSocket(self.uri.ip, self.uri.port))  # async
+        #self.transport = TTransport.TBufferedTransport(
+        #    TSocket.TSocket(self.uri.ip, self.uri.port))  # sync
         self.protocol = TBinaryProtocol.TBinaryProtocol(self.transport)
         # self.protocol = TCompactProtocol.TCompactProtocol(self.transport)
         self.client = InfinityService.Client(self.protocol)
