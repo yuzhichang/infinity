@@ -17,6 +17,57 @@ import third_party;
 
 namespace infinity {
 
+void BlockMaxPhraseDocIterator::UpdateScoreThreshold(float threshold) {
+    EarlyTerminateIterator::UpdateScoreThreshold(threshold);
+    const float base_threshold = threshold - BM25ScoreUpperBound();
+    for (auto &it : term_doc_iters_) {
+        float new_threshold = std::max(0.0f, base_threshold + it->BM25ScoreUpperBound());
+        it-> UpdateScoreThreshold(new_threshold);
+    }
+}
+
+bool BlockMaxPhraseDocIterator::NextShallow(RowID doc_id){
+    assert(doc_id != INVALID_ROWID);
+    for (auto &it : term_doc_iters_) {
+        bool ok = it->NextShallow(doc_id);
+        if(!ok){
+            return false;
+        }
+    }
+    return true;
+}
+
+bool BlockMaxPhraseDocIterator::Next(RowID doc_id){
+    assert(doc_id != INVALID_ROWID);
+    assert(doc_id_ == INVALID_ROWID || doc_id_ < doc_id);
+    RowID target_doc_id = doc_id;
+    float sum_score = 0.0f;
+    bool breaked = false;
+    do {
+        sum_score = 0.0f;
+        breaked = false;
+        for (auto &it : term_doc_iters_) {
+            bool ok = it->Next(target_doc_id);
+            if(!ok){
+                return false;
+            }
+            RowID new_doc_id = it->DocID();
+            if(new_doc_id > target_doc_id){
+                target_doc_id = new_doc_id;
+                breaked = true;
+                break;
+            }
+            sum_score += it->BM25Score();
+        }
+        if (!breaked && sum_score <= threshold_){
+            target_doc_id++;
+            breaked = true;
+        }
+    } while(breaked);
+    doc_id_ = target_doc_id;
+    return true;
+}
+
 bool BlockMaxPhraseDocIterator::BlockSkipTo(RowID doc_id, float threshold) {
     if (threshold > BM25ScoreUpperBound()) [[unlikely]] {
         return false;

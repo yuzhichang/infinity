@@ -14,7 +14,7 @@
 
 module;
 
-export module blockmax_and_not_iterator;
+export module blockmax_wand_iterator;
 import stl;
 import index_defines;
 import early_terminate_iterator;
@@ -22,46 +22,52 @@ import internal_types;
 
 namespace infinity {
 
-export class BlockMaxAndNotIterator final : public EarlyTerminateIterator {
+// Refers to https://engineering.nyu.edu/~suel/papers/bmw.pdf
+export class BlockMaxWandIterator final : public EarlyTerminateIterator {
 public:
-    explicit BlockMaxAndNotIterator(Vector<UniquePtr<EarlyTerminateIterator>> iterators) : inner_iterators_(std::move(iterators)) {
-        doc_freq_ = inner_iterators_[0]->DocFreq();
-        bm25_score_upper_bound_ = inner_iterators_[0]->BM25ScoreUpperBound();
-    }
+    explicit BlockMaxWandIterator(Vector<UniquePtr<EarlyTerminateIterator>> iterators);
 
-    void UpdateScoreThreshold(float threshold) override {
-        EarlyTerminateIterator::UpdateScoreThreshold(threshold);
-        return inner_iterators_[0]->UpdateScoreThreshold(threshold);
-    }
+    ~BlockMaxWandIterator() override;
+
+    void UpdateScoreThreshold(float threshold) override;
 
     bool NextShallow(RowID doc_id) override;
 
     bool Next(RowID doc_id) override;
 
-    bool BlockSkipTo(RowID doc_id, float threshold) override { return inner_iterators_[0]->BlockSkipTo(doc_id, threshold); }
+    bool BlockSkipTo(RowID doc_id, float threshold) override;
 
     // following functions are available only after BlockSkipTo() is called
 
-    RowID BlockMinPossibleDocID() const override { return inner_iterators_[0]->BlockMinPossibleDocID(); }
+    RowID BlockMinPossibleDocID() const override { return common_block_min_possible_doc_id_; }
 
-    RowID BlockLastDocID() const override { return inner_iterators_[0]->BlockLastDocID(); }
+    RowID BlockLastDocID() const override { return common_block_last_doc_id_; }
 
-    float BlockMaxBM25Score() override { return inner_iterators_[0]->BlockMaxBM25Score(); }
+    float BlockMaxBM25Score() override { return common_block_max_bm25_score_; }
 
     Pair<bool, RowID> SeekInBlockRange(RowID doc_id, RowID doc_id_no_beyond) override;
     Tuple<bool, float, RowID> SeekInBlockRange(RowID doc_id, RowID doc_id_no_beyond, float threshold) override;
-    float BM25Score() override { return inner_iterators_[0]->BM25Score(); }
+    float BM25Score() override;
 
     Pair<bool, RowID> PeekInBlockRange(RowID doc_id, RowID doc_id_no_beyond) override;
 
     bool NotPartCheckExist(RowID doc_id) override;
 
     void PrintTree(std::ostream &os, const String &prefix, bool is_final) const override {
-        return MultiQueryEarlyTerminateIteratorCommonPrintTree(this, "BlockMaxAndNotIterator", inner_iterators_, os, prefix, is_final);
+        return MultiQueryEarlyTerminateIteratorCommonPrintTree(this, "BlockMaxWandIterator", sorted_iterators_, os, prefix, is_final);
     }
 
 private:
-    Vector<UniquePtr<EarlyTerminateIterator>> inner_iterators_; // first: iter, others: "not" part
+    // block max info
+    RowID common_block_min_possible_doc_id_{}; // not always exist
+    RowID common_block_last_doc_id_{};
+    float common_block_max_bm25_score_{};
+    Vector<UniquePtr<EarlyTerminateIterator>> sorted_iterators_; // sort by DocID(), in ascending order
+    Vector<UniquePtr<EarlyTerminateIterator>> backup_iterators_;
+    SizeT pivot_;
+    // bm25 score cache
+    bool bm25_score_cached_ = false;
+    float bm25_score_cache_ = 0.0f;
 };
 
 } // namespace infinity

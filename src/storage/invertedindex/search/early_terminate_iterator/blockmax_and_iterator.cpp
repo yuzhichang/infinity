@@ -38,13 +38,66 @@ BlockMaxAndIterator::BlockMaxAndIterator(Vector<UniquePtr<EarlyTerminateIterator
 }
 
 void BlockMaxAndIterator::UpdateScoreThreshold(float threshold) {
-    if (threshold < 0) {
-        return;
-    }
+    EarlyTerminateIterator::UpdateScoreThreshold(threshold);
     const float base_threshold = threshold - BM25ScoreUpperBound();
     for (const auto &it : sorted_iterators_) {
-        it->UpdateScoreThreshold(base_threshold + it->BM25ScoreUpperBound());
+        float new_threshold = std::max(0.0f, base_threshold + it->BM25ScoreUpperBound());
+        it->UpdateScoreThreshold(new_threshold);
     }
+}
+
+bool BlockMaxAndIterator::NextShallow(RowID doc_id){
+    assert(doc_id != INVALID_ROWID);
+    common_block_last_doc_id_ = INVALID_ROWID;
+    for (const auto &it : sorted_iterators_) {
+        bool ok = it->NextShallow(doc_id);
+        if(!ok){
+            common_block_min_possible_doc_id_ = INVALID_ROWID;
+            common_block_last_doc_id_ = INVALID_ROWID;
+            return false;
+        }
+        if (common_block_last_doc_id_ > it->BlockLastDocID()){
+            common_block_last_doc_id_ = it->BlockLastDocID();
+        }
+    }
+    common_block_min_possible_doc_id_ = doc_id;
+    return true;
+}
+
+bool BlockMaxAndIterator::Next(RowID doc_id){
+    assert(doc_id != INVALID_ROWID);
+    bm25_score_cached_ = false;
+    assert(doc_id_ == INVALID_ROWID || doc_id_ < doc_id);
+    RowID target_doc_id = doc_id;
+    float sum_score = 0.0f;
+    bool breaked = false;
+    do {
+        sum_score = 0.0f;
+        breaked = false;
+        for (const auto &it : sorted_iterators_) {
+            bool ok = it->Next(target_doc_id);
+            if(!ok){
+                doc_id_ = INVALID_ROWID;
+                return false;
+            }
+            RowID new_doc_id = it->DocID();
+            assert(new_doc_id >= doc_id && new_doc_id != INVALID_ROWID);
+            if(new_doc_id > target_doc_id){
+                target_doc_id = new_doc_id;
+                breaked = true;
+                break;
+            }
+            sum_score += it->BM25Score();
+        }
+        if (!breaked && sum_score <= threshold_){
+            target_doc_id++;
+            breaked = true;
+        }
+    } while(breaked);
+    doc_id_ = target_doc_id;
+    bm25_score_cache_ = sum_score;
+    bm25_score_cached_ = true;
+    return true;
 }
 
 bool BlockMaxAndIterator::BlockSkipTo(RowID doc_id, float threshold) {

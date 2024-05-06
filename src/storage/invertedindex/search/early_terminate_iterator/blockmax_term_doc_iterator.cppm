@@ -38,7 +38,9 @@ public:
 
     void MultiplyWeight(float factor) { weight_ *= factor; }
 
-    void UpdateScoreThreshold(float threshold) override {} // do nothing
+    bool NextShallow(RowID doc_id) override;
+
+    bool Next(RowID doc_id) override;
 
     bool BlockSkipTo(RowID doc_id, float threshold) override;
 
@@ -101,6 +103,7 @@ private:
     u32 peek_cnt_ = 0;
     u32 block_skip_cnt_ = 0;
     u32 block_skip_cnt_inner_ = 0;
+    RowID last_target_doc_id_ = INVALID_ROWID;
 };
 
 } // namespace infinity

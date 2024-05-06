@@ -365,6 +365,64 @@ public:
         doc_freq_ = std::numeric_limits<u32>::max();
     }
     void UpdateScoreThreshold(float threshold) override { query_iterator_->UpdateScoreThreshold(threshold); }
+
+    bool NextShallow(RowID doc_id) override {
+        assert(doc_id != INVALID_ROWID);
+        while (true) {
+            if (!query_iterator_->NextShallow(doc_id)) {
+                common_block_min_possible_doc_id_ = INVALID_ROWID;
+                common_block_last_doc_id_ = INVALID_ROWID;
+                return false;
+            }
+            if (const RowID lowest_possible = query_iterator_->BlockMinPossibleDocID(); lowest_possible > doc_id) {
+                doc_id = lowest_possible;
+            }
+            RowID common_block_last_doc_id = query_iterator_->BlockLastDocID();
+            if (!SelfBlockSkipTo(doc_id)) {
+                common_block_min_possible_doc_id_ = INVALID_ROWID;
+                common_block_last_doc_id_ = INVALID_ROWID;
+                return false;
+            }
+            if (const RowID lowest_possible = SelfBlockMinPossibleDocID(); lowest_possible > common_block_last_doc_id) {
+                // continue loop
+                doc_id = common_block_last_doc_id + 1;
+                continue;
+            } else if (lowest_possible > doc_id) {
+                doc_id = lowest_possible;
+            }
+            common_block_last_doc_id = std::min(common_block_last_doc_id, SelfBlockLastDocID());
+            common_block_min_possible_doc_id_ = doc_id;
+            common_block_last_doc_id_ = common_block_last_doc_id;
+            return true;
+        }
+    }
+
+    bool Next(RowID doc_id) override {
+        while (true) {
+            bool ok = NextShallow(doc_id);
+            if (!ok){
+                doc_id_ = INVALID_ROWID;
+                return false;
+            }
+            query_iterator_->Next(doc_id);
+            doc_id = query_iterator_->DocID();
+            // check filter
+            const auto [success2, id2] = SelfSeekInBlockRange(doc_id, BlockLastDocID());
+            if (success2) {
+                if (id2 == doc_id) {
+                    doc_id_ = id2;
+                    return true;
+                }
+                assert(id2 > doc_id);
+                doc_id = id2;
+            } else {
+                assert(id2 == INVALID_ROWID);
+                doc_id_ = INVALID_ROWID;
+                return false;
+            }
+        }
+    }
+
     RowID BlockMinPossibleDocID() const override { return common_block_min_possible_doc_id_; }
     RowID BlockLastDocID() const override { return common_block_last_doc_id_; }
     bool BlockSkipTo(RowID doc_id, float threshold) override {
@@ -392,14 +450,8 @@ public:
             return true;
         }
     }
-    float BlockMaxBM25Score() override {
-        UnrecoverableError("Unreachable code!");
-        return 0.0f;
-    }
-    float BM25Score() override {
-        UnrecoverableError("Unreachable code!");
-        return 0.0f;
-    }
+    float BlockMaxBM25Score() override { return query_iterator_->BlockMaxBM25Score(); }
+    float BM25Score() override { return query_iterator_->BM25Score(); }
     Pair<bool, RowID> SeekInBlockRange(RowID doc_id, RowID doc_id_no_beyond) override {
         UnrecoverableError("Unreachable code!");
         return {false, INVALID_ROWID};
@@ -497,11 +549,13 @@ void ASSERT_FLOAT_EQ(float bar, u32 i, float a, float b) {
 void ExecuteFTSearch(UniquePtr<EarlyTerminateIterator> &et_iter, FullTextScoreResultHeap &result_heap, u32 &blockmax_loop_cnt) {
     if (et_iter) {
         while (true) {
-            auto [id, et_score] = et_iter->BlockNextWithThreshold(result_heap.GetScoreThreshold());
-            if (id == INVALID_ROWID) [[unlikely]] {
+            ++blockmax_loop_cnt;
+            bool ok = et_iter->Next();
+            if (!ok) [[unlikely]] {
                 break;
             }
-            ++blockmax_loop_cnt;
+            RowID id = et_iter->DocID();
+            float et_score = et_iter->BM25Score();
             if (result_heap.AddResult(et_score, id)) {
                 // update threshold
                 if (const float new_threshold = result_heap.GetScoreThreshold(); new_threshold > 0.0f) {

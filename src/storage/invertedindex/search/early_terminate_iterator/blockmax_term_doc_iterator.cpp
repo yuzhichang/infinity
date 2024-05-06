@@ -56,6 +56,32 @@ bool BlockMaxTermDocIterator::InitPostingIterator(SharedPtr<Vector<SegmentPostin
     return false;
 }
 
+bool BlockMaxTermDocIterator::NextShallow(RowID doc_id){
+    assert(doc_id != INVALID_ROWID);
+    return iter_.SkipTo(doc_id);
+}
+
+bool BlockMaxTermDocIterator::Next(RowID doc_id){
+    assert(doc_id != INVALID_ROWID);
+    assert(last_target_doc_id_ == INVALID_ROWID || doc_id > doc_id_);
+    last_target_doc_id_ = doc_id;
+    RowID target_doc_id = doc_id;
+    do{
+        target_doc_id = iter_.SeekDoc(target_doc_id);
+        if (target_doc_id == INVALID_ROWID) {
+            break;
+        }
+        float score = this->BM25Score();
+        if(score > threshold_){
+            break;
+        }
+        target_doc_id++;
+    } while(1);
+    doc_id_ = target_doc_id;
+    return (doc_id_ != INVALID_ROWID);
+}
+
+
 bool BlockMaxTermDocIterator::BlockSkipTo(RowID doc_id, float threshold) {
     ++block_skip_cnt_;
     if (threshold > BM25ScoreUpperBound()) [[unlikely]] {
