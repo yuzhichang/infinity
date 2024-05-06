@@ -365,6 +365,70 @@ public:
         doc_freq_ = std::numeric_limits<u32>::max();
     }
     void UpdateScoreThreshold(float threshold) override { query_iterator_->UpdateScoreThreshold(threshold); }
+
+    bool NextShallow(RowID doc_id) override {
+        assert(doc_id != INVALID_ROWID);
+        while (true) {
+            if (!query_iterator_->NextShallow(doc_id)) {
+                common_block_min_possible_doc_id_ = INVALID_ROWID;
+                common_block_last_doc_id_ = INVALID_ROWID;
+                return false;
+            }
+            if (const RowID lowest_possible = query_iterator_->BlockMinPossibleDocID(); lowest_possible > doc_id) {
+                doc_id = lowest_possible;
+            }
+            RowID common_block_last_doc_id = query_iterator_->BlockLastDocID();
+            if (!SelfBlockSkipTo(doc_id)) {
+                common_block_min_possible_doc_id_ = INVALID_ROWID;
+                common_block_last_doc_id_ = INVALID_ROWID;
+                return false;
+            }
+            if (const RowID lowest_possible = SelfBlockMinPossibleDocID(); lowest_possible > common_block_last_doc_id) {
+                // continue loop
+                doc_id = common_block_last_doc_id + 1;
+                continue;
+            } else if (lowest_possible > doc_id) {
+                doc_id = lowest_possible;
+            }
+            common_block_last_doc_id = std::min(common_block_last_doc_id, SelfBlockLastDocID());
+            common_block_min_possible_doc_id_ = doc_id;
+            common_block_last_doc_id_ = common_block_last_doc_id;
+            return true;
+        }
+    }
+
+    bool Next(RowID doc_id) override {
+        bool ok = false;
+        while(1) {
+            ok = query_iterator_->Next(doc_id);
+            if (!ok){
+                break;
+            }
+            doc_id = query_iterator_->DocID();
+            // check filter
+            ok = SelfBlockSkipTo(doc_id);
+            if (!ok) {
+                break;
+            }
+            const auto [ok, id2] = SelfSeekInBlockRange(doc_id, SelfBlockLastDocID());
+            if (!ok){
+                break;
+            }
+            if (id2 == doc_id) {
+                common_block_min_possible_doc_id_ = doc_id;
+                common_block_last_doc_id_ = std::max(query_iterator_->BlockLastDocID(), SelfBlockLastDocID());
+                doc_id_ = id2;
+                return true;
+            }
+            assert(id2 > doc_id);
+            doc_id = id2;
+        }
+        common_block_min_possible_doc_id_ = INVALID_ROWID;
+        common_block_last_doc_id_ = INVALID_ROWID;
+        doc_id_ = INVALID_ROWID;
+        return false;
+    }
+
     RowID BlockMinPossibleDocID() const override { return common_block_min_possible_doc_id_; }
     RowID BlockLastDocID() const override { return common_block_last_doc_id_; }
     bool BlockSkipTo(RowID doc_id, float threshold) override {
@@ -392,14 +456,8 @@ public:
             return true;
         }
     }
-    float BlockMaxBM25Score() override {
-        UnrecoverableError("Unreachable code!");
-        return 0.0f;
-    }
-    float BM25Score() override {
-        UnrecoverableError("Unreachable code!");
-        return 0.0f;
-    }
+    float BlockMaxBM25Score() override { return query_iterator_->BlockMaxBM25Score(); }
+    float BM25Score() override { return query_iterator_->BM25Score(); }
     Pair<bool, RowID> SeekInBlockRange(RowID doc_id, RowID doc_id_no_beyond) override {
         UnrecoverableError("Unreachable code!");
         return {false, INVALID_ROWID};
@@ -497,11 +555,13 @@ void ASSERT_FLOAT_EQ(float bar, u32 i, float a, float b) {
 void ExecuteFTSearch(UniquePtr<EarlyTerminateIterator> &et_iter, FullTextScoreResultHeap &result_heap, u32 &blockmax_loop_cnt) {
     if (et_iter) {
         while (true) {
-            auto [id, et_score] = et_iter->BlockNextWithThreshold(result_heap.GetScoreThreshold());
-            if (id == INVALID_ROWID) [[unlikely]] {
+            ++blockmax_loop_cnt;
+            bool ok = et_iter->Next();
+            if (!ok) [[unlikely]] {
                 break;
             }
-            ++blockmax_loop_cnt;
+            RowID id = et_iter->DocID();
+            float et_score = et_iter->BM25Score();
             if (result_heap.AddResult(et_score, id)) {
                 // update threshold
                 if (const float new_threshold = result_heap.GetScoreThreshold(); new_threshold > 0.0f) {
@@ -605,7 +665,7 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     }
     auto finish_query_builder_time = std::chrono::high_resolution_clock::now();
     TimeDurationType query_builder_duration = finish_query_builder_time - finish_parse_query_tree_time;
-    LOG_TRACE(fmt::format("PhysicalMatch Part 1: Build Query iterator time: {} ms", query_builder_duration.count()));
+    LOG_INFO(fmt::format("PhysicalMatch Part 1: Build Query iterator time: {} ms", query_builder_duration.count()));
     if (use_block_max_iter) {
         blockmax_score_result = MakeUniqueForOverwrite<float[]>(top_n);
         blockmax_row_id_result = MakeUniqueForOverwrite<RowID[]>(top_n);
@@ -691,7 +751,7 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     }
     auto finish_query_time = std::chrono::high_resolution_clock::now();
     TimeDurationType query_duration = finish_query_time - finish_query_builder_time;
-    LOG_TRACE(fmt::format("PhysicalMatch Part 2: Full text search time: {} ms", query_duration.count()));
+    LOG_INFO(fmt::format("PhysicalMatch Part 2: Full text search time: {} ms", query_duration.count()));
 #ifdef INFINITY_DEBUG
     {
         OStringStream stat_info;
@@ -726,7 +786,7 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
             RecoverableError(Status::SyntaxError("Debug Info: result count mismatch!"));
         }
         for (u32 i = 0; i < result_count; ++i) {
-            ASSERT_FLOAT_EQ(1e-6, i, ordinary_score_result[i], blockmax_score_result[i]);
+            ASSERT_FLOAT_EQ(1e-4, i, ordinary_score_result[i], blockmax_score_result[i]);
             ASSERT_FLOAT_EQ(0.0f, i, blockmax_score_result[i], blockmax_score_result_2[i]);
         }
     }

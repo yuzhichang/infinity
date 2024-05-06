@@ -18,7 +18,7 @@ import early_terminate_iterator;
 import blockmax_term_doc_iterator;
 import blockmax_and_iterator;
 import blockmax_and_not_iterator;
-import blockmax_maxscore_iterator;
+import blockmax_wand_iterator;
 import index_defines;
 import third_party;
 import phrase_doc_iterator;
@@ -594,7 +594,7 @@ OrQueryNode::CreateEarlyTerminateSearch(const TableEntry *table_entry, IndexRead
     } else if (sub_doc_iters.size() == 1) {
         return std::move(sub_doc_iters[0]);
     } else {
-        return MakeUnique<BlockMaxMaxscoreIterator>(std::move(sub_doc_iters));
+        return MakeUnique<BlockMaxWandIterator>(std::move(sub_doc_iters));
     }
 }
 
