@@ -132,8 +132,8 @@ Status Config::Init(const SharedPtr<String> &config_path) {
         }
 
         // Version
-        String current_version = fmt::format("{}.{}.{}", version_major(), version_minor(), version_patch());
-        UniquePtr<StringOption> version_option = MakeUnique<StringOption>("version", current_version);
+        String exe_version = fmt::format("{}.{}.{}", version_major(), version_minor(), version_patch());
+        UniquePtr<StringOption> version_option = MakeUnique<StringOption>("version", exe_version);
         global_options_.AddOption(std::move(version_option), GlobalOptionIndex::kVersion);
 
         // Timezone
@@ -302,17 +302,17 @@ Status Config::Init(const SharedPtr<String> &config_path) {
                 String invalid_str = "invalid";
                 {
                     // Version
-                    String version_str = general_config["version"].value_or("invalid");
-                    ToLower(version_str);
-                    if (IsEqual(version_str, invalid_str)) {
+                    String config_version = general_config["version"].value_or("invalid");
+                    ToLower(config_version);
+                    if (IsEqual(config_version, invalid_str)) {
                         return Status::InvalidConfig("Invalid version field");
                     } else {
-                        String current_version = fmt::format("{}.{}.{}", version_major(), version_minor(), version_patch());
-                        if (IsEqual(version_str, current_version)) {
-                            UniquePtr<StringOption> version_option = MakeUnique<StringOption>("version", current_version);
+                        String exe_version = fmt::format("{}.{}.{}", version_major(), version_minor(), version_patch());
+                        if (IsEqual(config_version, exe_version)) {
+                            UniquePtr<StringOption> version_option = MakeUnique<StringOption>("version", exe_version);
                             global_options_.AddOption(std::move(version_option), GlobalOptionIndex::kVersion);
                         } else {
-                            Status::MismatchVersion(version_str, current_version);
+                            return Status::MismatchVersion(*config_path, config_version, exe_version);
                         }
                     }
                 }

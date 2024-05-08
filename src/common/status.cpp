@@ -78,9 +78,9 @@ Status Status::InvalidTimeInfo(const String &time_info) {
 
 Status Status::EmptyConfigParameter() { return Status(ErrorCode::kEmptyConfigParameter, MakeUnique<String>("Empty configure parameter.")); }
 
-Status Status::MismatchVersion(const String &current_version, const String &expected_version) {
+Status Status::MismatchVersion(const String &config_path, const String &config_version, const String &exe_version) {
     return Status(ErrorCode::kMismatchVersion,
-                  MakeUnique<String>(fmt::format("Current infinity version: {}, expected version: {}", current_version, expected_version)));
+                  MakeUnique<String>(fmt::format("infinity config path: {}, config schema version: {}, executable version: {}", config_path, config_version, exe_version)));
 }
 
 Status Status::InvalidTimezone(const String &timezone) {

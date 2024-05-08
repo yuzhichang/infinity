@@ -169,7 +169,7 @@ public:
     // 2. Auth error
     static Status WrongPasswd(const String &user_name);
     static Status InsufficientPrivilege(const String &user_name, const String &detailed_error);
-    static Status MismatchVersion(const String &current_version, const String &expected_version);
+    static Status MismatchVersion(const String &config_path, const String &config_version, const String &exe_version);
     static Status InvalidTimezone(const String &timezone);
     static Status InvalidByteSize(const String &byte_size);
     static Status InvalidIPAddr(const String &ip_addr);
