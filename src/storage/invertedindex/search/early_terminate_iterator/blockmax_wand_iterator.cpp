@@ -110,8 +110,8 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
         std::sort(sorted_iterators_.begin(), sorted_iterators_.end(), [](const auto &a, const auto &b) {
             return a->DocID() < b->DocID();
         });
-
-        for (SizeT i = num_iterators - 1; i >= 0 && sorted_iterators_[i]->DocID() == INVALID_ROWID; i--) {
+        // remove exhausted lists
+        for (int i = int(num_iterators) - 1; i >= 0 && sorted_iterators_[i]->DocID() == INVALID_ROWID; i--) {
             sorted_iterators_.pop_back();
             num_iterators --;
         }

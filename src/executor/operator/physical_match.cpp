@@ -423,7 +423,6 @@ public:
             assert(id2 > doc_id);
             doc_id = id2;
         }
-        assert(!ok);
         common_block_min_possible_doc_id_ = INVALID_ROWID;
         common_block_last_doc_id_ = INVALID_ROWID;
         doc_id_ = INVALID_ROWID;
