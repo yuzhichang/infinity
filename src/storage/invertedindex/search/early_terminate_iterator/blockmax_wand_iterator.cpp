@@ -18,6 +18,7 @@ module;
 
 module blockmax_wand_iterator;
 import stl;
+import third_party;
 import index_defines;
 import early_terminate_iterator;
 import internal_types;
@@ -25,7 +26,19 @@ import logger;
 
 namespace infinity {
 
-BlockMaxWandIterator::~BlockMaxWandIterator() {}
+BlockMaxWandIterator::~BlockMaxWandIterator() {
+    String msg = "BlockMaxWandIterator pivot_history: ";
+    SizeT num_history = pivot_history_.size();
+    for (SizeT i=0; i<num_history; i++) {
+        auto &p = pivot_history_[i];
+        u32 pivot = std::get<0>(p);
+        u64 row_id = std::get<1>(p);
+        float score = std::get<2>(p);
+        //oss << " (" << pivot << ", " << row_id << ", " << score << ")";
+        msg += fmt::format(" ({}, {}, {:6f})", pivot, row_id, score);
+    }
+    LOG_INFO(msg);
+}
 
 BlockMaxWandIterator::BlockMaxWandIterator(Vector<UniquePtr<EarlyTerminateIterator>> iterators) : sorted_iterators_(std::move(iterators)), pivot_(sorted_iterators_.size()) {
     backup_iterators_.reserve(sorted_iterators_.size());
@@ -144,6 +157,7 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
                     doc_id_ = d;
                     bm25_score_cache_ = sum_score;
                     bm25_score_cached_ = true;
+                    pivot_history_.emplace_back(pivot_, doc_id_.ToUint64(), sum_score);
                     return true;
                 }
             }

@@ -68,6 +68,7 @@ private:
     // bm25 score cache
     bool bm25_score_cached_ = false;
     float bm25_score_cache_ = 0.0f;
+    Vector<Tuple<u32, u64, float>> pivot_history_; //pivot, row_id, score
 };
 
 } // namespace infinity

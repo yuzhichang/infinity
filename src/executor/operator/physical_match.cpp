@@ -399,14 +399,18 @@ public:
 
     bool Next(RowID doc_id) override {
         while (true) {
-            bool ok = NextShallow(doc_id);
+            bool ok = query_iterator_->Next(doc_id);
             if (!ok){
                 doc_id_ = INVALID_ROWID;
                 return false;
             }
-            query_iterator_->Next(doc_id);
             doc_id = query_iterator_->DocID();
             // check filter
+            if (!SelfBlockSkipTo(doc_id)) {
+                common_block_min_possible_doc_id_ = INVALID_ROWID;
+                common_block_last_doc_id_ = INVALID_ROWID;
+                return false;
+            }
             const auto [success2, id2] = SelfSeekInBlockRange(doc_id, BlockLastDocID());
             if (success2) {
                 if (id2 == doc_id) {
@@ -660,7 +664,7 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     }
     auto finish_query_builder_time = std::chrono::high_resolution_clock::now();
     TimeDurationType query_builder_duration = finish_query_builder_time - finish_parse_query_tree_time;
-    LOG_TRACE(fmt::format("PhysicalMatch Part 1: Build Query iterator time: {} ms", query_builder_duration.count()));
+    LOG_INFO(fmt::format("PhysicalMatch Part 1: Build Query iterator time: {} ms", query_builder_duration.count()));
     if (use_block_max_iter) {
         blockmax_score_result = MakeUniqueForOverwrite<float[]>(top_n);
         blockmax_row_id_result = MakeUniqueForOverwrite<RowID[]>(top_n);
@@ -746,7 +750,7 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     }
     auto finish_query_time = std::chrono::high_resolution_clock::now();
     TimeDurationType query_duration = finish_query_time - finish_query_builder_time;
-    LOG_TRACE(fmt::format("PhysicalMatch Part 2: Full text search time: {} ms", query_duration.count()));
+    LOG_INFO(fmt::format("PhysicalMatch Part 2: Full text search time: {} ms", query_duration.count()));
 #ifdef INFINITY_DEBUG
     {
         OStringStream stat_info;
