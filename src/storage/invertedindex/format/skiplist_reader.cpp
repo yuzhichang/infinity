@@ -51,6 +51,7 @@ bool SkipListReader::SkipTo(u32 query_doc_id, u32 &doc_id, u32 &prev_doc_id, u32
             if (has_block_max_) {
                 current_block_max_tf_ = block_max_tf_buffer_[current_cursor];
                 current_block_max_tf_percentage_ = block_max_tf_percentage_buffer_[current_cursor];
+                current_block_first_doc_id_ = block_first_doc_id_buffer_[current_cursor];
             }
             prev_doc_id = prev_doc_id_ = local_prev_doc_id;
             offset = prev_offset_ = local_prev_offset;

@@ -73,6 +73,8 @@ void DocListEncoder::AddDocument(docid_t doc_id, docpayload_t doc_payload, tf_t 
     block_max_tf_ = std::max(block_max_tf_, tf);
     assert((tf > 0 and tf <= doc_len));
     block_max_percentage_ = std::max(block_max_percentage_, static_cast<float>(tf) / doc_len);
+    if (block_first_doc_id_ == INVALID_DOCID)
+        block_first_doc_id_ = doc_id;
     if (doc_list_buffer_.NeedFlush()) {
         FlushDocListBuffer();
     }
@@ -142,6 +144,7 @@ void DocListEncoder::FlushDocListBuffer() {
     }
     block_max_tf_ = 0;
     block_max_percentage_ = 0.0f;
+    block_first_doc_id_ = INVALID_DOCID;
 }
 
 void DocListEncoder::CreateDocSkipListWriter() {

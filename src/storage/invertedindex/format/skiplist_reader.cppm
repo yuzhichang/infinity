@@ -24,6 +24,7 @@ public:
         if (has_block_max_) {
             block_max_tf_buffer_ = MakeUnique<u32[]>(SKIP_LIST_BUFFER_SIZE);
             block_max_tf_percentage_buffer_ = MakeUnique<u16[]>(SKIP_LIST_BUFFER_SIZE);
+            block_first_doc_id_buffer_ = MakeUnique<u32[]>(SKIP_LIST_BUFFER_SIZE);
         }
     }
 
@@ -55,7 +56,8 @@ public:
 
     // u32: block max tf
     // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
-    Pair<u32, u16> GetBlockMaxInfo() const { return {current_block_max_tf_, current_block_max_tf_percentage_}; }
+    // u32: block first doc id
+    Tuple<u32, u16, u32> GetBlockMaxInfo() const { return {current_block_max_tf_, current_block_max_tf_percentage_, current_block_first_doc_id_}; }
 
 protected:
     virtual Pair<int, bool> LoadBuffer() = 0;
@@ -68,6 +70,7 @@ protected:
     u32 current_ttf_ = 0;
     u32 current_block_max_tf_ = 0;
     u16 current_block_max_tf_percentage_ = 0;
+    u32 current_block_first_doc_id_ = 0;
     u32 prev_doc_id_ = 0;
     u32 prev_offset_ = 0;
     u32 prev_ttf_ = 0;
@@ -78,6 +81,7 @@ protected:
     UniquePtr<u32[]> ttf_buffer_;
     UniquePtr<u32[]> block_max_tf_buffer_;
     UniquePtr<u16[]> block_max_tf_percentage_buffer_;
+    UniquePtr<u32[]> block_first_doc_id_buffer_;
 };
 
 export class SkipListReaderByteSlice final : public SkipListReader {

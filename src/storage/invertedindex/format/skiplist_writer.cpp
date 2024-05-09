@@ -17,7 +17,7 @@ namespace infinity {
 SkipListWriter::SkipListWriter(MemoryPool *byte_slice_pool, MemoryPool *buffer_pool)
     : PostingByteSlice(byte_slice_pool, buffer_pool), last_key_(-1), last_value1_(-1) {}
 
-void SkipListWriter::AddItem(u32 last_doc_id, u32 total_tf, u32 block_max_tf, u16 block_max_percentage, u32 item_size) {
+void SkipListWriter::AddItem(u32 last_doc_id, u32 total_tf, u32 block_max_tf, u16 block_max_percentage, u32 block_first_doc_id, u32 item_size) {
     assert(static_cast<u32>(-1) == last_key_ || last_doc_id > last_key_);
     assert(static_cast<u32>(-1) == last_value1_ || total_tf > last_value1_);
     last_key_ = static_cast<u32>(-1) == last_key_ ? 0 : last_key_;
@@ -28,7 +28,8 @@ void SkipListWriter::AddItem(u32 last_doc_id, u32 total_tf, u32 block_max_tf, u1
     last_value1_ = total_tf;
     PushBack(2, block_max_tf);
     PushBack(3, block_max_percentage);
-    PushBack(4, item_size);
+    PushBack(4, block_first_doc_id);
+    PushBack(5, item_size);
     EndPushBack();
     if (NeedFlush(SKIP_LIST_BUFFER_SIZE)) {
         Flush();
