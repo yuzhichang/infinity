@@ -100,7 +100,7 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
     } else {
         assert(pivot_ < num_iterators);
         // Move all pointers from lists[0] to lists[p] by calling Next(list, d + 1)
-        for (SizeT i = 0; i < num_iterators && sorted_iterators_[i]->DocID() <= doc_id_; i++) {
+        for (SizeT i = 0; i <= pivot_; i++) {
             sorted_iterators_[i]->Next(doc_id_ + 1);
         }
     }
@@ -129,12 +129,14 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
                 break;
             }
         }
-
         if (pivot >= num_iterators){
             doc_id_ = INVALID_ROWID;
             return false;
         }
         RowID d = sorted_iterators_[pivot]->DocID();
+        for(; pivot < num_iterators && sorted_iterators_[pivot]->DocID() == d; pivot++){
+        }
+
         for(SizeT i=0; i+1<pivot; i++){
             sorted_iterators_[i]->NextShallow(d);
         }
@@ -147,9 +149,6 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
                 // EvaluatePartial(d , p);
                 sum_score = 0.0f;
                 for(SizeT i=0; i<pivot; i++){
-                    sum_score += sorted_iterators_[i]->BM25Score();
-                }
-                for(SizeT i=pivot; i<num_iterators && sorted_iterators_[i]->DocID() == d; i++){
                     sum_score += sorted_iterators_[i]->BM25Score();
                 }
                 if(sum_score > threshold_){
@@ -172,7 +171,7 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
             //     }
             // }
             // sorted_iterators_[largest_idf_idx]->Next(d + 1);
-            for (SizeT i = 0; i < num_iterators && sorted_iterators_[i]->DocID() <= d; i++) {
+            for (SizeT i = 0; i <= pivot_; i++) {
                 sorted_iterators_[i]->Next(d+1);
             }
         } else {
