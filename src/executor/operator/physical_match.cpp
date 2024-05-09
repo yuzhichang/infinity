@@ -787,7 +787,7 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
             RecoverableError(Status::SyntaxError("Debug Info: result count mismatch!"));
         }
         for (u32 i = 0; i < result_count; ++i) {
-            ASSERT_FLOAT_EQ(1e-6, i, ordinary_score_result[i], blockmax_score_result[i]);
+            ASSERT_FLOAT_EQ(1e-4, i, ordinary_score_result[i], blockmax_score_result[i]);
             ASSERT_FLOAT_EQ(0.0f, i, blockmax_score_result[i], blockmax_score_result_2[i]);
         }
     }

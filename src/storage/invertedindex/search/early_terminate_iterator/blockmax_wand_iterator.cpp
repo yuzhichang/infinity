@@ -100,7 +100,7 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
     } else {
         assert(pivot_ < num_iterators);
         // Move all pointers from lists[0] to lists[p] by calling Next(list, d + 1)
-        for (SizeT i = 0; i <= pivot_; i++) {
+        for (SizeT i = 0; i < num_iterators && sorted_iterators_[i]->DocID() <= doc_id_; i++) {
             sorted_iterators_[i]->Next(doc_id_ + 1);
         }
     }
@@ -162,16 +162,19 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
                 }
             }
             // Choose one list from the lists before lists[p] with the largest IDF, move it by calling Next(list, d + 1)
-            SizeT largest_idf = 0;
-            SizeT largest_idf_idx = 0;
-            for (SizeT i = 0; i + 1 < pivot; i++) {
-                SizeT idf = sorted_iterators_[i]->DocFreq();
-                if (idf > largest_idf) {
-                    largest_idf = idf;
-                    largest_idf_idx = i;
-                }
+            // SizeT largest_idf = 0;
+            // SizeT largest_idf_idx = 0;
+            // for (SizeT i = 0; i + 1 < pivot; i++) {
+            //     SizeT idf = sorted_iterators_[i]->DocFreq();
+            //     if (idf > largest_idf) {
+            //         largest_idf = idf;
+            //         largest_idf_idx = i;
+            //     }
+            // }
+            // sorted_iterators_[largest_idf_idx]->Next(d + 1);
+            for (SizeT i = 0; i < num_iterators && sorted_iterators_[i]->DocID() <= d; i++) {
+                sorted_iterators_[i]->Next(d+1);
             }
-            sorted_iterators_[largest_idf_idx]->Next(d + 1);
         } else {
             // d′ = GetNewCandidate();
             // Choose one list from the lists before and including lists[p] with the largest IDF, move it by calling Next(list, d′)
