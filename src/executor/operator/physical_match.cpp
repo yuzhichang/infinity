@@ -398,33 +398,36 @@ public:
     }
 
     bool Next(RowID doc_id) override {
-        while (true) {
-            bool ok = query_iterator_->Next(doc_id);
+        bool ok = false;
+        while(1) {
+            ok = query_iterator_->Next(doc_id);
             if (!ok){
-                doc_id_ = INVALID_ROWID;
-                return false;
+                break;
             }
             doc_id = query_iterator_->DocID();
             // check filter
-            if (!SelfBlockSkipTo(doc_id)) {
-                common_block_min_possible_doc_id_ = INVALID_ROWID;
-                common_block_last_doc_id_ = INVALID_ROWID;
-                return false;
+            ok = SelfBlockSkipTo(doc_id);
+            if (!ok) {
+                break;
             }
-            const auto [success2, id2] = SelfSeekInBlockRange(doc_id, BlockLastDocID());
-            if (success2) {
-                if (id2 == doc_id) {
-                    doc_id_ = id2;
-                    return true;
-                }
-                assert(id2 > doc_id);
-                doc_id = id2;
-            } else {
-                assert(id2 == INVALID_ROWID);
-                doc_id_ = INVALID_ROWID;
-                return false;
+            const auto [ok, id2] = SelfSeekInBlockRange(doc_id, SelfBlockLastDocID());
+            if (!ok){
+                break;
             }
+            if (id2 == doc_id) {
+                common_block_min_possible_doc_id_ = doc_id;
+                common_block_last_doc_id_ = std::max(query_iterator_->BlockLastDocID(), SelfBlockLastDocID());
+                doc_id_ = id2;
+                return true;
+            }
+            assert(id2 > doc_id);
+            doc_id = id2;
         }
+        assert(!ok);
+        common_block_min_possible_doc_id_ = INVALID_ROWID;
+        common_block_last_doc_id_ = INVALID_ROWID;
+        doc_id_ = INVALID_ROWID;
+        return false;
     }
 
     RowID BlockMinPossibleDocID() const override { return common_block_min_possible_doc_id_; }
