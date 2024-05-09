@@ -13,7 +13,7 @@ import index_defines;
 namespace infinity {
 
 InMemDocListDecoder::InMemDocListDecoder(MemoryPool *session_pool, const DocListFormatOption &doc_list_format_option)
-    : IndexDecoder(doc_list_format_option), session_pool_(session_pool) {}
+    : IndexDecoder(doc_list_format_option), session_pool_(session_pool), has_tf_list_(doc_list_format_option.HasTfList()) {}
 
 InMemDocListDecoder::~InMemDocListDecoder() {
     if (session_pool_) {
@@ -26,6 +26,9 @@ InMemDocListDecoder::~InMemDocListDecoder() {
         if (doc_buffer_to_copy_) {
             session_pool_->Deallocate((void *)doc_buffer_to_copy_, sizeof(docid_t) * MAX_DOC_PER_RECORD);
         }
+        if (tf_buffer_to_copy_) {
+            session_pool_->Deallocate((void *)tf_buffer_to_copy_, sizeof(tf_t) * MAX_DOC_PER_RECORD);
+        }
     } else {
         if (skiplist_reader_) {
             delete skiplist_reader_;
@@ -33,6 +36,9 @@ InMemDocListDecoder::~InMemDocListDecoder() {
         delete doc_list_buffer_;
         if (doc_buffer_to_copy_) {
             delete[] doc_buffer_to_copy_;
+        }
+        if (tf_buffer_to_copy_) {
+            delete[] tf_buffer_to_copy_;
         }
     }
 }
@@ -44,50 +50,70 @@ void InMemDocListDecoder::Init(df_t df, SkipListReaderPostingByteSlice *skiplist
     doc_list_reader_.Open(doc_list_buffer);
 }
 
-bool InMemDocListDecoder::DecodeSkipList(docid_t start_doc_id, docid_t &prev_last_doc_id, docid_t &last_doc_id, ttf_t &current_ttf) {
-    if (skiplist_reader_ == nullptr) {
-        prev_last_doc_id = 0;
-        current_ttf = 0;
-        return DecodeSkipListWithoutSkipList(0, 0, start_doc_id, last_doc_id);
-    }
-    auto ret = skiplist_reader_->SkipTo((u32)start_doc_id, last_doc_id_, last_doc_id_in_prev_record_, offset_, record_len_);
-    if (!ret) {
-        // we should decode buffer
-        prev_last_doc_id = last_doc_id_in_prev_record_ = skiplist_reader_->GetLastKeyInBuffer();
-        offset_ = skiplist_reader_->GetLastValueInBuffer();
-        current_ttf = current_ttf_ = skiplist_reader_->GetCurrentTTF();
+bool InMemDocListDecoder::DecodeSkipList(docid_t start_doc_id, docid_t &block_first_doc_id, docid_t &block_last_doc_id, ttf_t &current_ttf) {
+    current_ttf = 0;
+    offset_ = 0;
+    if (skiplist_reader_ != nullptr){
+        bool ret = skiplist_reader_->SkipTo((u32)start_doc_id, block_first_doc_id_, block_last_doc_id_, offset_, record_len_);
         skiped_item_count_ = skiplist_reader_->GetSkippedItemCount();
-        return DecodeSkipListWithoutSkipList(last_doc_id_in_prev_record_, offset_, start_doc_id, last_doc_id);
+        current_ttf = current_ttf_ = skiplist_reader_->GetCurrentTTF();
+        if (ret) {
+            block_first_doc_id = block_first_doc_id_;
+            block_last_doc_id = block_last_doc_id_;
+            return true;
+        }
+        // we should decode buffer
+        offset_ = skiplist_reader_->GetLastValueInBuffer();
     }
-    skiped_item_count_ = skiplist_reader_->GetSkippedItemCount();
-    prev_last_doc_id = last_doc_id_in_prev_record_;
-    last_doc_id = last_doc_id_;
-    current_ttf = current_ttf_ = skiplist_reader_->GetPrevTTF();
-    return true;
+    return DecodeSkipListWithoutSkipList(start_doc_id, block_first_doc_id, block_last_doc_id, current_ttf);
 }
 
-bool InMemDocListDecoder::DecodeSkipListWithoutSkipList(docid_t last_doc_id_in_prev_record, u32 offset, docid_t start_doc_id, docid_t &last_doc_id) {
+bool InMemDocListDecoder::DecodeSkipListWithoutSkipList(docid_t start_doc_id,
+                                                        docid_t &block_first_doc_id,
+                                                        docid_t &block_last_doc_id,
+                                                        ttf_t &current_ttf) {
     if (finish_decoded_) {
         return false;
     }
     // allocate space
     if (session_pool_) {
         doc_buffer_to_copy_ = static_cast<docid_t *>(session_pool_->Allocate(sizeof(docid_t) * MAX_DOC_PER_RECORD));
+        if (has_tf_list_) {
+            tf_buffer_to_copy_ = static_cast<docid_t *>(session_pool_->Allocate(sizeof(tf_t) * MAX_DOC_PER_RECORD));
+        }
     } else {
         doc_buffer_to_copy_ = new docid_t[MAX_DOC_PER_RECORD];
+        if (has_tf_list_) {
+            tf_buffer_to_copy_ = new tf_t[MAX_DOC_PER_RECORD];
+        }
     }
-    doc_list_reader_.Seek(offset);
+    doc_list_reader_.Seek(offset_);
     if (!doc_list_reader_.Decode(doc_buffer_to_copy_, MAX_DOC_PER_RECORD, decode_count_)) {
         return false;
     }
-    last_doc_id = last_doc_id_in_prev_record;
-    for (SizeT i = 0; i < decode_count_; ++i) {
-        last_doc_id += doc_buffer_to_copy_[i];
-    }
-    if (start_doc_id > last_doc_id) {
-        return false;
+    if (has_tf_list_) {
+        if (!doc_list_reader_.Decode(tf_buffer_to_copy_, MAX_DOC_PER_RECORD, decode_count_)) {
+            return false;
+        }
     }
     finish_decoded_ = true;
+    if (decode_count_ <= 0)
+        return false;
+    if (block_last_doc_id_ == INVALID_DOCID)
+        block_last_doc_id_ = 0;
+    block_first_doc_id_ = block_last_doc_id_ + doc_buffer_to_copy_[0];
+    for (SizeT i = 0; i < decode_count_; ++i) {
+        block_last_doc_id_ += doc_buffer_to_copy_[i];
+        if (has_tf_list_) {
+            current_ttf_ += tf_buffer_to_copy_[i];
+        }
+    }
+    block_first_doc_id = block_first_doc_id_;
+    block_last_doc_id = block_last_doc_id_;
+    current_ttf = current_ttf_;
+    if (start_doc_id > block_last_doc_id) {
+        return false;
+    }
     return true;
 }
 
@@ -113,6 +139,10 @@ bool InMemDocListDecoder::DecodeCurrentDocIDBuffer(docid_t *doc_buffer) {
 }
 
 bool InMemDocListDecoder::DecodeCurrentTFBuffer(tf_t *tf_buffer) {
+    if (finish_decoded_) {
+        std::copy_n(tf_buffer_to_copy_, decode_count_, tf_buffer);
+        return true;
+    }
     SizeT decode_count;
     return doc_list_reader_.Decode(tf_buffer, MAX_DOC_PER_RECORD, decode_count);
 }

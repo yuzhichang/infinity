@@ -73,6 +73,8 @@ void DocListEncoder::AddDocument(docid_t doc_id, docpayload_t doc_payload, tf_t 
     block_max_tf_ = std::max(block_max_tf_, tf);
     assert((tf > 0 and tf <= doc_len));
     block_max_percentage_ = std::max(block_max_percentage_, static_cast<float>(tf) / doc_len);
+    if (block_first_doc_id_ == INVALID_DOCID)
+        block_first_doc_id_ = doc_id;
     if (doc_list_buffer_.NeedFlush()) {
         FlushDocListBuffer();
     }
@@ -140,6 +142,7 @@ void DocListEncoder::FlushDocListBuffer() {
         }
         AddSkipListItem(flush_size);
     }
+    block_first_doc_id_ = INVALID_DOCID;
     block_max_tf_ = 0;
     block_max_percentage_ = 0.0f;
 }
@@ -156,7 +159,7 @@ void DocListEncoder::AddSkipListItem(u32 item_size) {
         assert((block_max_percentage_ > 0 and block_max_percentage_ <= 1.0f));
         u32 max_percentage_field = static_cast<u32>(std::ceil(block_max_percentage_ * std::numeric_limits<u16>::max()));
         assert((max_percentage_field <= std::numeric_limits<u16>::max()));
-        doc_skiplist_writer_->AddItem(last_doc_id_, total_tf_, block_max_tf_, static_cast<u16>(max_percentage_field), item_size);
+        doc_skiplist_writer_->AddItem(last_doc_id_, total_tf_, block_first_doc_id_, block_max_tf_, static_cast<u16>(max_percentage_field), item_size);
     } else if (skiplist_format->HasTfList()) {
         doc_skiplist_writer_->AddItem(last_doc_id_, total_tf_, item_size);
     } else {

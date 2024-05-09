@@ -43,7 +43,6 @@ BlockMaxWandIterator::~BlockMaxWandIterator() {
 }
 
 BlockMaxWandIterator::BlockMaxWandIterator(Vector<UniquePtr<EarlyTerminateIterator>> iterators) : sorted_iterators_(std::move(iterators)), pivot_(sorted_iterators_.size()) {
-    backup_iterators_.reserve(sorted_iterators_.size());
     bm25_score_upper_bound_ = 0.0f;
     SizeT num_iterators = sorted_iterators_.size();
     for (SizeT i = 0; i < num_iterators; i++){
@@ -66,7 +65,6 @@ void BlockMaxWandIterator::UpdateScoreThreshold(const float threshold) {
 
 bool BlockMaxWandIterator::NextShallow(RowID doc_id){
     assert(doc_id != INVALID_ROWID);
-    assert(backup_iterators_.empty());
     RowID common_block_last_doc_id = INVALID_ROWID;
     SizeT num_iterators = sorted_iterators_.size();
     SizeT gap = num_iterators;
@@ -155,7 +153,9 @@ bool BlockMaxWandIterator::Next(RowID doc_id){
 
         float sum_score_bm = 0.0f;
         for(SizeT i=0; i<=pivot; i++){
-            sorted_iterators_[i]->NextShallow(d);
+            if (sorted_iterators_[pivot]->DocID() < d){
+                sorted_iterators_[i]->NextShallow(d);
+            }
             sum_score_bm += sorted_iterators_[i]->BlockMaxBM25Score();
         }
         if (sum_score_bm > threshold_) {

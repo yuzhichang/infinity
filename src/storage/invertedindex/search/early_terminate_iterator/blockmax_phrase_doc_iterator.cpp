@@ -88,7 +88,7 @@ bool BlockMaxPhraseDocIterator::BlockSkipTo(RowID doc_id, float threshold) {
     }
 }
 
-RowID BlockMaxPhraseDocIterator::BlockMinPossibleDocID() const { return pos_iters_[0]->BlockLowestPossibleDocID(); }
+RowID BlockMaxPhraseDocIterator::BlockMinPossibleDocID() const { return pos_iters_[0]->BlockFirstDocID(); }
 
 RowID BlockMaxPhraseDocIterator::BlockLastDocID() const { return TermBlockLastDocID(0); }
 

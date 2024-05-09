@@ -14,60 +14,62 @@ import third_party;
 
 namespace infinity {
 
-bool SkipListReader::SkipTo(u32 query_doc_id, u32 &doc_id, u32 &prev_doc_id, u32 &offset, u32 &delta) {
-    u32 current_doc_id = current_doc_id_;
-    u32 current_offset = current_offset_;
-    u32 current_ttf = current_ttf_;
-    u32 current_cursor = current_cursor_;
-    i32 skipped_item_count = skipped_item_count_;
-    u32 num_in_buffer = num_in_buffer_;
-    for (;; ++current_cursor) {
-        const u32 local_prev_doc_id = current_doc_id;
-        const u32 local_prev_offset = current_offset;
-        const u32 local_prev_ttf = current_ttf;
-        if (current_cursor >= num_in_buffer) {
+bool SkipListReader::SkipTo(u32 query_doc_id, u32 &block_first_doc_id, u32 &block_last_doc_id, u32 &block_offset, u32 &block_len) {
+    if (query_doc_id <= current_doc_id_ && current_doc_id_ != INVALID_DOCID) [[unlikely]] {
+        assert(current_block_first_doc_id_ < current_doc_id_);
+        block_first_doc_id = current_block_first_doc_id_;
+        block_last_doc_id = current_doc_id_;
+        block_offset = prev_offset_;
+        block_len = current_offset_;
+        return true;
+    }
+    assert(current_doc_id_ == INVALID_DOCID || query_doc_id > current_doc_id_);
+    if (current_doc_id_ == INVALID_DOCID) [[unlikely]] {
+        assert(current_cursor_ == 0 && num_in_buffer_ == 0);
+        current_block_first_doc_id_ = 0;
+        current_doc_id_ = 0;
+        prev_offset_ = 0;
+        current_offset_ = 0;
+    }
+    for (;; ++current_cursor_) {
+        if (current_cursor_ >= num_in_buffer_) {
             auto [status, ret] = LoadBuffer();
             assert(status == 0);
             if (!ret) {
+                block_first_doc_id = current_block_first_doc_id_;
+                block_last_doc_id = current_doc_id_;
+                block_offset = prev_offset_;
+                block_len = current_offset_ - prev_offset_;
                 // current segment is exhausted
-                // skip current block
-                ++skipped_item_count;
-                break;
+                // skip current segment
+                ++skipped_item_count_;
+                return false;
             }
-            current_cursor = current_cursor_;
-            num_in_buffer = num_in_buffer_;
         }
-        current_doc_id += doc_id_buffer_[current_cursor];
-        current_offset += offset_buffer_[current_cursor];
+        prev_doc_id_ = current_doc_id_;
+        current_doc_id_ += doc_id_buffer_[current_cursor_];
+        prev_offset_ = current_offset_;
+        current_offset_ += offset_buffer_[current_cursor_];
         if (has_tf_list_) {
-            current_ttf += ttf_buffer_[current_cursor];
+            prev_ttf_ = current_ttf_;
+            current_ttf_ += tf_buffer_[current_cursor_];
         }
-        ++skipped_item_count;
-        if (current_doc_id >= query_doc_id) {
-            skipped_item_count_ = skipped_item_count;
-            doc_id = current_doc_id_ = current_doc_id;
-            current_offset_ = current_offset;
-            current_ttf_ = current_ttf;
+        ++skipped_item_count_;
+        if (current_doc_id_ >= query_doc_id) {
             if (has_block_max_) {
-                current_block_max_tf_ = block_max_tf_buffer_[current_cursor];
-                current_block_max_tf_percentage_ = block_max_tf_percentage_buffer_[current_cursor];
+                current_block_first_doc_id_ = current_doc_id_ - doc_id_buffer_[current_cursor_] + block_first_doc_id_buffer_[current_cursor_];
+                current_block_max_tf_ = block_max_tf_buffer_[current_cursor_];
+                current_block_max_tf_percentage_ = block_max_tf_percentage_buffer_[current_cursor_];
             }
-            prev_doc_id = prev_doc_id_ = local_prev_doc_id;
-            offset = prev_offset_ = local_prev_offset;
-            delta = offset_buffer_[current_cursor];
-            prev_ttf_ = local_prev_ttf;
-            // point to next block
-            current_cursor_ = current_cursor + 1;
+            block_first_doc_id = current_block_first_doc_id_;
+            block_last_doc_id = current_doc_id_;
+            block_offset = prev_offset_;
+            block_len = current_offset_ - prev_offset_;
+            // point to next item
+            ++current_cursor_;
             return true;
         }
     }
-    // case for LoadBuffer() return (0, false)
-    skipped_item_count_ = skipped_item_count;
-    current_doc_id_ = current_doc_id;
-    current_offset_ = current_offset;
-    current_ttf_ = current_ttf;
-    current_cursor_ = current_cursor;
-    return false;
 }
 
 u32 SkipListReader::GetLastValueInBuffer() const {
@@ -113,46 +115,51 @@ void SkipListReaderByteSlice::Load(ByteSlice *byte_slice, u32 start, u32 end) {
     byte_slice_reader_.Seek(start);
 }
 
+// Note: keep sync with SkipListWriter::AddItem
 Pair<int, bool> SkipListReaderByteSlice::LoadBuffer() {
     u32 end = byte_slice_reader_.Tell();
-    if (end < end_) {
-        const Int32Encoder *doc_id_encoder = GetSkipListEncoder();
-        u32 doc_num = doc_id_encoder->Decode(static_cast<u32 *>(doc_id_buffer_), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
-        if (has_tf_list_) {
-            const Int32Encoder *tf_encoder = GetSkipListEncoder();
-            u32 ttf_num = tf_encoder->Decode(ttf_buffer_.get(), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
-            if (ttf_num != doc_num) {
-                UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} ttf_num = {}", doc_num, ttf_num));
-                return MakePair(-1, false);
-            }
-        }
-        if (has_block_max_) {
-            const Int32Encoder *block_max_tf_encoder = GetSkipListEncoder();
-            u32 block_max_tf_num = block_max_tf_encoder->Decode(block_max_tf_buffer_.get(), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
-            if (block_max_tf_num != doc_num) {
-                UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} block_max_tf_num = {}", doc_num, block_max_tf_num));
-                return MakePair(-1, false);
-            }
-            const Int16Encoder *tf_percentage_encoder = GetTermPercentageEncoder();
-            u32 tf_percentage_num = tf_percentage_encoder->Decode(block_max_tf_percentage_buffer_.get(), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
-            if (tf_percentage_num != doc_num) {
-                UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} block_max_tf_percentage_num = {}", doc_num, tf_percentage_num));
-                return MakePair(-1, false);
-            }
-        }
-        {
-            const Int32Encoder *offset_encoder = GetSkipListEncoder();
-            u32 len_num = offset_encoder->Decode(static_cast<u32 *>(offset_buffer_), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
-            if (len_num != doc_num) {
-                UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} offset_num = {}", doc_num, len_num));
-                return MakePair(-1, false);
-            }
-        }
-        num_in_buffer_ = doc_num;
-        current_cursor_ = 0;
-        return MakePair(0, true);
+    if (end >= end_) [[unlikely]] {
+        return MakePair(0, false);
     }
-    return MakePair(0, false);
+    const Int32Encoder *i32_encoder = GetSkipListEncoder();
+    const Int16Encoder *i16_encoder = GetTermPercentageEncoder();
+    u32 doc_num = i32_encoder->Decode(static_cast<u32 *>(doc_id_buffer_), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
+    if (has_tf_list_) {
+        u32 ttf_num = i32_encoder->Decode(tf_buffer_.get(), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
+        if (ttf_num != doc_num) {
+            UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} ttf_num = {}", doc_num, ttf_num));
+            return MakePair(-1, false);
+        }
+    }
+    if (has_block_max_) {
+        u32 block_first_doc_id_num = i32_encoder->Decode(block_first_doc_id_buffer_.get(), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
+        if (block_first_doc_id_num != doc_num) {
+            UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} block_first_doc_id_num = {}", doc_num, block_first_doc_id_num));
+            return MakePair(-1, false);
+        }
+
+        u32 block_max_tf_num = i32_encoder->Decode(block_max_tf_buffer_.get(), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
+        if (block_max_tf_num != doc_num) {
+            UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} block_max_tf_num = {}", doc_num, block_max_tf_num));
+            return MakePair(-1, false);
+        }
+
+        u32 tf_percentage_num = i16_encoder->Decode(block_max_tf_percentage_buffer_.get(), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
+        if (tf_percentage_num != doc_num) {
+            UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} block_max_tf_percentage_num = {}", doc_num, tf_percentage_num));
+            return MakePair(-1, false);
+        }
+    }
+    {
+        u32 len_num = i32_encoder->Decode(static_cast<u32 *>(offset_buffer_), SKIP_LIST_BUFFER_SIZE, byte_slice_reader_);
+        if (len_num != doc_num) {
+            UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} offset_num = {}", doc_num, len_num));
+            return MakePair(-1, false);
+        }
+    }
+    num_in_buffer_ = doc_num;
+    current_cursor_ = 0;
+    return MakePair(0, true);
 }
 
 SkipListReaderPostingByteSlice::~SkipListReaderPostingByteSlice() {
@@ -175,6 +182,7 @@ void SkipListReaderPostingByteSlice::Load(const PostingByteSlice *posting_buffer
     skiplist_reader_.Open(skiplist_buffer_);
 }
 
+// Note: keep sync with SkipListWriter::AddItem
 Pair<int, bool> SkipListReaderPostingByteSlice::LoadBuffer() {
     SizeT flush_count = skiplist_buffer_->GetTotalCount();
     FlushInfo flush_info = skiplist_buffer_->GetFlushInfo();
@@ -194,7 +202,7 @@ Pair<int, bool> SkipListReaderPostingByteSlice::LoadBuffer() {
 
     if (has_tf_list_) {
         SizeT ttf_num = 0;
-        if (!skiplist_reader_.Decode(ttf_buffer_.get(), decode_count, ttf_num)) {
+        if (!skiplist_reader_.Decode(tf_buffer_.get(), decode_count, ttf_num)) {
             return MakePair(0, false);
         }
         if (doc_num != ttf_num) {
@@ -204,6 +212,15 @@ Pair<int, bool> SkipListReaderPostingByteSlice::LoadBuffer() {
     }
 
     if (has_block_max_) {
+        SizeT block_first_doc_id_num = 0;
+        if (!skiplist_reader_.Decode(block_first_doc_id_buffer_.get(), decode_count, block_first_doc_id_num)) {
+            return MakePair(0, false);
+        }
+        if (doc_num != block_first_doc_id_num) {
+            UnrecoverableError(fmt::format("SKipList decode error, doc_num = {} block_first_doc_id_num = {}", doc_num, block_first_doc_id_num));
+            return MakePair(-1, false);
+        }
+
         SizeT block_max_tf_num = 0;
         if (!skiplist_reader_.Decode(block_max_tf_buffer_.get(), decode_count, block_max_tf_num)) {
             return MakePair(0, false);

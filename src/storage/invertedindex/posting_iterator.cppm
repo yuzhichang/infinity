@@ -31,11 +31,9 @@ public:
 
     bool SkipTo(RowID doc_id);
 
-    RowID PrevBlockLastDocID() const { return last_doc_id_in_prev_block_; }
+    RowID BlockFirstDocID() const { return block_first_row_id_; }
 
-    RowID BlockLowestPossibleDocID() const { return lowest_possible_doc_id_in_current_block_; }
-
-    RowID BlockLastDocID() const { return last_doc_id_in_current_block_; }
+    RowID BlockLastDocID() const { return block_last_row_id_; }
 
     // u32: block max tf
     // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
@@ -95,7 +93,7 @@ public:
 private:
     u32 GetCurrentSeekedDocCount() const { return posting_decoder_->InnerGetSeekedDocCount() + (GetDocOffsetInBuffer() + 1); }
 
-    i32 GetDocOffsetInBuffer() const { return doc_buffer_cursor_ - doc_buffer_base_ - 1; }
+    i32 GetDocOffsetInBuffer() const { return doc_buffer_cursor_ - doc_buffer_ - 1; }
 
     void DecodeTFBuffer() {
         if (posting_option_.HasTfList()) {
@@ -120,16 +118,14 @@ private:
     u32 doc_freq_ = 0;
 
     // info for skiplist, block max
-    RowID last_doc_id_in_prev_block_ = INVALID_ROWID;
-    RowID lowest_possible_doc_id_in_current_block_ = INVALID_ROWID;
-    RowID last_doc_id_in_current_block_ = INVALID_ROWID;
+    RowID block_first_row_id_ = INVALID_ROWID;
+    RowID block_last_row_id_ = INVALID_ROWID;
     ttf_t current_ttf_ = 0;
 
     // info for decode buffer
     RowID current_row_id_ = INVALID_ROWID;
     docid_t *doc_buffer_cursor_ = nullptr;
     docid_t doc_buffer_[MAX_DOC_PER_RECORD] = {};
-    docid_t *doc_buffer_base_ = nullptr;
     i32 tf_buffer_cursor_ = 0;
     tf_t *tf_buffer_ = nullptr;
     docpayload_t *doc_payload_buffer_ = nullptr;

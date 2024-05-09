@@ -32,6 +32,7 @@ export {
     typedef i64 ttf_t;
 
     constexpr optionflag_t OPTION_FLAG_ALL = of_term_payload | of_doc_payload | of_position_list | of_term_frequency | of_block_max;
+    constexpr optionflag_t OPTION_FLAG_BLOCK_MAX = of_position_list | of_term_frequency | of_block_max;
     constexpr optionflag_t NO_BLOCK_MAX = of_term_payload | of_doc_payload | of_position_list | of_term_frequency;
     constexpr optionflag_t NO_TERM_FREQUENCY = of_term_payload | of_doc_payload;
     constexpr optionflag_t OPTION_FLAG_NONE = of_none;

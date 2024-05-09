@@ -22,7 +22,6 @@ namespace infinity {
 PostingIterator::PostingIterator(optionflag_t flag, MemoryPool *session_pool) : posting_option_(flag), session_pool_(session_pool) {
     tf_buffer_ = (tf_t *)((session_pool_)->Allocate(sizeof(tf_t) * MAX_DOC_PER_RECORD));
     doc_payload_buffer_ = (docpayload_t *)((session_pool_)->Allocate(sizeof(docpayload_t) * MAX_DOC_PER_RECORD));
-    doc_buffer_base_ = doc_buffer_;
 }
 
 PostingIterator::~PostingIterator() {
@@ -48,15 +47,18 @@ bool PostingIterator::Init(SharedPtr<Vector<SegmentPosting>> seg_postings, const
 }
 
 bool PostingIterator::SkipTo(RowID doc_id) {
-    if (doc_id > last_doc_id_in_current_block_ or last_doc_id_in_current_block_ == INVALID_ROWID) {
-        finish_decode_docid_ = false;
-        return posting_decoder_->SkipTo(doc_id,
-                                        last_doc_id_in_prev_block_,
-                                        lowest_possible_doc_id_in_current_block_,
-                                        last_doc_id_in_current_block_,
+    assert(doc_id != INVALID_ROWID);
+    if (block_last_row_id_ != INVALID_ROWID && doc_id <= block_last_row_id_) [[likely]]
+        return true;
+    finish_decode_docid_ = false;
+    bool ret = posting_decoder_->SkipTo(doc_id,
+                                        block_first_row_id_,
+                                        block_last_row_id_,
                                         current_ttf_);
-    }
-    return true;
+    assert(block_first_row_id_ <= block_last_row_id_ && block_last_row_id_ != INVALID_ROWID);
+    assert((ret && doc_id <= block_last_row_id_) || (!ret && doc_id > block_last_row_id_));
+    current_row_id_ = block_first_row_id_;
+    return ret;
 }
 
 // u32: block max tf
@@ -64,48 +66,40 @@ bool PostingIterator::SkipTo(RowID doc_id) {
 Pair<u32, u16> PostingIterator::GetBlockMaxInfo() const { return posting_decoder_->GetBlockMaxInfo(); }
 
 RowID PostingIterator::SeekDoc(RowID row_id) {
-    RowID current_row_id = finish_decode_docid_ ? current_row_id_ : INVALID_ROWID;
-    if (row_id == current_row_id) [[unlikely]] {
-        return current_row_id;
+    assert(row_id != INVALID_ROWID);
+    if (block_last_row_id_ == INVALID_ROWID || row_id > block_last_row_id_) [[unlikely]] {
+        if (!SkipTo(row_id)) {
+            current_row_id_ = INVALID_ROWID;
+            return INVALID_ROWID;
+        }
     }
-    if (current_row_id != INVALID_ROWID and row_id < current_row_id) {
-        return current_row_id;
-    }
-    assert(row_id > current_row_id or current_row_id == INVALID_ROWID);
-    if (!SkipTo(row_id)) {
-        current_row_id_ = INVALID_ROWID;
-        return INVALID_ROWID;
-    }
+    assert(current_row_id_ != INVALID_ROWID && current_row_id_ >= block_first_row_id_);
     if (!finish_decode_docid_) {
         posting_decoder_->DecodeCurrentDocIDBuffer(doc_buffer_);
-        current_row_id = last_doc_id_in_prev_block_ + doc_buffer_[0];
         doc_buffer_cursor_ = doc_buffer_ + 1;
         finish_decode_docid_ = true;
     }
-    docid_t *cursor = doc_buffer_cursor_;
-    while (current_row_id < row_id) {
-        current_row_id += *(cursor++);
+    while (current_row_id_ < row_id) {
+        current_row_id_ += *(doc_buffer_cursor_++);
     }
-    current_row_id_ = current_row_id;
-    doc_buffer_cursor_ = cursor;
     need_move_to_current_doc_ = true;
-    return current_row_id;
+    return current_row_id_;
 }
 
 Pair<bool, RowID> PostingIterator::PeekInBlockRange(RowID doc_id, RowID doc_id_no_beyond) {
+    assert(block_first_row_id_ <= current_row_id_ && current_row_id_ <= block_last_row_id_ && block_last_row_id_ != INVALID_ROWID);
+    assert(doc_id <= block_last_row_id_ && doc_id <= doc_id_no_beyond);
     if (!finish_decode_docid_) {
         posting_decoder_->DecodeCurrentDocIDBuffer(doc_buffer_);
-        current_row_id_ = last_doc_id_in_prev_block_ + doc_buffer_[0];
         doc_buffer_cursor_ = doc_buffer_ + 1;
+        current_row_id_ = block_first_row_id_;
         finish_decode_docid_ = true;
     }
-    RowID current_row_id = current_row_id_;
-    docid_t *cursor = doc_buffer_cursor_;
-    while (current_row_id < doc_id) {
-        current_row_id += *(cursor++);
+    while (current_row_id_ < doc_id) {
+        current_row_id_ += *(doc_buffer_cursor_++);
     }
-    if (current_row_id <= doc_id_no_beyond) {
-        return {true, current_row_id};
+    if (current_row_id_ <= doc_id_no_beyond) {
+        return {true, current_row_id_};
     }
     return {false, INVALID_ROWID};
 }
@@ -158,8 +152,8 @@ void PostingIterator::Reset() {
     posting_decoder_->Init(segment_postings_);
 
     current_row_id_ = INVALID_ROWID;
-    last_doc_id_in_prev_block_ = INVALID_ROWID;
-    last_doc_id_in_current_block_ = INVALID_ROWID;
+    block_first_row_id_ = INVALID_ROWID;
+    block_last_row_id_ = INVALID_ROWID;
     current_ttf_ = 0;
     need_move_to_current_doc_ = false;
     in_doc_pos_iter_inited_ = false;

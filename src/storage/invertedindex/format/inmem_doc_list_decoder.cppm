@@ -28,22 +28,22 @@ public:
 
     void Init(df_t df, SkipListReaderPostingByteSlice *skiplist_reader, PostingByteSlice *doc_list_buffer);
 
-    bool DecodeSkipList(docid_t start_doc_id, docid_t &prev_last_doc_id, docid_t &last_doc_id, ttf_t &current_ttf);
+    bool DecodeSkipList(docid_t start_doc_id, docid_t &block_first_doc_id, docid_t &block_last_doc_id, ttf_t &current_ttf) override;
 
     // u32: block max tf
     // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
-    Pair<u32, u16> GetBlockMaxInfo() const;
+    Pair<u32, u16> GetBlockMaxInfo() const override;
 
-    bool DecodeCurrentDocIDBuffer(docid_t *doc_buffer);
+    bool DecodeCurrentDocIDBuffer(docid_t *doc_buffer) override;
 
-    bool DecodeCurrentTFBuffer(tf_t *tf_buffer);
+    bool DecodeCurrentTFBuffer(tf_t *tf_buffer) override;
 
-    void DecodeCurrentDocPayloadBuffer(docpayload_t *doc_payload_buffer);
+    void DecodeCurrentDocPayloadBuffer(docpayload_t *doc_payload_buffer) override;
 
     u32 GetSeekedDocCount() const { return skiped_item_count_ << MAX_DOC_PER_RECORD_BIT_NUM; }
 
 private:
-    bool DecodeSkipListWithoutSkipList(docid_t last_doc_id_in_prev_record, u32 offset, docid_t start_doc_id, docid_t &last_doc_id);
+    bool DecodeSkipListWithoutSkipList(docid_t start_doc_id, docid_t &block_first_doc_id, docid_t &block_last_doc_id, ttf_t &current_ttf);
 
     // u32 skiped_item_count_ = 0;
     MemoryPool *session_pool_;
@@ -53,8 +53,12 @@ private:
     df_t df_ = 0;
     bool finish_decoded_ = false;
     bool finish_copy_prepared_doc_buffer_ = false;
+    bool has_tf_list_ = false;
     docid_t *doc_buffer_to_copy_ = nullptr;
+    tf_t *tf_buffer_to_copy_ = nullptr;
     SizeT decode_count_ = 0;
+    docid_t block_first_doc_id_ = INVALID_DOCID;
+    docid_t block_last_doc_id_ = INVALID_DOCID;
 };
 
 } // namespace infinity

@@ -21,7 +21,7 @@ public:
 
     void AddItem(u32 key, u32 value1, u32 value2);
 
-    void AddItem(u32 last_doc_id, u32 total_tf, u32 block_max_tf, u16 block_max_percentage, u32 item_size);
+    void AddItem(u32 last_doc_id, u32 total_tf, u32 block_first_doc_id, u32 block_max_tf, u16 block_max_percentage, u32 item_size);
 
     void Dump(const SharedPtr<FileWriter> &file, bool spill = false);
 

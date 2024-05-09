@@ -50,7 +50,7 @@ public:
 
     void InitBM25Info(u64 total_df, float avg_column_len, FullTextColumnLengthReader *column_length_reader);
 
-    RowID BlockMinPossibleDocID() const override { return iter_.BlockLowestPossibleDocID(); }
+    RowID BlockMinPossibleDocID() const override { return iter_.BlockFirstDocID(); }
 
     RowID BlockLastDocID() const override { return iter_.BlockLastDocID(); }
 

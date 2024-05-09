@@ -19,7 +19,7 @@ public:
 
     virtual ~IndexDecoder() = default;
 
-    virtual bool DecodeSkipList(docid_t start_doc_id, docid_t &prev_last_doc_id, docid_t &last_doc_id, ttf_t &current_ttf) = 0;
+    virtual bool DecodeSkipList(docid_t start_doc_id, docid_t &block_first_doc_id, docid_t &block_last_doc_id, ttf_t &current_ttf) = 0;
 
     // u32: block max tf
     // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
@@ -40,8 +40,8 @@ public:
 protected:
     u32 offset_ = 0;
     u32 record_len_ = 0;
-    u32 last_doc_id_in_prev_record_ = 0;
-    u32 last_doc_id_ = 0;
+    u32 block_first_doc_id_ = 0;
+    u32 block_last_doc_id_ = 0;
     u32 current_ttf_ = 0;
     u32 skiped_item_count_ = 0;
     DocListFormatOption doc_list_format_option_;
@@ -72,48 +72,48 @@ public:
         }
     }
 
-    void InitSkipList(u32 start, u32 end, ByteSliceList *posting_list, df_t df) {
+    void InitSkipList(u32 start, u32 end, ByteSliceList *posting_list, df_t df) override {
         skiplist_reader_ = session_pool_ ? (new ((session_pool_)->Allocate(sizeof(SkipListType))) SkipListType(doc_list_format_option_))
                                          : new SkipListType(doc_list_format_option_);
         skiplist_reader_->Load(posting_list, start, end);
     }
 
-    void InitSkipList(u32 start, u32 end, ByteSlice *posting_list, df_t df) {
+    void InitSkipList(u32 start, u32 end, ByteSlice *posting_list, df_t df) override {
         skiplist_reader_ = session_pool_ ? (new ((session_pool_)->Allocate(sizeof(SkipListType))) SkipListType(doc_list_format_option_))
                                          : new SkipListType(doc_list_format_option_);
         skiplist_reader_->Load(posting_list, start, end);
     }
 
-    bool DecodeSkipList(docid_t start_doc_id, docid_t &prev_last_doc_id, docid_t &last_doc_id, ttf_t &current_ttf) {
-        auto ret = skiplist_reader_->SkipTo(start_doc_id, last_doc_id_, last_doc_id_in_prev_record_, offset_, record_len_);
+    bool DecodeSkipList(docid_t start_doc_id, docid_t &block_first_doc_id, docid_t &block_last_doc_id, ttf_t &current_ttf) override {
+        auto ret = skiplist_reader_->SkipTo(start_doc_id, block_first_doc_id_, block_last_doc_id_, offset_, record_len_);
         if (!ret) {
             return false;
         }
         skiped_item_count_ = skiplist_reader_->GetSkippedItemCount();
-        prev_last_doc_id = last_doc_id_in_prev_record_;
-        last_doc_id = last_doc_id_;
+        block_first_doc_id = block_first_doc_id_;
+        block_last_doc_id = block_last_doc_id_;
         current_ttf = current_ttf_ = skiplist_reader_->GetPrevTTF();
         return true;
     }
 
     // u32: block max tf
     // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
-    Pair<u32, u16> GetBlockMaxInfo() const {
+    Pair<u32, u16> GetBlockMaxInfo() const override {
         return skiplist_reader_->GetBlockMaxInfo();
     }
 
-    bool DecodeCurrentDocIDBuffer(docid_t *doc_buffer) {
-        doc_list_reader_->Seek(offset_ + doc_list_begin_pos_);
+    bool DecodeCurrentDocIDBuffer(docid_t *doc_buffer) override {
+        doc_list_reader_->Seek(doc_list_begin_pos_ + offset_);
         doc_id_encoder_->Decode((u32 *)doc_buffer, MAX_DOC_PER_RECORD, *doc_list_reader_);
         return true;
     }
 
-    bool DecodeCurrentTFBuffer(tf_t *tf_buffer) {
+    bool DecodeCurrentTFBuffer(tf_t *tf_buffer) override {
         tf_list_encoder_->Decode((u32 *)tf_buffer, MAX_DOC_PER_RECORD, *doc_list_reader_);
         return true;
     }
 
-    void DecodeCurrentDocPayloadBuffer(docpayload_t *doc_payload_buffer) {
+    void DecodeCurrentDocPayloadBuffer(docpayload_t *doc_payload_buffer) override {
         doc_payload_encoder_->Decode(doc_payload_buffer, MAX_DOC_PER_RECORD, *doc_list_reader_);
     }
 

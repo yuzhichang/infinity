@@ -42,9 +42,9 @@ void MultiPostingDecoder::Init(SharedPtr<Vector<SegmentPosting>> &seg_postings) 
     MoveToSegment(0UL);
 }
 
-bool MultiPostingDecoder::SkipTo(RowID start_row_id, RowID &prev_last_doc_id, RowID &lowest_possible_doc_id, RowID &last_doc_id, ttf_t &current_ttf) {
+bool MultiPostingDecoder::SkipTo(RowID start_row_id, RowID &block_first_row_id, RowID &block_last_row_id, ttf_t &current_ttf) {
     while (true) {
-        if (SkipInOneSegment(start_row_id, prev_last_doc_id, lowest_possible_doc_id, last_doc_id, current_ttf)) {
+        if (SkipInOneSegment(start_row_id, block_first_row_id, block_last_row_id, current_ttf)) {
             return true;
         }
         if (!MoveToSegment(start_row_id)) {
@@ -53,10 +53,6 @@ bool MultiPostingDecoder::SkipTo(RowID start_row_id, RowID &prev_last_doc_id, Ro
     }
     return false;
 }
-
-// u32: block max tf
-// u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
-Pair<u32, u16> MultiPostingDecoder::GetBlockMaxInfo() const { return index_decoder_->GetBlockMaxInfo(); }
 
 bool MultiPostingDecoder::DecodeCurrentDocIDBuffer(docid_t *doc_buffer) {
     if (need_decode_doc_id_) {
@@ -84,9 +80,8 @@ void MultiPostingDecoder::DecodeCurrentDocPayloadBuffer(docpayload_t *doc_payloa
 }
 
 bool MultiPostingDecoder::SkipInOneSegment(RowID start_row_id,
-                                           RowID &prev_last_row_id,
-                                           RowID &lowest_possible_row_id,
-                                           RowID &last_row_id,
+                                           RowID &block_first_row_id,
+                                           RowID &block_last_row_id,
                                            ttf_t &current_ttf) {
     RowID next_seg_base_row_id = GetSegmentBaseRowId(segment_cursor_);
     if (next_seg_base_row_id != INVALID_ROWID && start_row_id >= next_seg_base_row_id) {
@@ -94,17 +89,16 @@ bool MultiPostingDecoder::SkipInOneSegment(RowID start_row_id,
         return false;
     }
     docid_t cur_seg_doc_id = (start_row_id >= base_row_id_) ? docid_t(start_row_id - base_row_id_) : 0;
-    docid_t prev_last_doc_id, last_doc_id;
-    if (!index_decoder_->DecodeSkipList(cur_seg_doc_id, prev_last_doc_id, last_doc_id, current_ttf)) {
+    docid_t block_first_doc_id, block_last_doc_id;
+    if (!index_decoder_->DecodeSkipList(cur_seg_doc_id, block_first_doc_id, block_last_doc_id, current_ttf)) {
         return false;
     }
     need_decode_doc_id_ = true;
     need_decode_tf_ = format_option_.HasTfList();
     need_decode_doc_payload_ = format_option_.HasDocPayload();
 
-    prev_last_row_id = base_row_id_ + prev_last_doc_id;
-    lowest_possible_row_id = prev_last_doc_id == 0 ? prev_last_row_id : prev_last_row_id + 1;
-    last_row_id = base_row_id_ + last_doc_id;
+    block_first_row_id = base_row_id_ + block_first_doc_id;
+    block_last_row_id = base_row_id_ + block_last_doc_id;
     return true;
 }
 

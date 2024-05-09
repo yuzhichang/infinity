@@ -15,9 +15,7 @@ public:
     SimpleFormat(SizeT count) {
         for (SizeT i = 0; i < count; ++i) {
             PostingField *value = new TypedPostingField<T>();
-            value->location_ = i;
-            value->offset_ = i * sizeof(T);
-            values_.push_back(value);
+            AddValue(value);
         }
     }
 };
@@ -208,15 +206,11 @@ TEST_F(PostingBufferTest, test8) {
     macro(uint16_t);
 
     PostingFields posting_fields;
-    SizeT offset = 0;
     SizeT pos = 0;
 
 #define ADD_VALUE_HELPER_FOR_TEST(type)                                                                                                              \
     {                                                                                                                                                \
         PostingField *value = new TypedPostingField<type>();                                                                                         \
-        value->location_ = pos++;                                                                                                                    \
-        value->offset_ = offset;                                                                                                                     \
-        offset += sizeof(type);                                                                                                                      \
         posting_fields.AddValue(value);                                                                                                              \
     }
 

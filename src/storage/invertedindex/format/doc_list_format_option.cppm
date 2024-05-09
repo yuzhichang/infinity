@@ -60,50 +60,18 @@ public:
     ~DocSkipListFormat() = default;
 
     void Init(const DocListFormatOption &option) {
-        u8 row_count = 0;
-        u32 offset = 0;
-        {
-            // NoCompressPostingValue<u32> *doc_id_field = new NoCompressPostingValue<u32>;
-            TypedPostingField<u32> *doc_id_field = new TypedPostingField<u32>;
-            doc_id_field->location_ = row_count++;
-            doc_id_field->offset_ = offset;
-            doc_id_field->encoder_ = GetSkipListEncoder();
-            values_.push_back(doc_id_field);
-            offset += sizeof(u32);
-        }
+        AddU32Value(); // doc_id
         if (option.HasTfList()) {
             has_tf_list_ = true;
-            TypedPostingField<u32> *tf_field = new TypedPostingField<u32>;
-            tf_field->location_ = row_count++;
-            tf_field->offset_ = offset;
-            tf_field->encoder_ = GetSkipListEncoder();
-            values_.push_back(tf_field);
-            offset += sizeof(u32);
+            AddU32Value(); // ttf
         }
         if (option.HasBlockMax()) {
             has_block_max_ = true;
-            // max_tf in a block
-            TypedPostingField<u32> *max_tf_field = new TypedPostingField<u32>;
-            max_tf_field->location_ = row_count++;
-            max_tf_field->offset_ = offset;
-            max_tf_field->encoder_ = GetSkipListEncoder();
-            values_.push_back(max_tf_field);
-            offset += sizeof(u32);
-            // max_percentage in a block (max tf / doc_len, quantized to u16)
-            TypedPostingField<u16> *max_percentage_field = new TypedPostingField<u16>;
-            max_percentage_field->location_ = row_count++;
-            max_percentage_field->offset_ = offset;
-            max_percentage_field->encoder_ = GetTermPercentageEncoder();
-            values_.push_back(max_percentage_field);
-            offset += sizeof(u16);
+            AddU32Value(); // block_first_doc_id
+            AddU32Value(); // block_max_tf
+            AddU16Value(); // block_max_percentage
         }
-        {
-            TypedPostingField<u32> *offset_field = new TypedPostingField<u32>;
-            offset_field->location_ = row_count++;
-            offset_field->offset_ = offset;
-            offset_field->encoder_ = GetSkipListEncoder();
-            values_.push_back(offset_field);
-        }
+        AddU32Value(); // offset
     }
 
     bool HasTfList() const { return has_tf_list_; }
@@ -127,29 +95,12 @@ public:
     };
 
     void Init(const DocListFormatOption &option) {
-        u8 row_count = 0;
-        u32 offset = 0;
-        {
-            TypedPostingField<u32> *doc_id_field = new TypedPostingField<u32>;
-            doc_id_field->location_ = row_count++;
-            doc_id_field->offset_ = offset;
-            doc_id_field->encoder_ = GetDocIDEncoder();
-            values_.push_back(doc_id_field);
-            offset += sizeof(u32);
-        }
+        AddU32Value(); // doc_id
         if (option.HasTfList()) {
-            TypedPostingField<u32> *tf_field = new TypedPostingField<u32>;
-            tf_field->location_ = row_count++;
-            tf_field->offset_ = offset;
-            tf_field->encoder_ = GetTFEncoder();
-            values_.push_back(tf_field);
-            offset += sizeof(u32);
+            AddU32Value(); // tf
         }
         if (option.HasDocPayload()) {
-            PostingField *doc_payload_value = new TypedPostingField<u16>;
-            doc_payload_value->location_ = row_count++;
-            doc_payload_value->offset_ = offset;
-            values_.push_back(doc_payload_value);
+            AddU16Value(); // doc_payload
         }
         skiplist_format_ = new DocSkipListFormat;
         skiplist_format_->Init(option);

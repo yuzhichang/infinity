@@ -27,11 +27,11 @@ public:
 
     inline void MoveToCurrentDocPosition(ttf_t current_ttf) { in_doc_state_keeper_.MoveToDoc(current_ttf); }
 
-    bool SkipTo(RowID start_row_id, RowID &prev_last_row_id, RowID &lowest_possible_doc_id, RowID &last_row_id, ttf_t &current_ttf);
+    bool SkipTo(RowID start_row_id, RowID &block_first_row_id, RowID &block_last_row_id, ttf_t &current_ttf);
 
     // u32: block max tf
     // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
-    Pair<u32, u16> GetBlockMaxInfo() const;
+    inline Pair<u32, u16> GetBlockMaxInfo() const {return index_decoder_->GetBlockMaxInfo();}
 
     bool DecodeCurrentDocIDBuffer(docid_t *doc_buffer);
 
@@ -44,7 +44,7 @@ public:
     u32 InnerGetSeekedDocCount() const { return index_decoder_->InnerGetSeekedDocCount(); }
 
 private:
-    bool SkipInOneSegment(RowID start_row_id, RowID &prev_last_row_id, RowID &lowest_possible_doc_id, RowID &last_doc_id, ttf_t &current_ttf);
+    bool SkipInOneSegment(RowID start_row_id, RowID &block_first_row_id, RowID &block_last_row_id, ttf_t &current_ttf);
 
     IndexDecoder *CreateIndexDecoder(u32 doc_list_begin_pos);
 
@@ -87,6 +87,7 @@ private:
     IndexDecoder *index_decoder_ = nullptr;
     u32 segment_cursor_ = 0;
     u32 segment_count_ = 0;
+    RowID block_first_row_id_ = 0;
 
     SharedPtr<Vector<SegmentPosting>> seg_postings_;
     ByteSliceReader doc_list_reader_;

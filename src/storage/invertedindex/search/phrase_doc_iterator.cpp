@@ -36,6 +36,9 @@ namespace infinity {
             doc_id = max_doc_id;
         }
         doc_id_ = doc_id;
+        if (doc_id == INVALID_ROWID) {
+            return;
+        }
         for (SizeT i = 0; i < iters_.size(); ++i) {
             iters_[i]->SeekDoc(doc_id_);
         }

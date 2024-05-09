@@ -19,9 +19,10 @@ public:
         : has_tf_list_(doc_list_format_option.HasTfList()),
           has_block_max_(doc_list_format_option.HasBlockMax()) {
         if (has_tf_list_) {
-            ttf_buffer_ = MakeUnique<u32[]>(SKIP_LIST_BUFFER_SIZE);
+            tf_buffer_ = MakeUnique<u32[]>(SKIP_LIST_BUFFER_SIZE);
         }
         if (has_block_max_) {
+            block_first_doc_id_buffer_ = MakeUnique<u32[]>(SKIP_LIST_BUFFER_SIZE);
             block_max_tf_buffer_ = MakeUnique<u32[]>(SKIP_LIST_BUFFER_SIZE);
             block_max_tf_percentage_buffer_ = MakeUnique<u16[]>(SKIP_LIST_BUFFER_SIZE);
         }
@@ -31,13 +32,10 @@ public:
 
     virtual ~SkipListReader() = default;
 
-    bool SkipTo(u32 query_doc_id, u32 &doc_id, u32 &prev_doc_id, u32 &offset, u32 &delta);
-
-    bool SkipTo(u32 query_doc_id, u32 &doc_id, u32 &offset, u32 &delta) { return SkipTo(query_doc_id, doc_id, prev_doc_id_, offset, delta); }
-
-    i32 GetSkippedItemCount() const { return std::max(static_cast<i32>(skipped_item_count_) - 1, 0); }
-
-    u32 GetPrevDocId() const { return prev_doc_id_; }
+    /**
+     * Dedicated methods for doc_list skiplist, the key is doc_id
+     */
+    bool SkipTo(u32 query_doc_id, u32 &block_first_doc_id, u32 &block_last_docIid, u32 &block_offset, u32 &block_len);
 
     u32 GetCurrentDocId() const { return current_doc_id_; }
 
@@ -45,7 +43,24 @@ public:
 
     u32 GetPrevTTF() const { return prev_ttf_; }
 
-    u32 GetPrevKey() const { return GetPrevDocId(); }
+    // u32: block max tf
+    // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
+    Pair<u32, u16> GetBlockMaxInfo() const { return {current_block_max_tf_, current_block_max_tf_percentage_}; }
+
+    // u32: block first doc id
+    inline u32 GetBlockFirstDocID() const {return current_block_first_doc_id_;}
+
+    /**
+     * Dedicated methods for pos_list skiplist, the key is ttf
+     */
+    bool SkipTo(u32 query_ttf, u32 &current_ttf, u32 &block_offset, u32 &block_len) { return SkipTo(query_ttf, current_block_first_doc_id_, current_ttf, block_offset, block_len); }
+
+    /**
+     * Common methods for pos_list skiplist, the key is ttf
+     */
+    i32 GetSkippedItemCount() const { return std::max(static_cast<i32>(skipped_item_count_) - 1, 0); }
+
+    u32 GetPrevKey() const { return prev_doc_id_; }
 
     u32 GetCurrentKey() const { return GetCurrentDocId(); }
 
@@ -53,31 +68,29 @@ public:
 
     u32 GetLastKeyInBuffer() const;
 
-    // u32: block max tf
-    // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
-    Pair<u32, u16> GetBlockMaxInfo() const { return {current_block_max_tf_, current_block_max_tf_percentage_}; }
-
 protected:
     virtual Pair<int, bool> LoadBuffer() = 0;
 
     const bool has_tf_list_ = false;
     const bool has_block_max_ = false;
     i32 skipped_item_count_ = 0;
-    u32 current_doc_id_ = 0;
+    u32 current_doc_id_ = INVALID_DOCID;
     u32 current_offset_ = 0;
     u32 current_ttf_ = 0;
+    u32 current_block_first_doc_id_ = INVALID_DOCID;
     u32 current_block_max_tf_ = 0;
     u16 current_block_max_tf_percentage_ = 0;
-    u32 prev_doc_id_ = 0;
+    u32 prev_doc_id_ = INVALID_DOCID;
     u32 prev_offset_ = 0;
     u32 prev_ttf_ = 0;
     u32 current_cursor_ = 0;
     u32 num_in_buffer_ = 0;
     u32 doc_id_buffer_[SKIP_LIST_BUFFER_SIZE] = {};
     u32 offset_buffer_[SKIP_LIST_BUFFER_SIZE] = {};
-    UniquePtr<u32[]> ttf_buffer_;
+    UniquePtr<u32[]> tf_buffer_;
     UniquePtr<u32[]> block_max_tf_buffer_;
     UniquePtr<u16[]> block_max_tf_percentage_buffer_;
+    UniquePtr<u32[]> block_first_doc_id_buffer_;
 };
 
 export class SkipListReaderByteSlice final : public SkipListReader {

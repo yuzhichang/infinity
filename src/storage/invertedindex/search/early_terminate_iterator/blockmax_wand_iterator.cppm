@@ -63,7 +63,6 @@ private:
     RowID common_block_last_doc_id_{};
     float common_block_max_bm25_score_{};
     Vector<UniquePtr<EarlyTerminateIterator>> sorted_iterators_; // sort by DocID(), in ascending order
-    Vector<UniquePtr<EarlyTerminateIterator>> backup_iterators_;
     SizeT pivot_;
     // bm25 score cache
     bool bm25_score_cached_ = false;

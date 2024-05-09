@@ -41,4 +41,16 @@ const Int32Encoder *GetSkipListEncoder() { return EncoderProvider::GetInstance()
 
 const Int32Encoder *GetPosListEncoder() { return EncoderProvider::GetInstance()->GetInt32Encoder(); }
 
+void PostingFields::AddU32Value() {
+    TypedPostingField<u32> *field = new TypedPostingField<u32>;
+    field->encoder_ = EncoderProvider::GetInstance()->GetInt32Encoder();
+    AddValue(field);
+}
+
+void PostingFields::AddU16Value() {
+    TypedPostingField<u16> *field = new TypedPostingField<u16>;
+    field->encoder_ = EncoderProvider::GetInstance()->GetInt16Encoder();
+    AddValue(field);
+}
+
 } // namespace infinity

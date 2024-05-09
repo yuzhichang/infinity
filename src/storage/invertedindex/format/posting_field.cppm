@@ -140,9 +140,20 @@ export struct PostingFields {
         return std::accumulate(values_.begin(), values_.end(), 0, [](SizeT sum, PostingField *field) { return sum + field->GetSize(); });
     }
 
-    void AddValue(PostingField *value) { values_.push_back(value); }
+    void AddValue(PostingField *value) {
+        value->location_ = row_count_++;
+        value->offset_ = offset_;
+        offset_ += value->GetSize();
+        values_.push_back(value);
+    }
+
+    void AddU32Value();
+
+    void AddU16Value();
 
     Vector<PostingField *> values_;
+    u8 row_count_ = 0;
+    u32 offset_ = 0;
 };
 
 } // namespace infinity

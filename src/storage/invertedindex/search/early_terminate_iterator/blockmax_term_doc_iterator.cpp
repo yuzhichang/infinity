@@ -62,15 +62,23 @@ bool BlockMaxTermDocIterator::NextShallow(RowID doc_id){
     if (threshold_ > BM25ScoreUpperBound()) [[unlikely]] {
         return false;
     }
+    if (doc_id_!=INVALID_ROWID && doc_id <= doc_id_) [[unlikely]]{
+        return true;
+    }
+    if (iter_.BlockLastDocID() != INVALID_ROWID && doc_id <= iter_.BlockLastDocID()) [[likely]] {
+        doc_id_ = doc_id;
+        return true;
+    }
     while (true) {
         ++block_skip_cnt_inner_;
         if (!iter_.SkipTo(doc_id)) {
             return false;
         }
         if (BlockMaxBM25Score() > threshold_) {
+            // NOTE: docode doc_id list lazily
+            doc_id_ = std::max(iter_.BlockFirstDocID(), doc_id);
             return true;
         }
-        doc_id = BlockLastDocID() + 1;
     }
 }
 
@@ -147,6 +155,14 @@ float BlockMaxTermDocIterator::BM25Score() {
     }
     calc_score_cnt_++;
     prev_calc_score_doc_id_ = doc_id_;
+
+    // NOTE: docode doc_id list lazily
+    RowID doc_id = iter_.SeekDoc(doc_id_);
+    if(doc_id > doc_id_){
+        doc_id_ = doc_id;
+        return 0.0f;
+    }
+
     // bm25_common_score_ * tf / (tf + k1 * (1.0F - b + b * column_len / avg_column_len));
     const auto [tf, doc_len] = GetScoreData();
     const float p = f1 + f2 * doc_len;
