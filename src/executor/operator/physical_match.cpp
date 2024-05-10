@@ -15,6 +15,7 @@
 module;
 
 #include <cassert>
+#include <cstdlib>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -589,6 +590,8 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     const String &block_max_option = search_ops.options_["block_max"];
     bool use_ordinary_iter = false;
     bool use_block_max_iter = false;
+    const String &threshold = search_ops.options_["threshold"];
+    const float begin_threshold = strtof(threshold.c_str(), nullptr);
     if (block_max_option == "true" or block_max_option.empty()) {
         use_block_max_iter = true;
     } else if (block_max_option == "false") {
@@ -643,6 +646,7 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
 
     if (use_block_max_iter) {
         et_iter = query_builder.CreateEarlyTerminateSearch(full_text_query_context);
+        et_iter->UpdateScoreThreshold(begin_threshold);
     }
     if (use_ordinary_iter) {
         doc_iterator = query_builder.CreateSearch(full_text_query_context);
@@ -650,6 +654,8 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     if (use_block_max_iter and use_ordinary_iter) {
         et_iter_2 = query_builder.CreateEarlyTerminateSearch(full_text_query_context);
         et_iter_3 = query_builder.CreateEarlyTerminateSearch(full_text_query_context);
+        et_iter_2->UpdateScoreThreshold(begin_threshold);
+        et_iter_3->UpdateScoreThreshold(begin_threshold);
     }
 
     // 3 full text search
