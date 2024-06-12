@@ -50,8 +50,8 @@ public:
     RowID GetBaseRowId() const { return base_row_id_; }
     void SetBaseRowId(RowID base_row_id) { base_row_id_ = base_row_id; }
 
+    // Assumes that Init() has been called
     u32 GetDocCount() const { return doc_count_; }
-    void SetDocCount(const u32 doc_count) { doc_count_ = doc_count; }
 
     const SharedPtr<PostingWriter> &GetInMemPostingWriter() const { return posting_writer_; }
     bool IsInMemorySegment() const { return posting_writer_.get(); }
