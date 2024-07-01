@@ -24,6 +24,7 @@ import index_defines;
 import early_terminate_iterator;
 import internal_types;
 import logger;
+import third_party;
 
 namespace infinity {
 
@@ -325,12 +326,14 @@ void BlockMaxMaxscoreIterator::UpdateScoreThreshold(const float threshold) {
     while (pivot_ > 0 and threshold > (pivot_ > 1 ? leftover_scores_upper_bound_[pivot_ - 2] : BlockMaxBM25Score())) {
         --pivot_;
         pivot_history_.emplace_back(pivot_, doc_id_.ToUint64());
+        LOG_DEBUG(fmt::format("pivot_ become {}", pivot_));
     }
     // update must have
     while (must_have_before_ < sorted_iterators_.size() and
            threshold > must_have_total_upper_bound_score_ + leftover_scores_upper_bound_[must_have_before_]) {
         must_have_total_upper_bound_score_ += sorted_iterators_[must_have_before_++]->BM25ScoreUpperBound();
         must_have_history_.emplace_back(must_have_before_, doc_id_.ToUint64());
+        LOG_DEBUG(fmt::format("must_have_before_ become {}", must_have_before_));
     }
 }
 
