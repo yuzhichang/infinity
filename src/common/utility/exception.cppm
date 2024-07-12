@@ -50,13 +50,9 @@ private:
 
 #if defined(INFINITY_DEBUG) || defined(ADD_LOG_INFO)
 
-export void RecoverableError(Status status,
-                             const char *file_name = std::source_location::current().file_name(),
-                             u32 line = std::source_location::current().line());
+export void RecoverableError(Status status, const char *file_name = __FILE__, u32 line = __LINE__);
 
-export void UnrecoverableError(const String &message,
-                               const char *file_name = std::source_location::current().file_name(),
-                               u32 line = std::source_location::current().line());
+export void UnrecoverableError(const String &message, const char *file_name = __FILE__, u32 line = __LINE__);
 
 export std::string_view GetErrorMsg(const String &message);
 

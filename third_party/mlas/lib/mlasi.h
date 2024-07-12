@@ -19,6 +19,7 @@ Abstract:
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>

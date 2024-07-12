@@ -14,10 +14,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <exception>
 #include <string>
-#include <cstdint>
-#include <source_location>
 
 namespace infinity {
 
@@ -31,10 +30,7 @@ private:
 };
 
 #ifdef INFINITY_DEBUG
-inline void ParserAssert(bool is_true,
-            const std::string &message,
-            const char *file_name = std::source_location::current().file_name(),
-            uint32_t line = std::source_location::current().line()) {
+inline void ParserAssert(bool is_true, const std::string &message, const char *file_name = __FILE__, uint32_t line = __LINE__) {
     if (!(is_true)) {
         std::string path = file_name;
         const auto pos = path.find("/src/");

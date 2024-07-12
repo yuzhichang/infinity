@@ -286,9 +286,6 @@ target_link_libraries(infinity
         lz4.a
         atomic.a
         event.a
-        c++.a
-        c++abi.a
-#        profiler
         oatpp.a
         jma
         opencc
@@ -333,18 +330,16 @@ target_link_libraries(embedded_infinity_ext PRIVATE
         zsv_parser
         newpfor
         fastpfor
-        jma
-        opencc
         lz4.a
         atomic.a
         event.a
         oatpp.a
-        c++.a
-        c++abi.a
+        jma
+        opencc
 )
 
-# WARN: python modules shall not link to static libstdc++!!!
-target_link_options(embedded_infinity_ext PRIVATE -static-libgcc)
+# WARN: python modules shall dynamicly link to libstdc++!!!
+#target_link_options(embedded_infinity_ext PRIVATE -static-libstdc++ -static-libgcc)
 set_target_properties(embedded_infinity_ext PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
 target_link_directories(embedded_infinity_ext PUBLIC "${CMAKE_BINARY_DIR}/lib")
@@ -464,8 +459,6 @@ target_link_libraries(unit_test
         lz4.a
         atomic.a
         thrift.a
-        c++.a
-        c++abi.a
         jma
         opencc
 )
@@ -493,8 +486,6 @@ target_include_directories(unit_test PUBLIC "${CMAKE_BINARY_DIR}/third_party/thr
 target_include_directories(unit_test PUBLIC "${CMAKE_SOURCE_DIR}/third_party/pgm/include")
 target_include_directories(unit_test PUBLIC "${CMAKE_SOURCE_DIR}/third_party/googletest/googletest/include")
 target_include_directories(unit_test PUBLIC "${CMAKE_SOURCE_DIR}/third_party/opencc")
-
-target_compile_options(unit_test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -mfma -mf16c -mpopcnt>)
 
 # target_compile_options(unit_test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -mfma -mf16c -mpopcnt>)
 if (SUPPORT_AVX2 EQUAL 0 OR SUPPORT_AVX512 EQUAL 0)

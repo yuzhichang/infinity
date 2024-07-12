@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "json.hpp"
 #include "parser_assert.h"
 #include <bitset>
 #include <charconv>
@@ -179,12 +180,12 @@ private:
         ss << "[";
         for (size_t i = 0; i < dimension - 1; ++i) {
             char buffer[20];
-            auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), ((float *)(embedding.ptr))[i], std::chars_format::general, 7);
+            auto ptr = nlohmann::detail::to_chars(buffer, buffer + sizeof(buffer), ((float *)(embedding.ptr))[i]);
             ss.write((const char *)buffer, ptr - buffer);
             ss.put(',');
         }
         char buffer[20];
-        auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), ((float *)(embedding.ptr))[dimension - 1], std::chars_format::general, 7);
+        auto ptr = nlohmann::detail::to_chars(buffer, buffer + sizeof(buffer), ((float *)(embedding.ptr))[dimension - 1]);
         ss.write((const char *)buffer, ptr - buffer);
         ss << "]";
         return ss.str();
@@ -196,12 +197,12 @@ private:
         ss << "[";
         for (size_t i = 0; i < dimension - 1; ++i) {
             char buffer[20];
-            auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), ((double *)(embedding.ptr))[i], std::chars_format::general, 16);
+            auto ptr = nlohmann::detail::to_chars(buffer, buffer + sizeof(buffer), ((double *)(embedding.ptr))[i]);
             ss.write((const char *)buffer, ptr - buffer);
             ss.put(',');
         }
         char buffer[20];
-        auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), ((double *)(embedding.ptr))[dimension - 1], std::chars_format::general, 16);
+        auto ptr = nlohmann::detail::to_chars(buffer, buffer + sizeof(buffer), ((double *)(embedding.ptr))[dimension - 1]);
         ss.write((const char *)buffer, ptr - buffer);
         ss << "]";
         return ss.str();
