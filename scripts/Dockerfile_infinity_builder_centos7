@@ -22,25 +22,23 @@ RUN rm -f /etc/yum.repos.d/* && sed -i 's/^enabled=1/enabled=0/' /etc/yum/plugin
 # https://www.getpagespeed.com/server-setup/how-to-fix-yum-after-centos-6-went-eol
 COPY centos7-vault.repo /etc/yum.repos.d/
 
-RUN yum -y install git make wget which vim file gcc-c++ \
+RUN yum -y install git make wget which vim file \
         python3 python3-devel gettext-devel openssl-devel \
         unzip bzip2 libtool m4 tree rpm-build postgresql \
     && yum clean all \
     && echo '/usr/local/lib' >> /etc/ld.so.conf.d/local.conf \
     && echo '/usr/local/lib64' >> /etc/ld.so.conf.d/local.conf
 
+RUN yum -y install devtoolset-10-gcc devtoolset-10-gcc-c++ devtoolset-10-binutils
+
+ENV PATH=$PATH:/opt/rh/devtoolset-10/root/usr/bin
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/rh/devtoolset-10/root/usr/lib64:/opt/rh/devtoolset-10/root/usr/lib
+
 # Install bison-3.8.2
 RUN --mount=type=bind,source=bison-3.8.2.tar.xz,target=/root/bison-3.8.2.tar.xz \
     cd /root && tar xf bison-3.8.2.tar.xz && cd bison-3.8.2 \
     && ./configure && make -j && make install \
     && ldconfig && cd /root && rm -rf bison-3.8.2
-
-# Install binutils-2.41
-RUN --mount=type=bind,source=binutils-2.41.tar.xz,target=/root/binutils-2.41.tar.xz \
-    cd /root && tar xf binutils-2.41.tar.xz && cd binutils-2.41 \
-    && ./configure --enable-gold \
-    && make -j && make install-strip \
-    && ldconfig && cd /root && rm -rf binutils-2.41
 
 # Install gcc-13.2.0
 RUN --mount=type=bind,source=gcc-13.2.0.tar.xz,target=/root/gcc-13.2.0.tar.xz \
