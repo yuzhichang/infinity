@@ -53,8 +53,8 @@ class AnnIVFFlat final : public KnnDistance<typename Compare::DistanceType> {
 public:
     explicit AnnIVFFlat(const DistType *queries, u64 query_count, u32 top_k, u32 dimension, EmbeddingDataType elem_data_type)
         : KnnDistance<DistType>(algo, elem_data_type, query_count, dimension, top_k), queries_(queries) {
-        id_array_ = MakeUniqueForOverwrite<RowID[]>(top_k * query_count);
-        distance_array_ = MakeUniqueForOverwrite<DistType[]>(top_k * query_count);
+        id_array_ = MakeUnique<RowID[]>(top_k * query_count);
+        distance_array_ = MakeUnique<DistType[]>(top_k * query_count);
         result_handler_ = MakeUnique<ResultHandler>(query_count, top_k, distance_array_.get(), id_array_.get());
     }
 
@@ -111,7 +111,7 @@ public:
         }
         this->total_base_count_ += base_ivf->data_num_;
         if (n_probes == 1) {
-            auto assign_centroid_ids = MakeUniqueForOverwrite<u32[]>(this->query_count_);
+            auto assign_centroid_ids = MakeUnique<u32[]>(this->query_count_);
             search_top_1_without_dis<DistType>(this->dimension_,
                                                this->query_count_,
                                                this->queries_,
@@ -129,8 +129,8 @@ public:
                 }
             }
         } else {
-            auto centroid_dists = MakeUniqueForOverwrite<DistType[]>(n_probes * this->query_count_);
-            auto centroid_ids = MakeUniqueForOverwrite<u32[]>(n_probes * this->query_count_);
+            auto centroid_dists = MakeUnique<DistType[]>(n_probes * this->query_count_);
+            auto centroid_ids = MakeUnique<u32[]>(n_probes * this->query_count_);
             search_top_k_with_dis(n_probes,
                                   this->dimension_,
                                   this->query_count_,
@@ -172,7 +172,7 @@ public:
         }
         this->total_base_count_ += base_ivf->data_num_;
         if (n_probes == 1) {
-            auto assign_centroid_ids = MakeUniqueForOverwrite<u32[]>(this->query_count_);
+            auto assign_centroid_ids = MakeUnique<u32[]>(this->query_count_);
             search_top_1_without_dis<DistType>(this->dimension_,
                                                this->query_count_,
                                                this->queries_,
@@ -193,8 +193,8 @@ public:
                 }
             }
         } else {
-            auto centroid_dists = MakeUniqueForOverwrite<DistType[]>(n_probes * this->query_count_);
-            auto centroid_ids = MakeUniqueForOverwrite<u32[]>(n_probes * this->query_count_);
+            auto centroid_dists = MakeUnique<DistType[]>(n_probes * this->query_count_);
+            auto centroid_ids = MakeUnique<u32[]>(n_probes * this->query_count_);
             search_top_k_with_dis(n_probes,
                                   this->dimension_,
                                   this->query_count_,

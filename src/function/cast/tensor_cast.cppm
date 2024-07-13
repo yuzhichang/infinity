@@ -80,7 +80,7 @@ void TensorTryCastToTensorImplInner(const u32 basic_embedding_dim,
             target_fix_heap_mgr->AppendToHeap(reinterpret_cast<const char *>(target_tmp_ptr.get()), target_size);
     } else {
         const auto target_size = source_total_dim * sizeof(TargetValueType);
-        auto target_tmp_ptr = MakeUniqueForOverwrite<TargetValueType[]>(source_total_dim);
+        auto target_tmp_ptr = MakeUnique<TargetValueType[]>(source_total_dim);
         if (!EmbeddingTryCastToFixlen::Run(reinterpret_cast<const SourceValueType *>(source_ptr),
                                            reinterpret_cast<TargetValueType *>(target_tmp_ptr.get()),
                                            source_total_dim)) {

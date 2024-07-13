@@ -63,7 +63,7 @@ private:
     Pair<u32, u32> *row_ids_ptr_ = nullptr; // with offset, start from 1, for heap sort
     const Vector<Vector<SharedPtr<ColumnVector>>> *input_data_ = nullptr;
     void Init() {
-        candidate_local_row_ids_ = MakeUniqueForOverwrite<Pair<u32, u32>[]>(limit_);
+        candidate_local_row_ids_ = MakeUnique<Pair<u32, u32>[]>(limit_);
         row_ids_ptr_ = candidate_local_row_ids_.get() - 1;
     }
     void ResetInput(const Vector<Vector<SharedPtr<ColumnVector>>> &eval_columns) {

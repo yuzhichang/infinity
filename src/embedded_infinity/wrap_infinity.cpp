@@ -297,7 +297,7 @@ ParsedExpr *WrapMatchTensorExpr::GetParsedExpr(Status &status) {
     }
     match_tensor_expr->dimension_ = dimension;
     const auto copy_bytes = EmbeddingT::EmbeddingSize(match_tensor_expr->embedding_data_type_, match_tensor_expr->dimension_);
-    match_tensor_expr->query_tensor_data_ptr_ = MakeUniqueForOverwrite<char[]>(copy_bytes);
+    match_tensor_expr->query_tensor_data_ptr_ = MakeUnique<char[]>(copy_bytes);
     std::memcpy(match_tensor_expr->query_tensor_data_ptr_.get(), embedding_data_ptr, copy_bytes);
 
     return match_tensor_expr;

@@ -33,13 +33,13 @@ private:
     mutable std::mutex mutex_check_task_start_;
     TxnTimeStamp build_time_{UNCOMMIT_TS};
 
-    // in query, use atomic_flag to check if filter is ready
-    atomic_flag finished_build_filter_;
+    // in query, use atomic_bool to check if filter is ready
+    atomic_bool finished_build_filter_;
     // zero-initialize the filter
     binary_fuse8_t filter = {};
 
 private:
-    inline bool HaveFilter() const { return finished_build_filter_.test(std::memory_order_acquire); }
+    inline bool HaveFilter() const { return finished_build_filter_.load(); }
 
 public:
     BinaryFuse() = default;
@@ -80,7 +80,7 @@ public:
             UnrecoverableError(error_message);
         }
         // set finished_build_filter_ to true
-        finished_build_filter_.test_and_set(std::memory_order_release);
+        finished_build_filter_.store(true);
     }
 
     inline bool Contain(TxnTimeStamp query_ts, uint64_t &item) const {
@@ -140,7 +140,7 @@ public:
             return false;
         }
         is.read(reinterpret_cast<char *>(filter.Fingerprints), filter.ArrayLength * sizeof(uint8_t));
-        finished_build_filter_.test_and_set(std::memory_order_release);
+        finished_build_filter_.store(true);
         return true;
     }
 };

@@ -39,8 +39,8 @@ public:
     explicit KnnFlatL2Top1(const DistType *queries, i64 query_count, i64 dimension, EmbeddingDataType elem_data_type)
         : KnnDistance<DistType>(KnnDistanceAlgoType::kKnnFlatL2Top1, elem_data_type, query_count, dimension, 1), queries_(queries) {
 
-        id_array_ = MakeUniqueForOverwrite<RowID[]>(this->query_count_);
-        distance_array_ = MakeUniqueForOverwrite<DistType[]>(this->query_count_);
+        id_array_ = MakeUnique<RowID[]>(this->query_count_);
+        distance_array_ = MakeUnique<DistType[]>(this->query_count_);
 
         result_handler_ = MakeUnique<ResultHandler>(query_count, distance_array_.get(), id_array_.get());
     }

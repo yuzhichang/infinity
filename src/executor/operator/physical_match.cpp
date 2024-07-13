@@ -711,8 +711,8 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     TimeDurationType query_builder_duration = finish_query_builder_time - finish_parse_query_tree_time;
     LOG_DEBUG(fmt::format("PhysicalMatch Part 2: Build Query iterator time: {} ms", query_builder_duration.count()));
     if (use_block_max_iter) {
-        blockmax_score_result = MakeUniqueForOverwrite<float[]>(top_n_);
-        blockmax_row_id_result = MakeUniqueForOverwrite<RowID[]>(top_n_);
+        blockmax_score_result = MakeUnique<float[]>(top_n_);
+        blockmax_row_id_result = MakeUnique<RowID[]>(top_n_);
         FullTextScoreResultHeap result_heap(top_n_, blockmax_score_result.get(), blockmax_row_id_result.get());
 #ifdef INFINITY_DEBUG
         auto blockmax_begin_ts = std::chrono::high_resolution_clock::now();
@@ -728,8 +728,8 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     if (use_ordinary_iter) {
         RowID iter_row_id = doc_iterator.get() == nullptr ? INVALID_ROWID : (doc_iterator->PrepareFirstDoc(), doc_iterator->Doc());
         if (iter_row_id != INVALID_ROWID) [[likely]] {
-            ordinary_score_result = MakeUniqueForOverwrite<float[]>(top_n_);
-            ordinary_row_id_result = MakeUniqueForOverwrite<RowID[]>(top_n_);
+            ordinary_score_result = MakeUnique<float[]>(top_n_);
+            ordinary_row_id_result = MakeUnique<RowID[]>(top_n_);
             FullTextScoreResultHeap result_heap(top_n_, ordinary_score_result.get(), ordinary_row_id_result.get());
 #ifdef INFINITY_DEBUG
             auto ordinary_begin_ts = std::chrono::high_resolution_clock::now();
@@ -751,8 +751,8 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
         }
     }
     if (use_ordinary_iter and use_block_max_iter) {
-        blockmax_score_result_2 = MakeUniqueForOverwrite<float[]>(top_n_);
-        blockmax_row_id_result_2 = MakeUniqueForOverwrite<RowID[]>(top_n_);
+        blockmax_score_result_2 = MakeUnique<float[]>(top_n_);
+        blockmax_row_id_result_2 = MakeUnique<RowID[]>(top_n_);
         FullTextScoreResultHeap result_heap(top_n_, blockmax_score_result_2.get(), blockmax_row_id_result_2.get());
 #ifdef INFINITY_DEBUG
         auto blockmax_begin_ts = std::chrono::high_resolution_clock::now();
@@ -764,8 +764,8 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
         auto blockmax_end_ts = std::chrono::high_resolution_clock::now();
         blockmax_duration_2 = blockmax_end_ts - blockmax_begin_ts;
         {
-            auto blockmax_score_result_3 = MakeUniqueForOverwrite<float[]>(top_n_);
-            auto blockmax_row_id_result_3 = MakeUniqueForOverwrite<RowID[]>(top_n_);
+            auto blockmax_score_result_3 = MakeUnique<float[]>(top_n_);
+            auto blockmax_row_id_result_3 = MakeUnique<RowID[]>(top_n_);
             FullTextScoreResultHeap result_heap_3(top_n_, blockmax_score_result_3.get(), blockmax_row_id_result_3.get());
             auto blockmax_begin_ts_3 = std::chrono::high_resolution_clock::now();
             u32 blockmax_loop_cnt_3 = 0;

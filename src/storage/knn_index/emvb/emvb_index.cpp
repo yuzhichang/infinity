@@ -123,7 +123,7 @@ void EMVBIndex::BuildEMVBIndex(const RowID base_rowid,
     {
         std::ostringstream oss;
         oss << "EMVBIndex::BuildEMVBIndex: Read segment data, total row count: " << row_count << ", total embedding count: " << embedding_count
-            << ", total time cost: " << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_1 - time_0);
+            << ", total time cost: " << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_1 - time_0).count() << "ms";
         LOG_INFO(std::move(oss).str());
     }
     // prepare centroid count
@@ -141,7 +141,7 @@ void EMVBIndex::BuildEMVBIndex(const RowID base_rowid,
     // train the index
     {
         const auto training_embedding_num = std::min<u32>(embedding_count, 8 * least_training_data_num);
-        const auto training_data = MakeUniqueForOverwrite<f32[]>(training_embedding_num * embedding_dimension_);
+        const auto training_data = MakeUnique<f32[]>(training_embedding_num * embedding_dimension_);
         // prepare training data
         {
             Vector<Pair<u32, u32>> sample_result;
@@ -171,7 +171,7 @@ void EMVBIndex::BuildEMVBIndex(const RowID base_rowid,
         {
             std::ostringstream oss;
             oss << "EMVBIndex::BuildEMVBIndex: Prepare training data, training embedding num: " << training_embedding_num
-                << ", time cost: " << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_2 - time_1);
+                << ", time cost: " << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_2 - time_1).count() << "ms";
             LOG_INFO(std::move(oss).str());
         }
         // call train
@@ -180,7 +180,7 @@ void EMVBIndex::BuildEMVBIndex(const RowID base_rowid,
         {
             std::ostringstream oss;
             oss << "EMVBIndex::BuildEMVBIndex: Train index, time cost: "
-                << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_3 - time_2);
+                << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_3 - time_2).count() << "ms";
             LOG_INFO(std::move(oss).str());
         }
     }
@@ -208,10 +208,10 @@ void EMVBIndex::BuildEMVBIndex(const RowID base_rowid,
         {
             const auto time_5 = std::chrono::high_resolution_clock::now();
             const auto total_add_time = std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_5 - time_4);
-            const auto avg_add_time = total_add_time / row_count;
+            const auto avg_add_time = total_add_time.count() / row_count;
             std::ostringstream oss;
-            oss << "EMVBIndex::BuildEMVBIndex: Add data, total row count: " << row_count << ", total time cost: " << total_add_time
-                << ", avg time cost: " << avg_add_time;
+            oss << "EMVBIndex::BuildEMVBIndex: Add data, total row count: " << row_count << ", total time cost: " << total_add_time.count()
+                << "ms, avg time cost: " << avg_add_time << "ms";
             LOG_INFO(std::move(oss).str());
         }
     }
@@ -268,14 +268,14 @@ void EMVBIndex::Train(const u32 centroids_num, const f32 *embedding_data, const 
     {
         std::ostringstream oss;
         oss << "EMVBIndex::Train: Finish train centroids, time cost: "
-            << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_1 - time_0);
+            << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_1 - time_0).count() << "ms";
         LOG_INFO(std::move(oss).str());
     }
     // step 2. get residuals
-    const auto residuals = MakeUniqueForOverwrite<f32[]>(embedding_num * embedding_dimension_);
+    const auto residuals = MakeUnique<f32[]>(embedding_num * embedding_dimension_);
     {
         // distance: for every embedding, e * c - 0.5 * c^2, find max
-        const auto dist_table = MakeUniqueForOverwrite<f32[]>(embedding_num * n_centroids_);
+        const auto dist_table = MakeUnique<f32[]>(embedding_num * n_centroids_);
         matrixA_multiply_transpose_matrixB_output_to_C(embedding_data,
                                                        centroids_data_.data(),
                                                        embedding_num,
@@ -304,7 +304,7 @@ void EMVBIndex::Train(const u32 centroids_num, const f32 *embedding_data, const 
     {
         std::ostringstream oss;
         oss << "EMVBIndex::Train: Finish calculate residuals, time cost: "
-            << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_2 - time_1);
+            << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_2 - time_1).count() << "ms";
         LOG_INFO(std::move(oss).str());
     }
     LOG_TRACE("EMVBIndex::Train: Finish calculate residuals.");
@@ -314,7 +314,7 @@ void EMVBIndex::Train(const u32 centroids_num, const f32 *embedding_data, const 
     {
         std::ostringstream oss;
         oss << "EMVBIndex::Train: Finish train pq for residuals, time cost: "
-            << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_3 - time_2);
+            << std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(time_3 - time_2).count() << "ms";
         LOG_INFO(std::move(oss).str());
     }
     LOG_TRACE("EMVBIndex::Train: Finish train pq for residuals.");
@@ -333,11 +333,11 @@ void EMVBIndex::AddOneDocEmbeddings(const f32 *embedding_data, const u32 embeddi
     doc_lens_.PushBack(embedding_num);
     doc_offsets_.PushBack(old_total_embeddings);
     // step 2. assign to centroids
-    const auto centroid_id_assignments = MakeUniqueForOverwrite<u32[]>(embedding_num);
-    const auto residuals = MakeUniqueForOverwrite<f32[]>(embedding_num * embedding_dimension_);
+    const auto centroid_id_assignments = MakeUnique<u32[]>(embedding_num);
+    const auto residuals = MakeUnique<f32[]>(embedding_num * embedding_dimension_);
     {
         // distance: for every embedding, e * c - 0.5 * c^2, find max
-        const auto dist_table = MakeUniqueForOverwrite<f32[]>(embedding_num * n_centroids_);
+        const auto dist_table = MakeUnique<f32[]>(embedding_num * n_centroids_);
         matrixA_multiply_transpose_matrixB_output_to_C(embedding_data,
                                                        centroids_data_.data(),
                                                        embedding_num,
@@ -459,7 +459,7 @@ EMVBQueryResultType EMVBIndex::GetQueryResultT(const f32 *query_ptr, const u32 q
     const f32 *query_ptr_to_use = query_ptr;
     // extend query to FIXED_QUERY_TOKEN_NUM
     if (query_embedding_num < FIXED_QUERY_TOKEN_NUM) {
-        extended_query_ptr = MakeUniqueForOverwrite<f32[]>(FIXED_QUERY_TOKEN_NUM * embedding_dimension_);
+        extended_query_ptr = MakeUnique<f32[]>(FIXED_QUERY_TOKEN_NUM * embedding_dimension_);
         std::copy_n(query_ptr, query_embedding_num * embedding_dimension_, extended_query_ptr.get());
         std::fill_n(extended_query_ptr.get() + query_embedding_num * embedding_dimension_,
                     (FIXED_QUERY_TOKEN_NUM - query_embedding_num) * embedding_dimension_,
@@ -520,7 +520,7 @@ void DeSerialize(FileHandler &file_handler, EMVBSharedVec<u32> &val, const u32 e
         const auto error_msg = fmt::format("EMVBSharedVec size mismatch: expect {}, got {}.", expect_element_num, size);
         UnrecoverableError(error_msg);
     }
-    const auto tmp_buffer = MakeUniqueForOverwrite<u32[]>(expect_element_num);
+    const auto tmp_buffer = MakeUnique<u32[]>(expect_element_num);
     file_handler.Read(tmp_buffer.get(), expect_element_num * sizeof(u32));
     val.PushBack(tmp_buffer.get(), tmp_buffer.get() + expect_element_num);
 }
@@ -539,7 +539,7 @@ void DeSerialize(FileHandler &file_handler, EMVBSharedVec<u32> &val) {
     }
     u32 element_num = 0;
     file_handler.Read(&element_num, sizeof(element_num));
-    const auto tmp_buffer = MakeUniqueForOverwrite<u32[]>(element_num);
+    const auto tmp_buffer = MakeUnique<u32[]>(element_num);
     file_handler.Read(tmp_buffer.get(), element_num * sizeof(u32));
     val.PushBack(tmp_buffer.get(), tmp_buffer.get() + element_num);
 }

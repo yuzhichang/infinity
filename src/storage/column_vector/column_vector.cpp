@@ -1147,7 +1147,7 @@ void ColumnVector::SetValue(SizeT index, const Value &value) {
         }
         case kTensor: {
             const auto embedding_size_unit = data_type_->type_info()->Size();
-            Span<char> data_span = value.GetEmbedding();
+            phmap::Span<char> data_span = value.GetEmbedding();
             const_ptr_t src_ptr = data_span.data();
             SizeT src_size = data_span.size();
             if (src_size == 0 or (src_size % embedding_size_unit) != 0) {
@@ -1169,7 +1169,7 @@ void ColumnVector::SetValue(SizeT index, const Value &value) {
             Vector<TensorT> tensor_array_data(tensor_num);
             for (u32 tensor_id = 0; tensor_id < tensor_num; ++tensor_id) {
                 auto &[embedding_num, tensor_chunk_id, tensor_chunk_offset] = tensor_array_data[tensor_id];
-                Span<char> tensor_data_span = value_tensor_array[tensor_id]->GetData();
+                phmap::Span<char> tensor_data_span = value_tensor_array[tensor_id]->GetData();
                 const_ptr_t tensor_data_ptr = tensor_data_span.data();
                 SizeT tensor_data_bytes = tensor_data_span.size();
                 if (tensor_data_bytes == 0 or (tensor_data_bytes % embedding_size_unit) != 0) {
@@ -1202,7 +1202,7 @@ void ColumnVector::SetValue(SizeT index, const Value &value) {
             break;
         }
         case kEmbedding: {
-            Span<char> data_span = value.GetEmbedding();
+            phmap::Span<char> data_span = value.GetEmbedding();
             const_ptr_t src_ptr = data_span.data();
             SizeT src_size = data_span.size();
             if (src_size != data_type_->Size()) {

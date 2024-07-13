@@ -74,7 +74,7 @@ void VectorBuffer::InitializeCompactBit(SizeT capacity) {
     }
     SizeT data_size = (capacity + 7) / 8;
     if (data_size > 0) {
-        ptr_ = MakeUniqueForOverwrite<char[]>(data_size);
+        ptr_ = MakeUnique<char[]>(data_size);
     }
     initialized_ = true;
     data_size_ = data_size;
@@ -88,7 +88,7 @@ void VectorBuffer::Initialize(SizeT type_size, SizeT capacity) {
     }
     SizeT data_size = type_size * capacity;
     if (data_size > 0) {
-        ptr_ = MakeUniqueForOverwrite<char[]>(data_size);
+        ptr_ = MakeUnique<char[]>(data_size);
     }
     if (buffer_type_ == VectorBufferType::kHeap) {
         fix_heap_mgr_ = MakeUnique<FixHeapManager>(0, DEFAULT_FIXLEN_CHUNK_SIZE, true);

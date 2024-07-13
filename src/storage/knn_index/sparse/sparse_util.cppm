@@ -46,8 +46,8 @@ struct SparseVecEle {
 
     void Init(const Vector<SizeT> &keep_idxes, const DataType *data, const IdxType *indices) {
         nnz_ = keep_idxes.size();
-        indices_ = MakeUniqueForOverwrite<IdxType[]>(nnz_);
-        data_ = MakeUniqueForOverwrite<DataType[]>(nnz_);
+        indices_ = MakeUnique<IdxType[]>(nnz_);
+        data_ = MakeUnique<DataType[]>(nnz_);
         for (i32 i = 0; i < nnz_; ++i) {
             indices_[i] = indices[keep_idxes[i]];
             data_[i] = data[keep_idxes[i]];

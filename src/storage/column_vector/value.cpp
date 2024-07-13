@@ -14,6 +14,7 @@
 
 module;
 
+#include "parallel_hashmap/phmap_base.h"
 #include <ranges>
 
 module value;
@@ -35,9 +36,16 @@ namespace infinity {
 
 namespace {
 template <typename T>
-void Embedding2JsonInternal(const EmbeddingType &embedding, size_t dimension, nlohmann::json& embedding_json) {
+void Embedding2JsonInternalInt(const EmbeddingType &embedding, size_t dimension, nlohmann::json &embedding_json) {
     for (size_t i = 0; i < dimension; ++i) {
-        embedding_json.push_back(((T *)(embedding.ptr))[i]);
+        embedding_json.push_back((BigIntT)((T *)(embedding.ptr))[i]);
+    }
+}
+
+template <typename T>
+void Embedding2JsonInternalFloat(const EmbeddingType &embedding, size_t dimension, nlohmann::json &embedding_json) {
+    for (size_t i = 0; i < dimension; ++i) {
+        embedding_json.push_back((DoubleT)((T *)(embedding.ptr))[i]);
     }
 }
 
@@ -51,8 +59,8 @@ void BitmapEmbedding2JsonInternal(const EmbeddingType &embedding, size_t dimensi
     for (size_t i = 0; i < dimension / 8; ++i) {
         const u8 byte = array[i];
         for (size_t j = 0; j < 8; ++j) {
-            int8_t elem = (byte & (1 << j)) ? 1 : 0;
-            embedding_json.push_back(elem);
+            uint8_t elem = (byte & (1 << j)) ? 1 : 0;
+            embedding_json.push_back((BigIntT)elem);
         }
     }
 }
@@ -64,27 +72,27 @@ void Embedding2Json(const EmbeddingType &embedding, EmbeddingDataType type, size
             break;
         }
         case kElemInt8: {
-            Embedding2JsonInternal<int8_t>(embedding, dimension, embedding_json);
+            Embedding2JsonInternalInt<int8_t>(embedding, dimension, embedding_json);
             break;
         }
         case kElemInt16: {
-            Embedding2JsonInternal<int16_t>(embedding, dimension, embedding_json);
+            Embedding2JsonInternalInt<int16_t>(embedding, dimension, embedding_json);
             break;
         }
         case kElemInt32: {
-            Embedding2JsonInternal<int32_t>(embedding, dimension, embedding_json);
+            Embedding2JsonInternalInt<int32_t>(embedding, dimension, embedding_json);
             break;
         }
         case kElemInt64: {
-            Embedding2JsonInternal<int64_t>(embedding, dimension, embedding_json);
+            Embedding2JsonInternalInt<int64_t>(embedding, dimension, embedding_json);
             break;
         }
         case kElemFloat: {
-            Embedding2JsonInternal<float>(embedding, dimension, embedding_json);
+            Embedding2JsonInternalFloat<float>(embedding, dimension, embedding_json);
             break;
         }
         case kElemDouble: {
-            Embedding2JsonInternal<double>(embedding, dimension, embedding_json);
+            Embedding2JsonInternalFloat<double>(embedding, dimension, embedding_json);
             break;
         }
         default: {
@@ -666,8 +674,8 @@ bool Value::operator==(const Value &other) const {
         }
         case kEmbedding:
         case kTensor: {
-            const Span<char> &data1 = this->GetEmbedding();
-            const Span<char> &data2 = other.GetEmbedding();
+            const phmap::Span<char> &data1 = this->GetEmbedding();
+            const phmap::Span<char> &data2 = other.GetEmbedding();
             return std::ranges::equal(data1, data2);
         }
         case kTensorArray: {
@@ -974,7 +982,7 @@ String Value::ToString() const {
         }
         case LogicalType::kEmbedding: {
             EmbeddingInfo *embedding_info = static_cast<EmbeddingInfo *>(type_.type_info().get());
-            Span<char> data_span = this->GetEmbedding();
+            phmap::Span<char> data_span = this->GetEmbedding();
             if (data_span.size() != embedding_info->Size()) {
                 String error_message = "Embedding data size mismatch.";
                 UnrecoverableError(error_message);
@@ -984,7 +992,7 @@ String Value::ToString() const {
         }
         case LogicalType::kTensor: {
             EmbeddingInfo *embedding_info = static_cast<EmbeddingInfo *>(type_.type_info().get());
-            Span<char> data_span = this->GetEmbedding();
+            phmap::Span<char> data_span = this->GetEmbedding();
             SizeT data_bytes = data_span.size();
             const auto basic_embedding_bytes = embedding_info->Size();
             if (data_bytes == 0 or data_bytes % basic_embedding_bytes != 0) {
@@ -1036,15 +1044,15 @@ void Value::AppendToJson(const String &name, nlohmann::json &json) {
             return;
         }
         case LogicalType::kTinyInt: {
-            json[name] = value_.tiny_int;
+            json[name] = (BigIntT)value_.tiny_int;
             return;
         }
         case LogicalType::kSmallInt: {
-            json[name] = value_.small_int;
+            json[name] = (BigIntT)value_.small_int;
             return;
         }
         case LogicalType::kInteger: {
-            json[name] = value_.integer;
+            json[name] = (BigIntT)value_.integer;
             return;
         }
         case LogicalType::kBigInt: {
@@ -1052,7 +1060,7 @@ void Value::AppendToJson(const String &name, nlohmann::json &json) {
             return;
         }
         case LogicalType::kFloat: {
-            json[name] = value_.float32;
+            json[name] = (DoubleT)value_.float32;
             return;
         }
         case LogicalType::kDouble: {
@@ -1089,7 +1097,7 @@ void Value::AppendToJson(const String &name, nlohmann::json &json) {
         }
         case LogicalType::kEmbedding: {
             EmbeddingInfo *embedding_info = static_cast<EmbeddingInfo *>(type_.type_info().get());
-            Span<char> data_span = this->GetEmbedding();
+            phmap::Span<char> data_span = this->GetEmbedding();
             if (data_span.size() != embedding_info->Size()) {
                 String error_message = "Embedding data size mismatch.";
                 UnrecoverableError(error_message);
@@ -1100,7 +1108,7 @@ void Value::AppendToJson(const String &name, nlohmann::json &json) {
         }
         case LogicalType::kTensor: {
             EmbeddingInfo *embedding_info = static_cast<EmbeddingInfo *>(type_.type_info().get());
-            Span<char> data_span = this->GetEmbedding();
+            phmap::Span<char> data_span = this->GetEmbedding();
             SizeT data_bytes = data_span.size();
             const auto basic_embedding_bytes = embedding_info->Size();
             if (data_bytes == 0 or data_bytes % basic_embedding_bytes != 0) {
@@ -1118,11 +1126,11 @@ void Value::AppendToJson(const String &name, nlohmann::json &json) {
             UnrecoverableError(error_message);
         }
         case LogicalType::kEmptyArray: {
-            json[name] = "[]";
+            json[name] = String("[]");
             return;
         }
         case LogicalType::kSparse: {
-            json[name] = "[]";
+            json[name] = String("[]");
             return;
         }
         default: {

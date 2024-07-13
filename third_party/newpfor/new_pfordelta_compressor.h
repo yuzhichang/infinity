@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <cmath>
 #include <memory>
+#include <ranges>
 #include <sstream>
 
 #include "decompress_sse4.h"

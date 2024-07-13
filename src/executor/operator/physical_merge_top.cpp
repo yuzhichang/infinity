@@ -118,7 +118,7 @@ bool PhysicalMergeTop::Execute(QueryContext *, OperatorState *operator_state) {
             }
         };
         // 1. get merged top ids
-        auto result_ids = MakeUniqueForOverwrite<VectorBlockRawIndex[]>(result_cnt);
+        auto result_ids = MakeUnique<VectorBlockRawIndex[]>(result_cnt);
         {
             VectorBlockRawIndex middle_id(middle_result_count, 0, 0), input_id(input_result_count, middle_block_cnt, 0);
             for (u32 total_i = 0; total_i < result_cnt; ++total_i) {

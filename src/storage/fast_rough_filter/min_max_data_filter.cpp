@@ -148,12 +148,12 @@ void MinMaxDataFilter::SaveToJsonFile(nlohmann::json &entry_json) const {
     OStringStream os(std::move(save_to_binary));
     SerializeToStringStream(os, total_binary_bytes);
     // step 3. encode to base64, and save to json
-    auto result_view = os.view();
-    if (result_view.size() != total_binary_bytes) {
+    auto result = os.str();
+    if (result.size() != total_binary_bytes) {
         String error_message = "MinMaxDataFilter::SaveToJsonFile(): save size error";
         UnrecoverableError(error_message);
     }
-    entry_json[JsonTag] = base64::to_base64(result_view);
+    entry_json[JsonTag] = base64::to_base64(result);
 }
 
 bool MinMaxDataFilter::LoadFromJsonFile(const nlohmann::json &entry_json) {
@@ -165,7 +165,7 @@ bool MinMaxDataFilter::LoadFromJsonFile(const nlohmann::json &entry_json) {
     auto filter_binary = base64::from_base64(filter_base64);
     IStringStream is(filter_binary);
     DeserializeFromStringStream(is);
-    if (!is or u32(is.tellg()) != is.view().size()) {
+    if (!is or !is.eof()) {
         String error_message = "MinMaxDataFilter::LoadFromJsonFile(): position error";
         UnrecoverableError(error_message);
         return false;

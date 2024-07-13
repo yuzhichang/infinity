@@ -153,7 +153,7 @@ TEST_F(SIMDTest, testleftpackf) {
             expect_out_ids.push_back(i);
         }
     }
-    auto out_ptr = std::make_unique_for_overwrite<u32[]>(1008);
+    auto out_ptr = std::make_unique<u32[]>(1008);
     auto out_ptr_end = filter_scores_output_ids(out_ptr.get(), 1.0f, test_input.get(), 1000);
     EXPECT_EQ(out_ptr_end, out_ptr.get() + expect_out_ids.size());
     for (u32 i = 0; i < expect_out_ids.size(); ++i) {

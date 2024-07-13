@@ -265,7 +265,7 @@ void PhysicalImport::ImportBVECS(QueryContext *query_context, ImportOperatorStat
     SizeT row_idx = 0;
     auto buf_ptr = static_cast<ptr_t>(buffer_handle.GetDataMut());
 
-    UniquePtr<i8[]> i8_buffer = MakeUniqueForOverwrite<i8[]>(sizeof(i8) * dimension);
+    UniquePtr<i8[]> i8_buffer = MakeUnique<i8[]>(sizeof(i8) * dimension);
     while (true) {
         i32 dim;
         nbytes = fs.Read(*file_handler, &dim, sizeof(dimension));

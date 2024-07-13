@@ -194,7 +194,7 @@ struct AnnIVFFlatIndexData {
     inline void InsertData(u32 vector_count, const VectorDataType *vector_data_ptr, auto &&get_offset) {
         // step 1. Classify vectors
         // search_top_1
-        auto assigned_partition_id = MakeUniqueForOverwrite<u32[]>(vector_count);
+        auto assigned_partition_id = MakeUnique<u32[]>(vector_count);
         search_top_1_without_dis<CommonType>(dimension_,
                                              vector_count,
                                              vector_data_ptr,

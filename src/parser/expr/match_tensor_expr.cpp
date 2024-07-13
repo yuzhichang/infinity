@@ -178,7 +178,7 @@ std::unique_ptr<char[]> GetConcatenatedTensorDataFromSubArray(const std::vector<
                                                               uint32_t &query_total_dimension) {
     static_assert(!std::is_same_v<T, bool>);
     query_total_dimension = sub_array_array.size() * tensor_column_basic_embedding_dim;
-    auto result = std::make_unique_for_overwrite<char[]>(query_total_dimension * sizeof(T));
+    auto result = std::make_unique<char[]>(query_total_dimension * sizeof(T));
     auto output_data = reinterpret_cast<T *>(result.get());
     for (uint32_t i = 0; i < sub_array_array.size(); ++i) {
         switch (sub_array_array[i]->literal_type_) {
@@ -266,7 +266,7 @@ GetConcatenatedTensorData(const std::vector<U> &data_array, const uint32_t tenso
         }
         return result;
     } else {
-        auto result = std::make_unique_for_overwrite<char[]>(query_total_dimension * sizeof(T));
+        auto result = std::make_unique<char[]>(query_total_dimension * sizeof(T));
         auto embedding_data_ptr = reinterpret_cast<T *>(result.get());
         for (uint32_t i = 0; i < query_total_dimension; ++i) {
             embedding_data_ptr[i] = data_array[i];

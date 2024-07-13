@@ -408,7 +408,7 @@ struct MaxSimOp<float, float> {
                        const u32 query_embedding_num,
                        const u32 target_embedding_num,
                        const u32 basic_embedding_dimension) {
-        auto output_ptr = MakeUniqueForOverwrite<float[]>(query_embedding_num * target_embedding_num);
+        auto output_ptr = MakeUnique<float[]>(query_embedding_num * target_embedding_num);
         matrixA_multiply_transpose_matrixB_output_to_C(reinterpret_cast<const float *>(query_tensor_ptr),
                                                        reinterpret_cast<const float *>(target_tensor_ptr),
                                                        query_embedding_num,
@@ -438,7 +438,7 @@ struct MaxSimOp<TensorElemT, QueryElemT> {
                        const u32 basic_embedding_dimension) {
         const auto query_tensor_ptr = reinterpret_cast<const QueryElemT *>(raw_query_tensor_ptr);
         const auto target_tensor_ptr = reinterpret_cast<const TensorElemT *>(raw_target_tensor_ptr);
-        auto output_ptr = MakeUniqueForOverwrite<float[]>(query_embedding_num * target_embedding_num);
+        auto output_ptr = MakeUnique<float[]>(query_embedding_num * target_embedding_num);
         float maxsim_score = 0.0f;
         for (u32 query_i = 0; query_i < query_embedding_num; ++query_i) {
             float max_score_i = std::numeric_limits<float>::lowest();
@@ -467,7 +467,7 @@ struct MaxSimOp<bool, bool> {
         const auto query_tensor_ptr = reinterpret_cast<const u8 *>(raw_query_tensor_ptr);
         const auto target_tensor_ptr = reinterpret_cast<const u8 *>(raw_target_tensor_ptr);
         const auto unit_embedding_bytes = basic_embedding_dimension / 8;
-        auto output_ptr = MakeUniqueForOverwrite<float[]>(query_embedding_num * target_embedding_num);
+        auto output_ptr = MakeUnique<float[]>(query_embedding_num * target_embedding_num);
         float maxsim_score = 0.0f;
         for (u32 query_i = 0; query_i < query_embedding_num; ++query_i) {
             u32 max_score_i = 0;
@@ -499,7 +499,7 @@ struct MaxSimOp<bool, QueryElemT> {
         const auto query_tensor_ptr = reinterpret_cast<const QueryElemT *>(raw_query_tensor_ptr);
         const auto target_tensor_ptr = reinterpret_cast<const u8 *>(raw_target_tensor_ptr);
         const auto unit_embedding_bytes = basic_embedding_dimension / 8;
-        auto output_ptr = MakeUniqueForOverwrite<float[]>(query_embedding_num * target_embedding_num);
+        auto output_ptr = MakeUnique<float[]>(query_embedding_num * target_embedding_num);
         float maxsim_score = 0.0f;
         for (u32 query_i = 0; query_i < query_embedding_num; ++query_i) {
             float max_score_i = std::numeric_limits<float>::lowest();
@@ -531,7 +531,7 @@ struct MaxSimOp<TensorElemT, bool> {
         const auto query_tensor_ptr = reinterpret_cast<const u8 *>(raw_query_tensor_ptr);
         const auto target_tensor_ptr = reinterpret_cast<const TensorElemT *>(raw_target_tensor_ptr);
         const auto unit_embedding_bytes = basic_embedding_dimension / 8;
-        auto output_ptr = MakeUniqueForOverwrite<float[]>(query_embedding_num * target_embedding_num);
+        auto output_ptr = MakeUnique<float[]>(query_embedding_num * target_embedding_num);
         float maxsim_score = 0.0f;
         for (u32 query_i = 0; query_i < query_embedding_num; ++query_i) {
             float max_score_i = std::numeric_limits<float>::lowest();

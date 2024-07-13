@@ -833,7 +833,7 @@ ptr_t GetConcatenatedTensorDataFromSubArray(const Vector<SharedPtr<ConstantExpr>
     static_assert(!std::is_same_v<T, bool>);
     // expect children to be embedding of dimension tensor_column_basic_embedding_dim
     query_total_dimension = sub_array_array.size() * tensor_column_basic_embedding_dim;
-    auto output_data = MakeUniqueForOverwrite<T[]>(query_total_dimension);
+    auto output_data = MakeUnique<T[]>(query_total_dimension);
     for (u32 i = 0; i < sub_array_array.size(); ++i) {
         switch (sub_array_array[i]->literal_type_) {
             case LiteralType::kIntegerArray: {
