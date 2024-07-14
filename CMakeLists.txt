@@ -113,8 +113,6 @@ else ()
     message(FATAL_ERROR "Only support CMake build type: Debug, RelWithDebInfo, and Release")
 endif ()
 
-set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} --gcc-install-dir=/opt/rh/devtoolset-10/root/usr/lib/gcc/x86_64-redhat-linux/10")
-
 if (CLANG_VERSION_STRING VERSION_EQUAL 17)
     set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -Wall -Werror -Wno-asm-operand-widths -Wno-unused-command-line-argument -Wno-deprecated-declarations -Wno-read-modules-implicitly -Wextra -Wno-unused-parameter -Wno-unused-private-field -pthread -fcolor-diagnostics")
 else ()
