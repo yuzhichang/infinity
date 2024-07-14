@@ -14,6 +14,7 @@
 
 module;
 
+#include "phmap_base.h"
 #include <string>
 
 module physical_export;
@@ -426,7 +427,7 @@ SizeT PhysicalExport::ExportToFVECS(QueryContext *query_context, ExportOperatorS
                 }
 
                 fs.Write(*file_handler, &dimension, sizeof(dimension));
-                fs.Write(*file_handler, embedding.data(), embedding.size_bytes());
+                fs.Write(*file_handler, embedding.data(), embedding.size());
                 ++ row_count;
                 if(limit_ != 0 && row_count == limit_) {
                     return row_count;
