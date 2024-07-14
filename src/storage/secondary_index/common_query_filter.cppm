@@ -77,7 +77,7 @@ export struct CommonQueryFilter {
             }
             BuildFilter(task_id, txn);
             if (++end_task_num_ == total_task_num_) {
-                finish_build_.store();
+                finish_build_.store(true);
                 break;
             }
         }
