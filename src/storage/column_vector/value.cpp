@@ -14,6 +14,7 @@
 
 module;
 
+#include "phmap_base.h"
 #include <ranges>
 
 module value;
@@ -666,8 +667,8 @@ bool Value::operator==(const Value &other) const {
         }
         case kEmbedding:
         case kTensor: {
-            const Span<char> &data1 = this->GetEmbedding();
-            const Span<char> &data2 = other.GetEmbedding();
+            const phmap::Span<char> &data1 = this->GetEmbedding();
+            const phmap::Span<char> &data2 = other.GetEmbedding();
             return std::ranges::equal(data1, data2);
         }
         case kTensorArray: {
@@ -974,7 +975,7 @@ String Value::ToString() const {
         }
         case LogicalType::kEmbedding: {
             EmbeddingInfo *embedding_info = static_cast<EmbeddingInfo *>(type_.type_info().get());
-            Span<char> data_span = this->GetEmbedding();
+            phmap::Span<char> data_span = this->GetEmbedding();
             if (data_span.size() != embedding_info->Size()) {
                 String error_message = "Embedding data size mismatch.";
                 UnrecoverableError(error_message);
@@ -984,7 +985,7 @@ String Value::ToString() const {
         }
         case LogicalType::kTensor: {
             EmbeddingInfo *embedding_info = static_cast<EmbeddingInfo *>(type_.type_info().get());
-            Span<char> data_span = this->GetEmbedding();
+            phmap::Span<char> data_span = this->GetEmbedding();
             SizeT data_bytes = data_span.size();
             const auto basic_embedding_bytes = embedding_info->Size();
             if (data_bytes == 0 or data_bytes % basic_embedding_bytes != 0) {
@@ -1089,7 +1090,7 @@ void Value::AppendToJson(const String &name, nlohmann::json &json) {
         }
         case LogicalType::kEmbedding: {
             EmbeddingInfo *embedding_info = static_cast<EmbeddingInfo *>(type_.type_info().get());
-            Span<char> data_span = this->GetEmbedding();
+            phmap::Span<char> data_span = this->GetEmbedding();
             if (data_span.size() != embedding_info->Size()) {
                 String error_message = "Embedding data size mismatch.";
                 UnrecoverableError(error_message);
@@ -1100,7 +1101,7 @@ void Value::AppendToJson(const String &name, nlohmann::json &json) {
         }
         case LogicalType::kTensor: {
             EmbeddingInfo *embedding_info = static_cast<EmbeddingInfo *>(type_.type_info().get());
-            Span<char> data_span = this->GetEmbedding();
+            phmap::Span<char> data_span = this->GetEmbedding();
             SizeT data_bytes = data_span.size();
             const auto basic_embedding_bytes = embedding_info->Size();
             if (data_bytes == 0 or data_bytes % basic_embedding_bytes != 0) {
