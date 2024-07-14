@@ -113,6 +113,7 @@ using std::try_to_lock;
 
 using std::accumulate;
 using std::binary_search;
+using std::bit_ceil;
 using std::bitset;
 using std::ceil;
 using std::copy_n;
