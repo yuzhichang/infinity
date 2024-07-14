@@ -88,6 +88,18 @@ RUN --mount=type=bind,source=gperftools-2.15.tar.gz,target=/root/gperftools-2.15
 RUN --mount=type=bind,source=sqllogictest-bin-v0.20.2-x86_64-unknown-linux-musl.tar.gz,target=/root/sqllogictest-bin-v0.20.2-x86_64-unknown-linux-musl.tar.gz \
     cd /tmp && tar xzf /root/sqllogictest-bin-v0.20.2-x86_64-unknown-linux-musl.tar.gz && cp -rf sqllogictest /usr/local/bin && rm -fr /tmp/*
 
+# Install lz4-1.9.4
+RUN --mount=type=bind,source=lz4-1.9.4.tar.gz,target=/root/lz4-1.9.4.tar.gz  \
+cd /root && tar xf lz4-1.9.4.tar.gz \
+&& cd lz4-1.9.4 && CFLAGS="-fPIC" make -j install \
+&& ldconfig && cd /root && rm -rf lz4-1.9.4
+
+# Install zlib-1.3.1
+RUN --mount=type=bind,source=zlib-1.3.1.tar.gz,target=/root/zlib-1.3.1.tar.gz  \
+cd /root && tar xf zlib-1.3.1.tar.gz \
+&& cd zlib-1.3.1 && ./configure && CFLAGS="-fPIC" make -j install \
+&& ldconfig && cd /root && rm -rf zlib-1.3.1
+
 RUN /usr/local/bin/python3.10 -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 # Install tools for building and uploading a python wheel.
