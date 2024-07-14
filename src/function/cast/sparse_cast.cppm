@@ -98,7 +98,7 @@ void SparseTryCastToSparseFunInner(const SparseInfo *source_info,
         if constexpr (std::is_same_v<TargetIndiceType, SourceIndiceType>) {
             std::tie(target.chunk_id_, target.chunk_offset_) = target_fix_heap_mgr->AppendToHeap(source_ptr, sparse_bytes);
         } else {
-            auto target_indice_tmp_ptr = MakeUnique<TargetIndiceType[]>(source_nnz);
+            auto target_indice_tmp_ptr = MakeUniqueForOverwrite<TargetIndiceType[]>(source_nnz);
             const SizeT target_indice_size = target_info->IndiceSize(source_nnz);
             if (!EmbeddingTryCastToFixlen::Run(reinterpret_cast<const SourceIndiceType *>(source_ptr),
                                                reinterpret_cast<TargetIndiceType *>(target_indice_tmp_ptr.get()),
@@ -123,7 +123,7 @@ void SparseTryCastToSparseFunInner(const SparseInfo *source_info,
         if constexpr (std::is_same_v<TargetIndiceType, SourceIndiceType>) {
             data_ptrs.emplace_back(reinterpret_cast<const char *>(source_ptr), source_indice_size);
         } else {
-            target_indice_tmp_ptr = MakeUnique<TargetIndiceType[]>(source_nnz);
+            target_indice_tmp_ptr = MakeUniqueForOverwrite<TargetIndiceType[]>(source_nnz);
             const SizeT target_indice_size = target_info->IndiceSize(source_nnz);
             if (!EmbeddingTryCastToFixlen::Run(reinterpret_cast<const SourceIndiceType *>(source_ptr),
                                                reinterpret_cast<TargetIndiceType *>(target_indice_tmp_ptr.get()),
@@ -135,7 +135,7 @@ void SparseTryCastToSparseFunInner(const SparseInfo *source_info,
         }
 
         if constexpr (!std::is_same_v<TargetValueType, BooleanT>) {
-            target_value_tmp_ptr = MakeUnique<TargetValueType[]>(source_nnz);
+            target_value_tmp_ptr = MakeUniqueForOverwrite<TargetValueType[]>(source_nnz);
             const SizeT target_data_size = target_info->DataSize(source_nnz);
             if (!EmbeddingTryCastToFixlen::Run(reinterpret_cast<const SourceValueType *>(source_ptr + source_indice_size),
                                             reinterpret_cast<TargetValueType *>(target_value_tmp_ptr.get()),

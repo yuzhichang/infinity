@@ -436,8 +436,8 @@ public:
         if (capacity < 8) {
             capacity = 8;
         }
-        reservoir_distance_ptr = MakeUnique<DistType[]>(n_queries * capacity);
-        reservoir_id_ptr = MakeUnique<ID[]>(n_queries * capacity);
+        reservoir_distance_ptr = MakeUniqueForOverwrite<DistType[]>(n_queries * capacity);
+        reservoir_id_ptr = MakeUniqueForOverwrite<ID[]>(n_queries * capacity);
     }
 
     ~ReservoirResultHandler() = default;

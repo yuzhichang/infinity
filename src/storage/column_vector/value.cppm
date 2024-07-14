@@ -13,8 +13,6 @@
 // limitations under the License.
 module;
 
-#include "parallel_hashmap/phmap_base.h"
-
 export module value;
 
 import stl;
@@ -132,7 +130,7 @@ public:
     // Also used for tensor info
     static SharedPtr<EmbeddingValueInfo> MakeTensorValueInfo(const_ptr_t ptr, SizeT bytes);
 
-    phmap::Span<char> GetData() const { return {data_.get(), len_}; }
+    Span<char> GetData() const { return {data_.get(), len_}; }
 
 private:
     UniquePtr<char[]> data_;
@@ -170,9 +168,9 @@ export struct SparseValueInfo : public ExtraValueInfo {
         : ExtraValueInfo(ExtraValueInfoType::SPARSE_VALUE_INFO), nnz_(nnz), indices_(EmbeddingValueInfo(std::move(indice_ptr), indice_len)),
           data_(EmbeddingValueInfo(std::move(data_ptr), data_len)) {}
 
-    Tuple<SizeT, phmap::Span<char>, phmap::Span<char>> GetData() const {
-        phmap::Span<char> indice_span = indices_.GetData();
-        phmap::Span<char> data_span = data_.GetData();
+    Tuple<SizeT, Span<char>, Span<char>> GetData() const {
+        Span<char> indice_span = indices_.GetData();
+        Span<char> data_span = data_.GetData();
         return {nnz_, indice_span, data_span};
     }
 
@@ -310,11 +308,11 @@ public:
     // Value getter for each type outside union
     const String &GetVarchar() const { return this->value_info_->Get<StringValueInfo>().GetString(); }
 
-    phmap::Span<char> GetEmbedding() const { return this->value_info_->Get<EmbeddingValueInfo>().GetData(); }
+    Span<char> GetEmbedding() const { return this->value_info_->Get<EmbeddingValueInfo>().GetData(); }
 
     const Vector<SharedPtr<EmbeddingValueInfo>> &GetTensorArray() const { return this->value_info_->Get<TensorArrayValueInfo>().member_tensor_data_; }
 
-    Tuple<SizeT, phmap::Span<char>, phmap::Span<char>> GetSparse() const { return this->value_info_->Get<SparseValueInfo>().GetData(); }
+    Tuple<SizeT, Span<char>, Span<char>> GetSparse() const { return this->value_info_->Get<SparseValueInfo>().GetData(); }
 
     [[nodiscard]] const DataType &type() const { return type_; }
 

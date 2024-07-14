@@ -36,7 +36,7 @@ public:
 #endif
     }
 
-    explicit VectorHeapChunk(u64 capacity) : ptr_(MakeUnique<char[]>(capacity)) {
+    explicit VectorHeapChunk(u64 capacity) : ptr_(MakeUniqueForOverwrite<char[]>(capacity)) {
 #ifdef INFINITY_DEBUG
         GlobalResourceUsage::IncrObjectCount("VectorHeapChunk");
 #endif

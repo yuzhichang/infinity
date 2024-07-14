@@ -3,7 +3,6 @@
 module;
 
 #include <cassert>
-#include <functional>
 #include <vector>
 export module loser_tree;
 

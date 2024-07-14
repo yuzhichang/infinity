@@ -78,6 +78,7 @@ using std::strtod;
 using std::strtof;
 using std::strtol;
 
+using std::bit_cast;
 using std::memcmp;
 using std::memcpy;
 using std::memset;
@@ -295,6 +296,9 @@ namespace infinity {
     using Vector = std::vector<T, Allocator>;
 
     template<typename T>
+    using Span = std::span<T>;
+
+    template<typename T>
     using Deque = std::deque<T>;
 
     template<typename T>
@@ -457,6 +461,11 @@ namespace infinity {
     template<typename T, typename... Args>
     inline UniquePtr<T> MakeUnique(Args &&...args) {
         return std::make_unique<T>(std::forward<Args>(args)...);
+    }
+
+    template<typename T, typename... Args>
+    inline UniquePtr<T> MakeUniqueForOverwrite(Args &&...args) {
+        return std::make_unique_for_overwrite<T>(std::forward<Args>(args)...);
     }
 
     template<typename T, typename U>

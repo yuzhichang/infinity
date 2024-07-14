@@ -44,7 +44,7 @@ private:
     // if set to valid time, we know one job has started
     mutable std::mutex mutex_check_task_start_;
     TxnTimeStamp build_time_{UNCOMMIT_TS};     // for minmax filter
-    atomic_bool finished_build_minmax_filter_; // for minmax filter
+    atomic_flag finished_build_minmax_filter_; // for minmax filter
     UniquePtr<MinMaxDataFilter> min_max_data_filter_;
 
     UniquePtr<ProbabilisticDataFilter> probabilistic_data_filter_;
@@ -69,7 +69,7 @@ public:
     bool LoadFromJsonFile(const nlohmann::json &entry_json);
 
 private:
-    inline bool HaveMinMaxFilter() const { return finished_build_minmax_filter_.load(); }
+    inline bool HaveMinMaxFilter() const { return finished_build_minmax_filter_.test(std::memory_order_acquire); }
 
     // call after check finished_build_minmax_filter_, thus no need to lock
     inline TxnTimeStamp GetMinMaxBuildTime() const { return build_time_; }
@@ -93,7 +93,7 @@ private:
         min_max_data_filter_ = MakeUnique<MinMaxDataFilter>(column_count);
     }
 
-    void FinishBuildMinMaxFilterTask() { finished_build_minmax_filter_.store(true); }
+    void FinishBuildMinMaxFilterTask() { finished_build_minmax_filter_.test_and_set(std::memory_order_release); }
 
     void BuildProbabilisticDataFilter(TxnTimeStamp begin_ts, ColumnID column_id, u64 *data, u32 count) {
         probabilistic_data_filter_->Build(begin_ts, column_id, data, count);

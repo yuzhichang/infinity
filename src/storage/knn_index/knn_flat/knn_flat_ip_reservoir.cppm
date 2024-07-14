@@ -38,8 +38,8 @@ class KnnFlatIPReservoir final : public KnnDistance<DistType> {
 public:
     explicit KnnFlatIPReservoir(const DistType *queries, i64 query_count, i64 topk, i64 dimension, EmbeddingDataType elem_data_type)
         : KnnDistance<DistType>(KnnDistanceAlgoType::kKnnFlatIpReservoir, elem_data_type, query_count, dimension, topk), queries_(queries) {
-        id_array_ = MakeUnique<RowID[]>(topk * query_count);
-        distance_array_ = MakeUnique<DistType[]>(topk * query_count);
+        id_array_ = MakeUniqueForOverwrite<RowID[]>(topk * query_count);
+        distance_array_ = MakeUniqueForOverwrite<DistType[]>(topk * query_count);
         result_handler_ = MakeUnique<ResultHandler>(query_count, topk, distance_array_.get(), id_array_.get());
     }
 

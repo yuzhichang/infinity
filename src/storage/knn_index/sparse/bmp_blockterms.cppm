@@ -61,7 +61,7 @@ class BlockTerms {
 
 public:
     BlockTerms(const Vector<Tuple<IdxType, Vector<BMPBlockOffset>, Vector<DataType>>> &block_terms)
-        : data_len_(GetBufferSize(block_terms)), data_(MakeUnique<char[]>(data_len_)) {
+        : data_len_(GetBufferSize(block_terms)), data_(MakeUniqueForOverwrite<char[]>(data_len_)) {
         char *ptr = data_.get();
         for (const auto &[term_id, block_offsets, values] : block_terms) {
             SizeT block_size = block_offsets.size();
@@ -102,7 +102,7 @@ public:
 
     static BlockTerms<DataType, IdxType> ReadAdv(const char *&p) {
         SizeT data_len = ReadBufAdv<SizeT>(p);
-        UniquePtr<char[]> data = MakeUnique<char[]>(data_len);
+        UniquePtr<char[]> data = MakeUniqueForOverwrite<char[]>(data_len);
         std::memcpy(data.get(), p, data_len);
         p += data_len;
         return BlockTerms<DataType, IdxType>(data_len, std::move(data));

@@ -50,14 +50,14 @@ void search_top_k_with_sgemm(u32 k,
         return;
     UniquePtr<f32[]> distances_holder;
     if (distances == nullptr) {
-        distances_holder = MakeUnique<f32[]>(nx * k);
+        distances_holder = MakeUniqueForOverwrite<f32[]>(nx * k);
         distances = distances_holder.get();
     }
     heap_twin_multiple<CompareMax<f32, ID>> heap(nx, k, distances, labels);
     heap.initialize();
-    auto square_x = MakeUnique<f32[]>(nx);
-    auto square_y = MakeUnique<f32[]>(ny);
-    auto x_y_inner_product_buffer = MakeUnique<f32[]>(block_size_x * block_size_y);
+    auto square_x = MakeUniqueForOverwrite<f32[]>(nx);
+    auto square_y = MakeUniqueForOverwrite<f32[]>(ny);
+    auto x_y_inner_product_buffer = MakeUniqueForOverwrite<f32[]>(block_size_x * block_size_y);
     L2NormsSquares(square_x.get(), x, dimension, nx);
     L2NormsSquares(square_y.get(), y, dimension, ny);
     for (u32 x_part_begin = 0; x_part_begin < nx; x_part_begin += block_size_x) {
@@ -154,14 +154,14 @@ void search_top_k_with_sgemm(u32 k,
         return;
     UniquePtr<f32[]> distances_holder;
     if (distances == nullptr) {
-        distances_holder = MakeUnique<f32[]>(nx * k);
+        distances_holder = MakeUniqueForOverwrite<f32[]>(nx * k);
         distances = distances_holder.get();
     }
     heap_twin_multiple<CompareMax<f32, ID>> heap(nx, k, distances, labels);
     heap.initialize();
-    auto square_x = MakeUnique<f32[]>(nx);
-    auto square_y = MakeUnique<f32[]>(ny);
-    auto x_y_inner_product_buffer = MakeUnique<f32[]>(block_size_x * block_size_y);
+    auto square_x = MakeUniqueForOverwrite<f32[]>(nx);
+    auto square_y = MakeUniqueForOverwrite<f32[]>(ny);
+    auto x_y_inner_product_buffer = MakeUniqueForOverwrite<f32[]>(block_size_x * block_size_y);
     L2NormsSquares(square_x.get(), x, dimension, nx);
     L2NormsSquares(square_y.get(), y, dimension, ny);
     for (u32 x_part_begin = 0; x_part_begin < nx; x_part_begin += block_size_x) {

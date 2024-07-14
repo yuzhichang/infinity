@@ -56,7 +56,7 @@ int main(int argc, char *argv[]) {
             SaveSparseMatrix(data_mat, opt.data_save_path_);
 
             auto [topk, query_n, indices, scores] = DecodeGroundtruth(opt.groundtruth_path_, false);
-            auto new_indices = MakeUnique<i32[]>(query_n * topk);
+            auto new_indices = MakeUniqueForOverwrite<i32[]>(query_n * topk);
             for (SizeT i = 0; i < query_n; i++) {
                 for (SizeT j = 0; j < topk; j++) {
                     new_indices.get()[i * topk + j] = inv_idx[indices.get()[i * topk + j]];

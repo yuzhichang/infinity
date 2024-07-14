@@ -51,12 +51,12 @@ ColumnInverter::ColumnInverter(PostingWriterProvider posting_writer_provider, Ve
     : posting_writer_provider_(posting_writer_provider), column_lengths_(column_lengths) {}
 
 void ColumnInverter::InitAnalyzer(const String &analyzer_name) {
-    auto result = AnalyzerPool::instance().GetAnalyzer(analyzer_name);
-    if (!std::get<1>(result).ok()) {
+    auto [analyzer, status] = AnalyzerPool::instance().GetAnalyzer(analyzer_name);
+    if(!status.ok()) {
         Status status = Status::UnexpectedError(fmt::format("Invalid analyzer: {}", analyzer_name));
         RecoverableError(status);
     }
-    analyzer_ = std::move(std::get<0>(result));
+    analyzer_ = std::move(analyzer);
 }
 
 ColumnInverter::~ColumnInverter() = default;

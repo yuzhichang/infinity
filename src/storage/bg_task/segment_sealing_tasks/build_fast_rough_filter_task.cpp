@@ -140,8 +140,8 @@ template <CanBuildBloomFilter ValueType, bool CheckTS>
 void BuildFastRoughFilterTask::BuildOnlyBloomFilter(BuildFastRoughFilterArg &arg) {
     LOG_TRACE(fmt::format("BuildFastRoughFilterTask: BuildOnlyBloomFilter job begin for column: {}", arg.column_id_));
     if (!arg.distinct_keys_) {
-        arg.distinct_keys_ = MakeUnique<u64[]>(arg.total_row_count_in_segment_);
-        arg.distinct_keys_backup_ = MakeUnique<u64[]>(arg.total_row_count_in_segment_);
+        arg.distinct_keys_ = MakeUniqueForOverwrite<u64[]>(arg.total_row_count_in_segment_);
+        arg.distinct_keys_backup_ = MakeUniqueForOverwrite<u64[]>(arg.total_row_count_in_segment_);
     }
     auto iter = BlockEntryIter(arg.segment_entry_);
     Vector<u64> input_data; // for reuse
@@ -276,8 +276,8 @@ void BuildFastRoughFilterTask::BuildMinMaxAndBloomFilter(BuildFastRoughFilterArg
     using MinMaxHelper = InnerMinMaxDataFilterInfo<ValueType>;
     using MinMaxInnerValueType = MinMaxHelper::InnerValueType;
     if (!arg.distinct_keys_) {
-        arg.distinct_keys_ = MakeUnique<u64[]>(arg.total_row_count_in_segment_);
-        arg.distinct_keys_backup_ = MakeUnique<u64[]>(arg.total_row_count_in_segment_);
+        arg.distinct_keys_ = MakeUniqueForOverwrite<u64[]>(arg.total_row_count_in_segment_);
+        arg.distinct_keys_backup_ = MakeUniqueForOverwrite<u64[]>(arg.total_row_count_in_segment_);
     }
     // step 0. prepare min and max value
     MinMaxInnerValueType segment_min_value = std::numeric_limits<MinMaxInnerValueType>::max();

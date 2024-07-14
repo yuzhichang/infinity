@@ -58,7 +58,7 @@ template <u32 FIXED_QUERY_TOKEN_NUM>
 auto EMVBSearch<FIXED_QUERY_TOKEN_NUM>::find_candidate_docs(const f32 *centroids_scores, const u32 nprobe, const f32 th) const {
     std::vector<std::bitset<FIXED_QUERY_TOKEN_NUM>> centroid_q_token_sim(n_centroids_);
     // TODO: reuse space?
-    auto filtered_centroid_ids = std::make_unique<u32[]>(n_centroids_ + 8);
+    auto filtered_centroid_ids = std::make_unique_for_overwrite<u32[]>(n_centroids_ + 8);
     std::vector<u32> closest_centroids_ids;
     closest_centroids_ids.reserve(FIXED_QUERY_TOKEN_NUM * nprobe);
     for (u32 i = 0; i < FIXED_QUERY_TOKEN_NUM; ++i) {
@@ -120,7 +120,7 @@ auto EMVBSearch<FIXED_QUERY_TOKEN_NUM>::compute_hit_frequency(std::vector<u32> c
     if (n_doc_to_score >= candidate_documents.size()) [[unlikely]] {
         // too few documents
         std::pair<u32, std::unique_ptr<u32[]>> result(candidate_documents.size(), nullptr);
-        result.second = std::make_unique<u32[]>(candidate_documents.size());
+        result.second = std::make_unique_for_overwrite<u32[]>(candidate_documents.size());
         std::copy(candidate_documents.begin(), candidate_documents.end(), result.second.get());
         return result;
     }
@@ -180,7 +180,7 @@ auto EMVBSearch<FIXED_QUERY_TOKEN_NUM>::second_stage_filtering(auto selected_cnt
                                                                auto query_token_centroids_scores) const {
     static_assert(std::is_same_v<decltype(query_token_centroids_scores), UniquePtrF32Aligned>);
     const auto &[selected_cnt, selected_docs] = selected_cnt_and_docs;
-    auto centroids_scores_transposed = std::make_unique<f32[]>(FIXED_QUERY_TOKEN_NUM * n_centroids_);
+    auto centroids_scores_transposed = std::make_unique_for_overwrite<f32[]>(FIXED_QUERY_TOKEN_NUM * n_centroids_);
     TransposeMatrix(query_token_centroids_scores.get(), centroids_scores_transposed.get(), FIXED_QUERY_TOKEN_NUM, n_centroids_);
     // release memory no longer needed
     query_token_centroids_scores.reset();

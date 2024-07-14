@@ -73,7 +73,7 @@ public:
     using SparseVecEle = SparseVecEle<DataType, IdxType>;
 
 private:
-    SparseVecStoreInner(SizeT max_vec_num, const Meta &meta) : vecs_(MakeUnique<SparseVecEle[]>(max_vec_num)) {}
+    SparseVecStoreInner(SizeT max_vec_num, const Meta &meta) : vecs_(MakeUniqueForOverwrite<SparseVecEle[]>(max_vec_num)) {}
 
 public:
     SparseVecStoreInner() = default;
@@ -86,10 +86,10 @@ public:
             nnz += vecs_[i].nnz_;
         }
         file_handler.Write(&nnz, sizeof(nnz));
-        auto indptr = MakeUnique<i32[]>(cur_vec_num + 1);
+        auto indptr = MakeUniqueForOverwrite<i32[]>(cur_vec_num + 1);
         indptr[0] = 0;
-        auto indice = MakeUnique<IdxType[]>(nnz);
-        auto data = MakeUnique<DataType[]>(nnz);
+        auto indice = MakeUniqueForOverwrite<IdxType[]>(nnz);
+        auto data = MakeUniqueForOverwrite<DataType[]>(nnz);
         for (SizeT i = 0; i < cur_vec_num; ++i) {
             const SparseVecEle &vec = vecs_[i];
             Copy(vec.indices_.get(), vec.indices_.get() + vec.nnz_, indice.get() + indptr[i]);
@@ -104,19 +104,19 @@ public:
     static This Load(FileHandler &file_handler, SizeT cur_vec_num, SizeT max_vec_num, const Meta &meta) {
         SizeT nnz = 0;
         file_handler.Read(&nnz, sizeof(nnz));
-        auto indptr = MakeUnique<i32[]>(cur_vec_num + 1);
+        auto indptr = MakeUniqueForOverwrite<i32[]>(cur_vec_num + 1);
         file_handler.Read(indptr.get(), sizeof(i32) * (cur_vec_num + 1));
-        auto indice = MakeUnique<IdxType[]>(nnz);
+        auto indice = MakeUniqueForOverwrite<IdxType[]>(nnz);
         file_handler.Read(indice.get(), sizeof(IdxType) * nnz);
-        auto data = MakeUnique<DataType[]>(nnz);
+        auto data = MakeUniqueForOverwrite<DataType[]>(nnz);
         file_handler.Read(data.get(), sizeof(DataType) * nnz);
 
         This ret(max_vec_num, meta);
         for (SizeT i = 0; i < cur_vec_num; ++i) {
             SparseVecEle &vec = ret.vecs_[i];
             vec.nnz_ = indptr[i + 1] - indptr[i];
-            vec.indices_ = MakeUnique<IdxType[]>(vec.nnz_);
-            vec.data_ = MakeUnique<DataType[]>(vec.nnz_);
+            vec.indices_ = MakeUniqueForOverwrite<IdxType[]>(vec.nnz_);
+            vec.data_ = MakeUniqueForOverwrite<DataType[]>(vec.nnz_);
             Copy(indice.get() + indptr[i], indice.get() + indptr[i + 1], vec.indices_.get());
             Copy(data.get() + indptr[i], data.get() + indptr[i + 1], vec.data_.get());
         }
@@ -126,8 +126,8 @@ public:
     void SetVec(SizeT idx, const SparseVecRef &vec, const Meta &meta) {
         SparseVecEle &dst = vecs_[idx];
         dst.nnz_ = vec.nnz_;
-        dst.indices_ = MakeUnique<IdxType[]>(vec.nnz_);
-        dst.data_ = MakeUnique<DataType[]>(vec.nnz_);
+        dst.indices_ = MakeUniqueForOverwrite<IdxType[]>(vec.nnz_);
+        dst.data_ = MakeUniqueForOverwrite<DataType[]>(vec.nnz_);
         Copy(vec.indices_, vec.indices_ + vec.nnz_, dst.indices_.get());
         Copy(vec.data_, vec.data_ + vec.nnz_, dst.data_.get());
     }

@@ -130,8 +130,8 @@ private:
     template <bool WithLock, FilterConcept<LabelType> Filter = NoneType>
     Tuple<SizeT, UniquePtr<DataType[]>, UniquePtr<VertexType[]>>
     SearchLayer(VertexType enter_point, const StoreType &query, i32 layer_idx, SizeT result_n, const Filter &filter) const {
-        auto d_ptr = MakeUnique<DataType[]>(result_n);
-        auto i_ptr = MakeUnique<VertexType[]>(result_n);
+        auto d_ptr = MakeUniqueForOverwrite<DataType[]>(result_n);
+        auto i_ptr = MakeUniqueForOverwrite<VertexType[]>(result_n);
         HeapResultHandler<CompareMax<DataType, VertexType>> result_handler(1, result_n, d_ptr.get(), i_ptr.get());
         result_handler.Begin();
         DistHeap candidate;
@@ -363,7 +363,7 @@ public:
     template <FilterConcept<LabelType> Filter = NoneType, bool WithLock = true>
     Tuple<SizeT, UniquePtr<DataType[]>, UniquePtr<LabelType[]>> KnnSearch(const QueryVecType &q, SizeT k, const Filter &filter) const {
         auto [result_n, d_ptr, v_ptr] = KnnSearchInner<WithLock, Filter>(q, k, filter);
-        auto labels = MakeUnique<LabelType[]>(result_n);
+        auto labels = MakeUniqueForOverwrite<LabelType[]>(result_n);
         for (SizeT i = 0; i < result_n; ++i) {
             labels[i] = GetLabel(v_ptr[i]);
         }

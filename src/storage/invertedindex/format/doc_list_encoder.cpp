@@ -73,7 +73,7 @@ void DocListEncoder::Dump(const SharedPtr<FileWriter> &file, bool spill) {
         file->WriteVInt(df_);
         file->WriteVInt(block_max_tf_);
         assert((sizeof(i32) == sizeof(float)));
-        i32 block_max_percentage = *(i32 *)(&block_max_percentage_);
+        i32 block_max_percentage = std::bit_cast<i32>(block_max_percentage_);
         file->WriteInt(block_max_percentage);
     } else {
         Flush();
@@ -103,7 +103,7 @@ void DocListEncoder::Load(const SharedPtr<FileReader> &file) {
     df_ = file->ReadVInt();
     block_max_tf_ = file->ReadVInt();
     i32 block_max_percentage = file->ReadInt();
-    block_max_percentage_ = *(float *)(&block_max_percentage);
+    block_max_percentage_ = std::bit_cast<float>(block_max_percentage);
 
     doc_skiplist_writer_->Load(file);
     doc_list_buffer_.Load(file);

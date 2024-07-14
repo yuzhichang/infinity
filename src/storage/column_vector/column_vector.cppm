@@ -357,7 +357,7 @@ private:
             }
         }
 
-        auto tmp_indices = MakeUnique<IdxT[]>(total_element_count);
+        auto tmp_indices = MakeUniqueForOverwrite<IdxT[]>(total_element_count);
         HashSet<IdxT> index_set;
         if constexpr (std::is_same_v<T, BooleanT>) {
             for (u32 i = 0; i < total_element_count; ++i) {
@@ -378,7 +378,7 @@ private:
                 buffer_->fix_heap_mgr_->AppendToHeap(reinterpret_cast<const char *>(tmp_indices.get()), total_element_count * sizeof(IdxT));
         } else {
             Vector<Pair<const_ptr_t, SizeT>> data_ptrs;
-            auto tmp_data = MakeUnique<T[]>(total_element_count);
+            auto tmp_data = MakeUniqueForOverwrite<T[]>(total_element_count);
             for (u32 i = 0; i < total_element_count; ++i) {
                 auto [index, value] = DataType::StringToSparseValue<T, IdxT>(ele_str_views[i]);
                 if (index < 0) {
@@ -446,7 +446,7 @@ void WriteToTensor(TensorT &target_tensor,
         Status status = Status::SyntaxError("Tensor size exceeds the limit.");
         RecoverableError(status);
     }
-    auto tmp_data = MakeUnique<T[]>(total_element_count);
+    auto tmp_data = MakeUniqueForOverwrite<T[]>(total_element_count);
     for (u32 i = 0; i < total_element_count; ++i) {
         tmp_data[i] = DataType::StringToValue<T>(ele_str_views[i]);
     }

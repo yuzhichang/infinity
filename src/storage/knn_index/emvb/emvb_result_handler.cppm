@@ -186,8 +186,8 @@ public:
         if (capacity_ < 8) {
             capacity_ = 8;
         }
-        reservoir_distance_ptr_ = MakeUnique<DistType[]>(capacity_);
-        reservoir_id_ptr_ = MakeUnique<ID[]>(capacity_);
+        reservoir_distance_ptr_ = MakeUniqueForOverwrite<DistType[]>(capacity_);
+        reservoir_id_ptr_ = MakeUniqueForOverwrite<ID[]>(capacity_);
     }
 
     [[nodiscard]] auto GetThreshold() const { return threshold_; }

@@ -40,8 +40,8 @@ public:
     explicit KnnFlatL2Top1Blas(const DistType *queries, i64 query_count, i64 dimension, EmbeddingDataType elem_data_type)
         : KnnDistance<DistType>(KnnDistanceAlgoType::kKnnFlatL2Top1Blas, elem_data_type, query_count, dimension, 1), queries_(queries) {
 
-        id_array_ = MakeUnique<RowID[]>(this->query_count_);
-        distance_array_ = MakeUnique<DistType[]>(this->query_count_);
+        id_array_ = MakeUniqueForOverwrite<RowID[]>(this->query_count_);
+        distance_array_ = MakeUniqueForOverwrite<DistType[]>(this->query_count_);
 
         result_handler_ = MakeUnique<ResultHandler>(query_count, distance_array_.get(), id_array_.get());
     }
@@ -56,8 +56,8 @@ public:
         const SizeT bs_y = DISTANCE_COMPUTE_BLAS_DATABASE_BS;
         // const SizeT bs_x = 16, bs_y = 16;
 
-        ip_block_ = MakeUnique<DistType[]>(bs_x * bs_y);
-        x_norms_ = MakeUnique<DistType[]>(this->query_count_);
+        ip_block_ = MakeUniqueForOverwrite<DistType[]>(bs_x * bs_y);
+        x_norms_ = MakeUniqueForOverwrite<DistType[]>(this->query_count_);
 
         L2NormsSquares(x_norms_.get(), queries_, this->dimension_, this->query_count_);
 
@@ -77,7 +77,7 @@ public:
             return;
         }
 
-        y_norms_ = MakeUnique<DistType[]>(base_count);
+        y_norms_ = MakeUniqueForOverwrite<DistType[]>(base_count);
         L2NormsSquares(y_norms_.get(), base, this->dimension_, base_count);
 
         // block sizes
@@ -140,7 +140,7 @@ public:
             return;
         }
 
-        y_norms_ = MakeUnique<DistType[]>(base_count);
+        y_norms_ = MakeUniqueForOverwrite<DistType[]>(base_count);
         L2NormsSquares(y_norms_.get(), base, this->dimension_, base_count);
 
         // block sizes

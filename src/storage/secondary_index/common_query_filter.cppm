@@ -44,7 +44,7 @@ export struct CommonQueryFilter {
     Vector<FilterExecuteElem> filter_execute_command_;
 
     // result
-    atomic_bool finish_build_;
+    atomic_flag finish_build_;
     std::mutex result_mutex_;
     Map<SegmentID, std::variant<Vector<u32>, Bitmask>> filter_result_;
     SizeT filter_result_count_ = 0;
@@ -63,7 +63,7 @@ export struct CommonQueryFilter {
     // if other threads are building the filter, the filter is not available for query
     // in this case, physical operator should return early and wait for next scheduling
     bool TryFinishBuild(Txn *txn) {
-        if (finish_build_.load()) {
+        if (finish_build_.test(std::memory_order_acquire)) {
             return true;
         }
         while (true) {
@@ -77,13 +77,13 @@ export struct CommonQueryFilter {
             }
             BuildFilter(task_id, txn);
             if (++end_task_num_ == total_task_num_) {
-                finish_build_.store(true);
+                finish_build_.test_and_set(std::memory_order_release);
                 break;
             }
         }
         // no more begin_task_num_ left
         // but it is possible that other threads are still building the filter
-        return finish_build_.load();
+        return finish_build_.test(std::memory_order_acquire);
     }
 
     void TryApplyFastRoughFilterOptimizer();

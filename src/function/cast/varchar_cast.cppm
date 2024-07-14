@@ -304,7 +304,7 @@ inline bool TryCastVarcharVector::Run(const VarcharT &source, ColumnVector* sour
             SizeT varchar_len = source.length_;
             u32 chunk_id = source.vector_.chunk_id_;
             u32 chunk_offset = source.vector_.chunk_offset_;
-            auto varchar_ptr = MakeUnique<char[]>(varchar_len + 1);
+            auto varchar_ptr = MakeUniqueForOverwrite<char[]>(varchar_len + 1);
             varchar_ptr[varchar_len] = '\0';
             source_vector->buffer_->fix_heap_mgr_->ReadFromHeap(varchar_ptr.get(), chunk_id, chunk_offset, varchar_len);
 

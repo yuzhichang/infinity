@@ -252,7 +252,7 @@ void EmbeddingTryCastToTensorImpl(const EmbeddingT &source, const SizeT source_e
         target.chunk_offset_ = chunk_offset;
     } else {
         const auto target_size = source_embedding_dim * sizeof(TargetValueType);
-        auto target_tmp_ptr = MakeUnique<TargetValueType[]>(source_embedding_dim);
+        auto target_tmp_ptr = MakeUniqueForOverwrite<TargetValueType[]>(source_embedding_dim);
         if (!EmbeddingTryCastToFixlen::Run(reinterpret_cast<const SourceValueType *>(source.ptr),
                                            reinterpret_cast<TargetValueType *>(target_tmp_ptr.get()),
                                            source_embedding_dim)) {
@@ -418,7 +418,7 @@ void EmbeddingTryCastToSparseImpl(const EmbeddingT &source,
         target.chunk_offset_ = chunk_offset;
     } else {
         SizeT target_size = source_dim * sizeof(IdxT);
-        auto target_tmp_ptr = MakeUnique<IdxT[]>(source_dim);
+        auto target_tmp_ptr = MakeUniqueForOverwrite<IdxT[]>(source_dim);
         if (!EmbeddingTryCastToFixlen::Run(reinterpret_cast<const SourceType *>(source.ptr), target_tmp_ptr.get(), source_dim)) {
             String error_message = fmt::format("Failed to cast from embedding with type {} to sparse with type {}",
                                                DataType::TypeToString<SourceType>(),

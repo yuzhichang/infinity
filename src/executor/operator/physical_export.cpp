@@ -412,7 +412,7 @@ SizeT PhysicalExport::ExportToFVECS(QueryContext *query_context, ExportOperatorS
                 }
 
                 Value v = exported_column_vector.GetValue(row_idx);
-                phmap::Span<char> embedding = v.GetEmbedding();
+                Span<char> embedding = v.GetEmbedding();
 
                 if(row_count > 0 && this->row_limit_ != 0 && (row_count % this->row_limit_) == 0) {
                     ++ file_no_;

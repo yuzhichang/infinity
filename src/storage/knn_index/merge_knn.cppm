@@ -39,8 +39,8 @@ class MergeKnn final : public MergeKnnBase {
 
 public:
     explicit MergeKnn(u64 query_count, u64 topk)
-        : total_count_(0), query_count_(query_count), topk_(topk), idx_array_(MakeUnique<RowID[]>(topk * query_count)),
-          distance_array_(MakeUnique<DataType[]>(topk * query_count)) {
+        : total_count_(0), query_count_(query_count), topk_(topk), idx_array_(MakeUniqueForOverwrite<RowID[]>(topk * query_count)),
+          distance_array_(MakeUniqueForOverwrite<DataType[]>(topk * query_count)) {
         result_handler_ = MakeUnique<ResultHandler>(query_count, topk, this->distance_array_.get(), this->idx_array_.get());
     }
 

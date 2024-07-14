@@ -92,13 +92,10 @@ Tuple<bool, float, RowID> BlockMaxAndNotIterator::SeekInBlockRange(RowID doc_id,
         if (doc_id > block_end) [[unlikely]] {
             return {false, 0.0F, INVALID_ROWID};
         }
-        // [success, score, id]
-        auto result = inner_iterators_[0]->SeekInBlockRange(doc_id, block_end, threshold);
-        if (!std::get<0>(result)) {
+        auto [success, score, id] = inner_iterators_[0]->SeekInBlockRange(doc_id, block_end, threshold);
+        if (!success) {
             return {false, 0.0F, INVALID_ROWID};
         }
-        float score = std::get<1>(result);
-        RowID id = std::get<2>(result);
         assert((doc_id <= id && id <= block_end));
         doc_id = id;
         bool all_match = true;

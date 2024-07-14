@@ -75,7 +75,7 @@ std::unique_ptr<T[]> load_data(const std::string &filename, size_t &num, int &di
     in.seekg(0, std::ios::end);
     auto ss = in.tellg();
     num = ((size_t)ss) / (dim + 1) / 4;
-    auto data = std::make_unique<T[]>(num * dim);
+    auto data = std::make_unique_for_overwrite<T[]>(num * dim);
 
     in.seekg(0, std::ios::beg);
     for (size_t i = 0; i < num; i++) {

@@ -511,7 +511,7 @@ void PhysicalKnnScan::ExecuteInternal(QueryContext *query_context, KnnScanOperat
                                     }
                                 }
 
-                                auto row_ids = MakeUnique<RowID[]>(result_n);
+                                auto row_ids = MakeUniqueForOverwrite<RowID[]>(result_n);
                                 for (i64 i = 0; i < result_n; ++i) {
                                     row_ids[i] = RowID{segment_id, l_ptr[i]};
                                 }

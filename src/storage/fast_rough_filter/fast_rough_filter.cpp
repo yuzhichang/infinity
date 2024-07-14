@@ -42,12 +42,11 @@ String FastRoughFilter::SerializeToString() const {
         os.write(reinterpret_cast<const char *>(&build_time_), sizeof(build_time_));
         probabilistic_data_filter_->SerializeToStringStream(os, probabilistic_data_filter_binary_bytes);
         min_max_data_filter_->SerializeToStringStream(os, min_max_data_filter_binary_bytes);
-        String result = os.str();
-        if (result.size() != total_binary_bytes) {
+        if (os.view().size() != total_binary_bytes) {
             String error_message = "FastRoughFilter::SerializeToString(): save size error";
             UnrecoverableError(error_message);
         }
-        return result;
+        return std::move(os).str();
     } else {
         String error_message = "FastRoughFilter::SerializeToString(): No FastRoughFilter data.";
         UnrecoverableError(error_message);
@@ -60,6 +59,10 @@ void FastRoughFilter::DeserializeFromString(const String &str) {
     IStringStream is(str);
     u32 total_binary_bytes;
     is.read(reinterpret_cast<char *>(&total_binary_bytes), sizeof(total_binary_bytes));
+    if (total_binary_bytes != is.view().size()) {
+        String error_message = "FastRoughFilter::DeserializeToString(): load size error";
+        UnrecoverableError(error_message);
+    }
     is.read(reinterpret_cast<char *>(&build_time_), sizeof(build_time_));
     if (!probabilistic_data_filter_) {
         probabilistic_data_filter_ = MakeUnique<ProbabilisticDataFilter>();
@@ -70,7 +73,7 @@ void FastRoughFilter::DeserializeFromString(const String &str) {
     }
     min_max_data_filter_->DeserializeFromStringStream(is);
     // check position
-    if (!is or !is.eof()) {
+    if (!is or u32(is.tellg()) != is.view().size()) {
         String error_message = "FastRoughFilter::DeserializeToString(): load size error";
         UnrecoverableError(error_message);
     }

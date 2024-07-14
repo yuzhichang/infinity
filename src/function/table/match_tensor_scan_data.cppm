@@ -34,8 +34,8 @@ public:
     explicit MatchTensorScanFunctionData(const u32 topn) : topn_(topn) { Init(); }
 
     void Init() {
-        score_result_ = MakeUnique<float[]>(topn_);
-        row_id_result_ = MakeUnique<RowID[]>(topn_);
+        score_result_ = MakeUniqueForOverwrite<float[]>(topn_);
+        row_id_result_ = MakeUniqueForOverwrite<RowID[]>(topn_);
         result_handler_ = MakeUnique<ResultHandler>(1, topn_, score_result_.get(), row_id_result_.get());
         result_handler_->Begin();
     }
