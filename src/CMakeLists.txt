@@ -285,7 +285,6 @@ target_link_libraries(infinity
         thrift.a
         thriftnb.a
         lz4.a
-        atomic.a
         event.a
         oatpp.a
         jma
@@ -332,7 +331,6 @@ target_link_libraries(embedded_infinity_ext PRIVATE
         newpfor
         fastpfor
         lz4.a
-        atomic.a
         event.a
         oatpp.a
         jma
@@ -458,7 +456,6 @@ target_link_libraries(unit_test
         newpfor
         fastpfor
         lz4.a
-        atomic.a
         thrift.a
         jma
         opencc

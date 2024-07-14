@@ -22,7 +22,6 @@ target_link_libraries(
         newpfor
         fastpfor
         lz4.a
-        atomic.a
         thrift.a
         jma
         opencc

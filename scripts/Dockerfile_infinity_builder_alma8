@@ -88,6 +88,15 @@ RUN --mount=type=bind,source=gperftools-2.15.tar.gz,target=/root/gperftools-2.15
 RUN --mount=type=bind,source=sqllogictest-bin-v0.20.2-x86_64-unknown-linux-musl.tar.gz,target=/root/sqllogictest-bin-v0.20.2-x86_64-unknown-linux-musl.tar.gz \
     cd /tmp && tar xzf /root/sqllogictest-bin-v0.20.2-x86_64-unknown-linux-musl.tar.gz && cp -rf sqllogictest /usr/local/bin && rm -fr /tmp/*
 
+# Install libevent-2.1.12
+RUN --mount=type=bind,source=libevent-2.1.12-stable.tar.gz,target=/root/libevent-2.1.12-stable.tar.gz  \
+    cd /root && tar xf libevent-2.1.12-stable.tar.gz \
+    && cd libevent-2.1.12-stable && mkdir build && cd build \
+    && cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-fPIC" .. \
+    && ninja install \
+    && ldconfig && cd /root && rm -rf libevent-2.1.12-stable
+
 # Install lz4-1.9.4
 RUN --mount=type=bind,source=lz4-1.9.4.tar.gz,target=/root/lz4-1.9.4.tar.gz  \
 cd /root && tar xf lz4-1.9.4.tar.gz \
@@ -114,6 +123,6 @@ RUN --mount=type=bind,source=python/requirements.txt,target=/root/requirements.t
 
 ENV PATH="/usr/local/venv310/bin:$PATH"
 
-ENV CC=clang CXX=clang++
+ENV CC=clang CXX=clang++ LZ4_ROOT=/usr/local
 
 ENTRYPOINT [ "bash", "-c", "while true; do sleep 60; done"]

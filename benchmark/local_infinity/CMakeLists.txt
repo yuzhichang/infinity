@@ -14,7 +14,6 @@ target_link_libraries(
     newpfor
     fastpfor
     lz4.a
-    atomic.a
     jma
     opencc
 )
@@ -37,7 +36,6 @@ target_link_libraries(
     newpfor
     fastpfor
     lz4.a
-    atomic.a
     jma
     opencc
 )
@@ -58,7 +56,6 @@ target_link_libraries(
     newpfor
     fastpfor
     lz4.a
-    atomic.a
     jma
     opencc
 )
@@ -81,7 +78,6 @@ target_link_libraries(
     newpfor
     fastpfor
     lz4.a
-    atomic.a
     jma
     opencc
 )
@@ -102,7 +98,6 @@ target_link_libraries(
     newpfor
     fastpfor
     lz4.a
-    atomic.a
     jma
     opencc
 )
@@ -122,7 +117,6 @@ target_link_libraries(
     newpfor
     fastpfor
     lz4.a
-    atomic.a
     jma
     opencc
 )
@@ -142,7 +136,6 @@ target_link_libraries(
     newpfor
     fastpfor
     lz4.a
-    atomic.a
     jma
     opencc
 )
