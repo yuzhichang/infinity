@@ -6,7 +6,7 @@
 # - https://github.com/wjakob/nanobind/blob/master/docs/api_cmake.rst
 
 [build-system]
-requires = ["scikit-build-core", "nanobind"]
+requires = ["scikit-build-core >= 0.9.8", "nanobind @ git+https://github.com/wjakob/nanobind@master"]
 build-backend = "scikit_build_core.build"
 
 [project]
