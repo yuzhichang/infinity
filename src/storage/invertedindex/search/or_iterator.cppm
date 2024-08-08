@@ -21,29 +21,9 @@ import index_defines;
 import doc_iterator;
 import multi_doc_iterator;
 import internal_types;
+import loser_tree;
 
 namespace infinity {
-
-export struct DocIteratorEntry {
-    RowID doc_id_{INVALID_ROWID};
-    u32 entry_id_{0};
-};
-
-export struct DocIteratorHeap {
-public:
-    DocIteratorHeap() { iterator_heap_.resize(1); }
-
-    void AddEntry(const DocIteratorEntry &entry) { iterator_heap_.push_back(entry); }
-
-    void BuildHeap();
-
-    void AdjustDown(SizeT idx);
-
-    DocIteratorEntry &TopEntry() { return iterator_heap_[1]; }
-
-public:
-    Vector<DocIteratorEntry> iterator_heap_; // children begin with 1
-};
 
 export class OrIterator : public MultiDocIterator {
 public:
@@ -61,9 +41,7 @@ public:
 private:
     DocIterator *GetDocIterator(u32 i) { return children_[i].get(); }
 
-    const DocIterator *GetDocIterator(u32 i) const { return children_[i].get(); }
-
-    DocIteratorHeap heap_;
+    LoserTree<RowID, std::less<RowID>> pq_;
     // bm25 score cache
     RowID bm25_score_cache_docid_ = INVALID_ROWID;
     float bm25_score_cache_ = 0.0f;

@@ -23,61 +23,38 @@ import stl;
 import index_defines;
 import multi_doc_iterator;
 import doc_iterator;
+import loser_tree;
 namespace infinity {
 
-void DocIteratorHeap::BuildHeap() {
-    for (SizeT i = (1 + iterator_heap_.size()) / 2; i > 0; --i) {
-        AdjustDown(i);
-    }
-}
-
-void DocIteratorHeap::AdjustDown(SizeT idx) {
-    assert(idx >= 1 && idx < iterator_heap_.size());
-    SizeT min = idx;
-    SizeT end = iterator_heap_.size();
-    do {
-        idx = min;
-        SizeT left = idx << 1;
-        SizeT right = left + 1;
-        if (left < end && iterator_heap_[left].doc_id_ < iterator_heap_[min].doc_id_) {
-            min = left;
-        }
-        if (right < end && iterator_heap_[right].doc_id_ < iterator_heap_[min].doc_id_) {
-            min = right;
-        }
-        if (min != idx) {
-            std::swap(iterator_heap_[idx], iterator_heap_[min]);
-        }
-    } while (min != idx);
-}
-
-OrIterator::OrIterator(Vector<UniquePtr<DocIterator>> iterators) : MultiDocIterator(std::move(iterators)) {
+OrIterator::OrIterator(Vector<UniquePtr<DocIterator>> iterators) : MultiDocIterator(std::move(iterators)), pq_(children_.size()) {
     doc_freq_ = 0;
     bm25_score_upper_bound_ = 0.0f;
+    for (u32 i = 0; i < children_.size(); ++i) {
+        doc_freq_ += children_[i]->GetDF();
+        bm25_score_upper_bound_ += children_[i]->BM25ScoreUpperBound();
+    }
 }
 
 bool OrIterator::Next(RowID doc_id) {
     assert(doc_id != INVALID_ROWID);
     if (doc_id_ == INVALID_ROWID) {
         for (u32 i = 0; i < children_.size(); ++i) {
-            doc_freq_ += children_[i]->GetDF();
             children_[i]->Next();
-            DocIteratorEntry entry = {children_[i]->DocID(), i};
-            heap_.AddEntry(entry);
-            bm25_score_upper_bound_ += children_[i]->BM25ScoreUpperBound();
+            RowID child_doc_id = children_[i]->DocID();
+            pq_.InsertStart(&child_doc_id, i, false);
         }
-        heap_.BuildHeap();
-        doc_id_ = heap_.TopEntry().doc_id_;
+        pq_.Init();
+        doc_id_ = pq_.TopKey();
     }
     if (doc_id_ != INVALID_ROWID && doc_id_ >= doc_id)
         return true;
-    while (doc_id > heap_.TopEntry().doc_id_) {
-        DocIterator *top = GetDocIterator(heap_.TopEntry().entry_id_);
+    while (doc_id > pq_.TopKey()) {
+        DocIterator *top = GetDocIterator(pq_.TopSource());
         top->Next(doc_id);
-        heap_.TopEntry().doc_id_ = top->DocID();
-        heap_.AdjustDown(1);
+        RowID child_doc_id = top->DocID();
+        pq_.DeleteTopInsert(&child_doc_id, false);
     }
-    doc_id_ = heap_.TopEntry().doc_id_;
+    doc_id_ = pq_.TopKey();
     return doc_id_ != INVALID_ROWID;
 }
 
