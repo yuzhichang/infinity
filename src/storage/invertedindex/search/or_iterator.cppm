@@ -26,28 +26,37 @@ namespace infinity {
 
 export struct DocIteratorEntry {
     RowID doc_id_{INVALID_ROWID};
-    u32 entry_id_{0};
+    SizeT entry_id_{0};
 };
 
-export struct DocIteratorHeap {
+export class DocIteratorHeap {
 public:
-    DocIteratorHeap() { iterator_heap_.resize(1); }
+    inline DocIteratorHeap() { iterator_heap_.resize(1); }
 
-    void AddEntry(const DocIteratorEntry &entry) { iterator_heap_.push_back(entry); }
+    inline void AddEntry(const DocIteratorEntry &entry) { iterator_heap_.push_back(entry); }
 
-    void BuildHeap();
+    inline void BuildHeap() {
+        for (SizeT i = (1 + iterator_heap_.size()) / 2; i > 0; --i) {
+            AdjustDown(i);
+        }
+    }
 
-    void AdjustDown(SizeT idx);
+    inline DocIteratorEntry &TopEntry() { return iterator_heap_[1]; }
 
-    DocIteratorEntry &TopEntry() { return iterator_heap_[1]; }
+    inline void UpdateTopEntry(RowID new_row_id) {
+        iterator_heap_[1].doc_id_ = new_row_id;
+        AdjustDown(1);
+    }
 
 public:
     Vector<DocIteratorEntry> iterator_heap_; // children begin with 1
+private:
+    void AdjustDown(SizeT idx);
 };
 
 export class OrIterator : public MultiDocIterator {
 public:
-    OrIterator(Vector<UniquePtr<DocIterator>> iterators);
+    OrIterator(Vector<SharedPtr<DocIterator>> iterators);
 
     String Name() const override { return "OrIterator"; }
 
@@ -59,9 +68,9 @@ public:
     void UpdateScoreThreshold(float threshold) override;
 
 private:
-    DocIterator *GetDocIterator(u32 i) { return children_[i].get(); }
+    DocIterator *GetDocIterator(SizeT i) { return children_[i].get(); }
 
-    const DocIterator *GetDocIterator(u32 i) const { return children_[i].get(); }
+    const DocIterator *GetDocIterator(SizeT i) const { return children_[i].get(); }
 
     DocIteratorHeap heap_;
     // bm25 score cache

@@ -24,7 +24,7 @@ import internal_types;
 
 namespace infinity {
 
-AndIterator::AndIterator(Vector<UniquePtr<DocIterator>> iterators) : MultiDocIterator(std::move(iterators)) {
+AndIterator::AndIterator(Vector<SharedPtr<DocIterator>> iterators) : MultiDocIterator(std::move(iterators)) {
     std::sort(children_.begin(), children_.end(), [](const auto &lhs, const auto &rhs) { return lhs->GetDF() < rhs->GetDF(); });
     // init df
     doc_freq_ = std::numeric_limits<u32>::max();

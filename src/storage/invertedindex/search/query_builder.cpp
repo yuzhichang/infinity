@@ -40,13 +40,13 @@ void QueryBuilder::Init(IndexReader index_reader) { index_reader_ = index_reader
 
 QueryBuilder::~QueryBuilder() {}
 
-UniquePtr<DocIterator> QueryBuilder::CreateSearch(FullTextQueryContext &context, EarlyTermAlgo early_term_algo) {
+SharedPtr<DocIterator> QueryBuilder::CreateSearch(FullTextQueryContext &context, EarlyTermAlgo early_term_algo) {
     // Optimize the query tree.
     if (!context.optimized_query_tree_) {
         context.optimized_query_tree_ = QueryNode::GetOptimizedQueryTree(std::move(context.query_tree_));
     }
     // Create the iterator from the query tree.
-    UniquePtr<DocIterator> result = context.optimized_query_tree_->CreateSearch(table_entry_, index_reader_, early_term_algo);
+    SharedPtr<DocIterator> result = context.optimized_query_tree_->CreateSearch(table_entry_, index_reader_, early_term_algo);
 #ifdef INFINITY_DEBUG
     {
         OStringStream oss;

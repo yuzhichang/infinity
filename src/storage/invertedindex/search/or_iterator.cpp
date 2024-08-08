@@ -25,12 +25,6 @@ import multi_doc_iterator;
 import doc_iterator;
 namespace infinity {
 
-void DocIteratorHeap::BuildHeap() {
-    for (SizeT i = (1 + iterator_heap_.size()) / 2; i > 0; --i) {
-        AdjustDown(i);
-    }
-}
-
 void DocIteratorHeap::AdjustDown(SizeT idx) {
     assert(idx >= 1 && idx < iterator_heap_.size());
     SizeT min = idx;
@@ -51,7 +45,7 @@ void DocIteratorHeap::AdjustDown(SizeT idx) {
     } while (min != idx);
 }
 
-OrIterator::OrIterator(Vector<UniquePtr<DocIterator>> iterators) : MultiDocIterator(std::move(iterators)) {
+OrIterator::OrIterator(Vector<SharedPtr<DocIterator>> iterators) : MultiDocIterator(std::move(iterators)) {
     doc_freq_ = 0;
     bm25_score_upper_bound_ = 0.0f;
 }
@@ -59,7 +53,7 @@ OrIterator::OrIterator(Vector<UniquePtr<DocIterator>> iterators) : MultiDocItera
 bool OrIterator::Next(RowID doc_id) {
     assert(doc_id != INVALID_ROWID);
     if (doc_id_ == INVALID_ROWID) {
-        for (u32 i = 0; i < children_.size(); ++i) {
+        for (SizeT i = 0; i < children_.size(); ++i) {
             doc_freq_ += children_[i]->GetDF();
             children_[i]->Next();
             DocIteratorEntry entry = {children_[i]->DocID(), i};
@@ -74,8 +68,7 @@ bool OrIterator::Next(RowID doc_id) {
     while (doc_id > heap_.TopEntry().doc_id_) {
         DocIterator *top = GetDocIterator(heap_.TopEntry().entry_id_);
         top->Next(doc_id);
-        heap_.TopEntry().doc_id_ = top->DocID();
-        heap_.AdjustDown(1);
+        heap_.UpdateTopEntry(top->DocID());
     }
     doc_id_ = heap_.TopEntry().doc_id_;
     return doc_id_ != INVALID_ROWID;
@@ -86,7 +79,7 @@ float OrIterator::BM25Score() {
         return bm25_score_cache_;
     }
     float sum_score = 0;
-    for (u32 i = 0; i < children_.size(); ++i) {
+    for (SizeT i = 0; i < children_.size(); ++i) {
         if (children_[i]->DocID() == doc_id_)
             sum_score += children_[i]->BM25Score();
     }

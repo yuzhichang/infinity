@@ -25,7 +25,7 @@ namespace infinity {
 
 export class AndIterator : public MultiDocIterator {
 public:
-    AndIterator(Vector<UniquePtr<DocIterator>> iterators);
+    AndIterator(Vector<SharedPtr<DocIterator>> iterators);
 
     String Name() const override { return "AndIterator"; }
 

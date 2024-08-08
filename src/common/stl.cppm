@@ -314,6 +314,9 @@ export namespace std {
     // using std::literals;
     using std::put_time;
     using std::localtime;
+
+    using std::greater;
+    using std::less;
 } // namespace std
 
 namespace infinity {

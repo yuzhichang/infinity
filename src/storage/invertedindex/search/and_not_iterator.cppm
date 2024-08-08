@@ -25,7 +25,7 @@ import internal_types;
 namespace infinity {
 export class AndNotIterator : public MultiDocIterator {
 public:
-    AndNotIterator(Vector<UniquePtr<DocIterator>> iterators);
+    AndNotIterator(Vector<SharedPtr<DocIterator>> iterators);
 
     String Name() const override { return "AndNotIterator"; }
 

@@ -23,11 +23,13 @@ import internal_types;
 
 namespace infinity {
 
-// Refers to https://engineering.nyu.edu/~suel/papers/bmw.pdf
+/**
+Refers to https://engineering.nyu.edu/~suel/papers/bmw.pdf
+Faster Top-k Document Retrieval Using Block-Max Indexes, 2011.
+ */
 export class BlockMaxWandIterator final : public MultiDocIterator {
 public:
-    explicit BlockMaxWandIterator(Vector<UniquePtr<DocIterator>> &&iterators);
-
+    explicit BlockMaxWandIterator(Vector<SharedPtr<DocIterator>> &&iterators);
     ~BlockMaxWandIterator() override;
 
     String Name() const override { return "BlockMaxWandIterator"; }
@@ -40,9 +42,6 @@ public:
 
 private:
     // block max info
-    RowID common_block_min_possible_doc_id_{}; // not always exist
-    RowID common_block_last_doc_id_{};
-    float common_block_max_bm25_score_{};
     Vector<TermDocIterator *> sorted_iterators_; // sort by DocID(), in ascending order
     Vector<TermDocIterator *> backup_iterators_;
     SizeT pivot_;

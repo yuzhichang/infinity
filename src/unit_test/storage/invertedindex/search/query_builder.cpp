@@ -91,8 +91,8 @@ struct MockQueryNode : public TermQueryNode {
     }
 
     void PushDownWeight(float factor) final { MultiplyWeight(factor); }
-    std::unique_ptr<DocIterator> CreateSearch(const TableEntry *, IndexReader &, EarlyTermAlgo early_term_algo) const final {
-        return MakeUnique<MockVectorDocIterator>(std::move(doc_ids_), term_, column_);
+    SharedPtr<DocIterator> CreateSearch(const TableEntry *, IndexReader &, EarlyTermAlgo early_term_algo) const final {
+        return MakeShared<MockVectorDocIterator>(std::move(doc_ids_), term_, column_);
     }
     void PrintTree(std::ostream &os, const std::string &prefix, bool is_final) const final {
         os << prefix;
@@ -201,7 +201,7 @@ TEST_F(QueryBuilderTest, test_and) {
     context.query_tree_ = std::move(and_root);
     FakeQueryBuilder fake_query_builder;
     QueryBuilder &builder = fake_query_builder.builder;
-    UniquePtr<DocIterator> result_iter = builder.CreateSearch(context, EarlyTermAlgo::kNaive);
+    SharedPtr<DocIterator> result_iter = builder.CreateSearch(context, EarlyTermAlgo::kNaive);
 
     oss.str("");
     oss << "DocIterator tree after optimization:" << std::endl;
@@ -214,7 +214,7 @@ TEST_F(QueryBuilderTest, test_and) {
     ASSERT_NE(and_iter, nullptr);
     ASSERT_EQ(and_iter->GetChildren().size(), u32(5));
     // check result
-    UniquePtr<DocIterator> expect_iter_result = MakeUnique<MockVectorDocIterator>(std::move(expect_result), "", "");
+    SharedPtr<DocIterator> expect_iter_result = MakeShared<MockVectorDocIterator>(std::move(expect_result), "", "");
     for (RowID doc_id = 0; doc_id < DocIDMaxN + 1'000; ++doc_id) {
         bool ok1 = result_iter->Next(doc_id);
         bool ok2 = expect_iter_result->Next(doc_id);
@@ -271,7 +271,7 @@ TEST_F(QueryBuilderTest, test_or) {
     context.query_tree_ = std::move(or_root);
     FakeQueryBuilder fake_query_builder;
     QueryBuilder &builder = fake_query_builder.builder;
-    UniquePtr<DocIterator> result_iter = builder.CreateSearch(context, EarlyTermAlgo::kNaive);
+    SharedPtr<DocIterator> result_iter = builder.CreateSearch(context, EarlyTermAlgo::kNaive);
 
     oss.str("");
     oss << "DocIterator tree after optimization:" << std::endl;
@@ -284,7 +284,7 @@ TEST_F(QueryBuilderTest, test_or) {
     ASSERT_NE(or_iter, nullptr);
     ASSERT_EQ(or_iter->GetChildren().size(), u32(5));
     // check result
-    UniquePtr<DocIterator> expect_iter_result = MakeUnique<MockVectorDocIterator>(std::move(expect_result), "", "");
+    SharedPtr<DocIterator> expect_iter_result = MakeShared<MockVectorDocIterator>(std::move(expect_result), "", "");
     for (RowID doc_id = 0; doc_id < DocIDMaxN + 1'000; ++doc_id) {
         bool ok1 = result_iter->Next(doc_id);
         bool ok2 = expect_iter_result->Next(doc_id);
@@ -347,7 +347,7 @@ TEST_F(QueryBuilderTest, test_and_not) {
     context.query_tree_ = std::move(and_not_root);
     FakeQueryBuilder fake_query_builder;
     QueryBuilder &builder = fake_query_builder.builder;
-    UniquePtr<DocIterator> result_iter = builder.CreateSearch(context, EarlyTermAlgo::kNaive);
+    SharedPtr<DocIterator> result_iter = builder.CreateSearch(context, EarlyTermAlgo::kNaive);
 
     oss.str("");
     oss << "DocIterator tree after optimization:" << std::endl;
@@ -366,7 +366,7 @@ TEST_F(QueryBuilderTest, test_and_not) {
     ASSERT_NE(child_or_iter, nullptr);
     ASSERT_EQ(child_or_iter->GetChildren().size(), u32(3));
     // check result
-    UniquePtr<DocIterator> expect_iter_result = MakeUnique<MockVectorDocIterator>(std::move(expect_result), "", "");
+    SharedPtr<DocIterator> expect_iter_result = MakeShared<MockVectorDocIterator>(std::move(expect_result), "", "");
     for (RowID doc_id = 0; doc_id < DocIDMaxN + 1'000; ++doc_id) {
         bool ok1 = result_iter->Next(doc_id);
         bool ok2 = expect_iter_result->Next(doc_id);
@@ -429,7 +429,7 @@ TEST_F(QueryBuilderTest, test_and_not2) {
     context.query_tree_ = std::move(and_not_root);
     FakeQueryBuilder fake_query_builder;
     QueryBuilder &builder = fake_query_builder.builder;
-    UniquePtr<DocIterator> result_iter = builder.CreateSearch(context, EarlyTermAlgo::kNaive);
+    SharedPtr<DocIterator> result_iter = builder.CreateSearch(context, EarlyTermAlgo::kNaive);
 
     oss.str("");
     oss << "DocIterator tree after optimization:" << std::endl;
@@ -448,7 +448,7 @@ TEST_F(QueryBuilderTest, test_and_not2) {
     ASSERT_NE(child_and_iter, nullptr);
     ASSERT_EQ(child_and_iter->GetChildren().size(), u32(3));
     // check result
-    UniquePtr<DocIterator> expect_iter_result = MakeUnique<MockVectorDocIterator>(std::move(expect_result), "", "");
+    SharedPtr<DocIterator> expect_iter_result = MakeShared<MockVectorDocIterator>(std::move(expect_result), "", "");
     for (RowID doc_id = 0; doc_id < DocIDMaxN + 1'000; ++doc_id) {
         bool ok1 = result_iter->Next(doc_id);
         bool ok2 = expect_iter_result->Next(doc_id);

@@ -23,7 +23,7 @@ import internal_types;
 
 namespace infinity {
 
-export enum class EarlyTermAlgo { kNaive, kBMM, kBMW, kCompare };
+export enum class EarlyTermAlgo { kNaive, kMaxscore, kBMM, kBMW, kCompare };
 
 export enum class DocIteratorType : u8 {
     kDocIterator,

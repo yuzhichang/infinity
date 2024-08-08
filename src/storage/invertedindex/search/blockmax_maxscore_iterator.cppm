@@ -16,17 +16,43 @@ module;
 
 export module blockmax_maxscore_iterator;
 import stl;
+import doc_iterator;
 import term_doc_iterator;
 import multi_doc_iterator;
+import or_iterator;
 import internal_types;
 import index_defines;
 
 namespace infinity {
 
-// equivalent to "OR" iterator
+/**
+Refers to https://engineering.nyu.edu/~suel/papers/bmm.pdf
+Optimizing Top-k Document Retrieval Strategies for Block-Max Indexes, 2013.
+
+We also implemented a Maxscore-based method
+(BMM), but with some changes over the implementation
+described in [7]. In particular, we removed the preprocess-
+ing for aligning block boundaries and the selection of non-
+essential lists in each interval as described in [7], as we found
+this to be a performance bottleneck.
+
+Finally, initial experiments found that some methods are
+better for queries with few terms, and some for queries with
+many terms. Since all algorithms use exactly the same data
+structures, it is easy to call the best method for any number
+of query terms; this combined method is called BM-OPT.
+
+In fact, it seems that BMW spends a fair amount
+of effort trying to avoid evaluations and calls, while BMM
+does not spend as much time thinking about avoiding them
+and instead keeps the control structure simple.
+
+The blog on ElasticSearch bmm:
+https://www.elastic.co/search-labs/blog/more-skipping-with-bm-maxscore
+ */
 export class BlockMaxMaxscoreIterator final : public MultiDocIterator {
 public:
-    explicit BlockMaxMaxscoreIterator(Vector<UniquePtr<DocIterator>> &&iterators);
+    explicit BlockMaxMaxscoreIterator(Vector<SharedPtr<DocIterator>> &&iterators);
 
     ~BlockMaxMaxscoreIterator() override;
 
@@ -40,40 +66,47 @@ public:
 
 private:
     void Init();
+
+    void EssentialPqInit();
+
+    void EssentialPqNext(RowID doc_id);
+
+    TermDocIterator *GetDocIterator(u32 i) { return sorted_iterators_[i]; }
+
+    bool NextPhase1();
+    bool NextPhase2();
+
     // won't change after initialization
-    Vector<TermDocIterator *> sorted_iterators_;                 // sort by BM25ScoreUpperBound, in descending order
-    Vector<float> leftover_scores_upper_bound_;                  // value at i: upper bound of sum of BM25 scores for iter i + 1, i + 2, ..., n - 1
-    // block max info
-    RowID common_block_min_possible_doc_id_ = INVALID_ROWID;
-    RowID common_block_last_doc_id_ = INVALID_ROWID;
-    float common_block_max_bm25_score_ = 0.0f;
-    Vector<float> common_block_max_bm25_score_parts_; // value at i: blockmax of sum of BM25 scores for iter i + 1, i + 2, ..., n - 1
-    // pivot and must_have info
-    // separate the iterators into two parts:
-    // 1. [0, pivot) : cannot add into part 2
-    // 2. [pivot, n) : sum < threshold
-    u32 pivot_ = sorted_iterators_.size();
-    // there is an "AND" requirement for the iterators 0, 1, ..., must_have_before_ - 1
-    // we have must_have_before_ > 0 <=> pivot_ <= 1.
-    // so: case 1: must_have_before_ = 0, pivot_ > 1.
-    //     case 2: must_have_before_ > 0, pivot_ = 1.
-    u32 must_have_before_ = 0;
-    float must_have_total_upper_bound_score_ = 0.0f;
-    Vector<int> bool_need_score_;
+    Vector<TermDocIterator *> sorted_iterators_; // sort by BM25ScoreUpperBound, in ascending order
+    SizeT num_iterators_ = 0;
+    Vector<float> sum_scores_upper_bound_;       // value at i: sum of BM25ScoreUpperBound for iter [0, i]
+
+    UniquePtr<DocIteratorHeap> essentialPq_ = nullptr; // OR among iterators [firstEssential_, firstRequired_)
+
+    // Index of the first essential iterator, ie. essentialHeap_ contains all iterators from
+    // sorted_iterators_[firstEssential:]. All iterators below this index are non-essential.
+    SizeT firstEssential_ = 0;
+    // Index of the first iterator that is required, this iterator and all following iterators are required
+    // for a document to match.
+    SizeT firstRequired_ = sorted_iterators_.size();
+
+    float non_essential_sum_score_ = 0.0f;
+    float essential_sum_score_ = 0.0f;
+    RowID target_doc_id_ = INVALID_ROWID;
+
     // bm25 score cache
-    bool bm25_score_cached_ = false;
-    bool need_seek_after_must_ = false;
-    bool need_seek_after_pivot_ = false;
+    RowID bm25_score_cache_docid_ = INVALID_ROWID;
     float bm25_score_cache_ = 0.0f;
-    RowID prev_next_candidate_ = INVALID_ROWID;
+
+    RowID threshold_doc_id_ = INVALID_ROWID;
 
     // debug info
-    u32 inner_pivot_loop_cnt = 0;
-    u32 inner_must_have_loop_cnt_ = 0;
-    u32 use_prev_candidate_cnt_ = 0;
-    u32 not_use_prev_candidate_cnt_ = 0;
-    Vector<Pair<u32, u64>> pivot_history_;
-    Vector<Pair<u32, u64>> must_have_history_;
+    Vector<Tuple<u64, float, u32, u32>> pivot_history_; // row_id, threshold, firstEssential, firstRequired
+    u64 loop_cnt_phase1_ = 0;
+    u64 loop_cnt_phase2_ = 0;
+    u64 loop_cnt_init_boundaries_ = 0;
+    u64 loop_cnt_nlb_ = 0;
+    u64 loop_cnt_quit_ = 0;
 };
 
 } // namespace infinity

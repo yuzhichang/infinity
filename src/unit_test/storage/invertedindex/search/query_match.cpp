@@ -341,7 +341,7 @@ void QueryMatchTest::QueryMatch(const String &db_name,
     }
     FullTextQueryContext full_text_query_context;
     full_text_query_context.query_tree_ = std::move(query_tree);
-    UniquePtr<DocIterator> doc_iterator = query_builder.CreateSearch(full_text_query_context, EarlyTermAlgo::kNaive);
+    SharedPtr<DocIterator> doc_iterator = query_builder.CreateSearch(full_text_query_context, EarlyTermAlgo::kNaive);
 
     RowID iter_row_id = doc_iterator.get() == nullptr ? INVALID_ROWID : (doc_iterator->Next(), doc_iterator->DocID());
     if (iter_row_id == INVALID_ROWID) {

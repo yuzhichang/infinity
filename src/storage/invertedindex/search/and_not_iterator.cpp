@@ -24,7 +24,7 @@ import internal_types;
 
 namespace infinity {
 
-AndNotIterator::AndNotIterator(Vector<UniquePtr<DocIterator>> iterators) : MultiDocIterator(std::move(iterators)) {
+AndNotIterator::AndNotIterator(Vector<SharedPtr<DocIterator>> iterators) : MultiDocIterator(std::move(iterators)) {
     std::sort(children_.begin() + 1, children_.end(), [](const auto &lhs, const auto &rhs) { return lhs->GetDF() < rhs->GetDF(); });
     // initialize doc_id_ to first doc
     Next(0);

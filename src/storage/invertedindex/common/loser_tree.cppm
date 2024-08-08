@@ -30,6 +30,7 @@ protected:
         bool sup;
         Source source;
         ValueType key;
+        bool operator==(const Loser &rhs) const { return (sup == rhs.sup && source == rhs.source && key == rhs.key); }
     };
 
     // The number of nodes in the tree.
@@ -41,16 +42,13 @@ protected:
 
     Comparator cmp_;
 
-    bool first_insert_;
 public:
-    explicit LoserTreeBase(const Source& k,
-                           const Comparator& cmp = Comparator())
-         : ik_(k), k_(round_up_to_power_of_two(k)),
-          losers_(2 * k_), cmp_(cmp), first_insert_(true) {
-
-        for (Source i = ik_ - 1; i < k_; i++) {
-            losers_[i + k_].sup = true;
-            losers_[i + k_].source = invalid_;
+    explicit LoserTreeBase(const Source &k, const Comparator &cmp = Comparator())
+        : ik_(k), k_(round_up_to_power_of_two(k)), losers_(2 * k_), cmp_(cmp) {
+        for (Source i = 0; i < 2 * k_; i++) {
+            losers_[i].sup = true;
+            losers_[i].source = invalid_;
+            losers_[i].key = ValueType();
         }
     }
 
@@ -63,39 +61,11 @@ public:
     }
 
     void InsertStart(const ValueType* keyp, const Source& source, bool sup) {
+        assert(source < k_);
         Source pos = k_ + source;
         losers_[pos].source = source;
         losers_[pos].sup = sup;
-
-        if (first_insert_) {
-            for (Source i = 0; i < 2 * k_; ++i) {
-                if (keyp) {
-                    losers_[i].key = *keyp;
-                } else {
-                    losers_[i].key = ValueType();
-                }
-            }
-            first_insert_ = false;
-        } else {
-            losers_[pos].key = (keyp ? *keyp : ValueType());
-        }
-    }
-
-    // Recursively compute the winner of the competition at player root.
-    Source InitWinner(const Source& root) {
-        if (root >= k_) {
-            return root;
-        }
-        Source left = InitWinner(2 * root);
-        Source right = InitWinner(2 * root + 1);
-        if (losers_[right].sup ||
-            (!losers_[left].sup && !cmp_(losers_[right].key, losers_[left].key))) {
-            losers_[root] = losers_[right];
-            return left;
-        } else {
-            losers_[root] = losers_[left];
-            return right;
-        }
+        losers_[pos].key = (keyp ? *keyp : ValueType());
     }
 
     void Init() {
@@ -103,6 +73,55 @@ public:
             return;
         }
         losers_[0] = losers_[InitWinner(1)];
+#ifdef INFINITY_DEBUG
+        Validate();
+#endif
+    }
+
+#ifdef INFINITY_DEBUG
+    void Validate() {
+        std::vector<bool> present(k_);
+        auto Cmp = [&](const Loser &lhs, const Loser &rhs) -> bool { return (rhs.sup || !cmp_(rhs.key, lhs.key)); };
+        for (Source i = 0; i < k_; i++) {
+            Source pos = losers_[i].source;
+            if (pos != invalid_) {
+                assert(pos < k_);
+                assert(losers_[i] == losers_[k_ + pos]);
+                present[pos] = true;
+            }
+        }
+        for (Source i = k_; i < k_ + ik_; i++) {
+            Source pos = losers_[i].source;
+            assert(pos == i - k_);
+            assert(losers_[i].sup || present[pos]);
+        }
+        for (Source i = k_ + ik_; i < 2 * k_; i++) {
+            assert(!present[i - k_]);
+            assert(losers_[i].sup);
+            assert(losers_[i].source = invalid_);
+            assert(losers_[i].key == ValueType());
+        }
+        for (Source i = 1; i < k_; i++) {
+            assert(Cmp(losers_[0], losers_[i]));
+        }
+    }
+#endif
+
+private:
+    // Recursively compute the winner of the competition at player root.
+    Source InitWinner(const Source& root) {
+        if (root >= k_) {
+            return root;
+        }
+        Source left = InitWinner(2 * root);
+        Source right = InitWinner(2 * root + 1);
+        if (losers_[right].sup || (!losers_[left].sup && !cmp_(losers_[right].key, losers_[left].key))) {
+            losers_[root] = losers_[right];
+            return left;
+        } else {
+            losers_[root] = losers_[left];
+            return right;
+        }
     }
 };
 
@@ -111,6 +130,8 @@ class LoserTree : public LoserTreeBase<ValueType, Comparator> {
 public:
     using Super = LoserTreeBase<ValueType, Comparator>;
     using Source = typename Super::Source;
+    using Loser = typename Super::Loser;
+    using Visitor = std::function<void(Source, ValueType)>;
 
 public:
     explicit LoserTree(const Source& k,
@@ -122,6 +143,9 @@ public:
         assert(sup == (keyp == nullptr));
         Source source = Super::losers_[0].source;
         ValueType key = (keyp ? *keyp : ValueType());
+        Loser &loser = Super::losers_[Super::k_ + source];
+        loser.sup = sup;
+        loser.key = key;
 
         for (Source pos = (Super::k_ + source) / 2; pos > 0; pos /= 2) {
             if (sup) {

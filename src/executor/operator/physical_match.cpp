@@ -71,7 +71,7 @@ namespace infinity {
 
 class FilterIterator final : public DocIterator {
 public:
-    explicit FilterIterator(CommonQueryFilter *common_query_filter, UniquePtr<DocIterator> &&query_iterator)
+    explicit FilterIterator(CommonQueryFilter *common_query_filter, SharedPtr<DocIterator> &&query_iterator)
         : common_query_filter_(common_query_filter), query_iterator_(std::move(query_iterator)) {}
 
     DocIteratorType GetType() const override { return DocIteratorType::kFilterIterator; }
@@ -117,7 +117,7 @@ public:
 
 private:
     CommonQueryFilter *common_query_filter_;
-    UniquePtr<DocIterator> query_iterator_;
+    SharedPtr<DocIterator> query_iterator_;
 };
 
 // use QueryNodeType::FILTER
@@ -140,8 +140,7 @@ struct FilterQueryNode final : public QueryNode {
 
     void PushDownWeight(float factor) override { MultiplyWeight(factor); }
 
-    std::unique_ptr<DocIterator>
-    CreateSearch(const TableEntry *table_entry, IndexReader &index_reader, EarlyTermAlgo early_term_algo) const override {
+    SharedPtr<DocIterator> CreateSearch(const TableEntry *table_entry, IndexReader &index_reader, EarlyTermAlgo early_term_algo) const override {
         assert(common_query_filter_ != nullptr);
         if (!common_query_filter_->AlwaysTrue() && common_query_filter_->filter_result_count_ == 0)
             return nullptr;
@@ -151,7 +150,7 @@ struct FilterQueryNode final : public QueryNode {
         }
         if (common_query_filter_->AlwaysTrue())
             return search_iter;
-        return MakeUnique<FilterIterator>(common_query_filter_, std::move(search_iter));
+        return MakeShared<FilterIterator>(common_query_filter_, std::move(search_iter));
     }
 
     void PrintTree(std::ostream &os, const std::string &prefix, bool is_final) const override {
@@ -178,7 +177,7 @@ void ASSERT_FLOAT_EQ(float bar, u32 i, float a, float b) {
     }
 }
 
-void ExecuteFTSearch(UniquePtr<DocIterator> &et_iter, FullTextScoreResultHeap &result_heap, u32 &blockmax_loop_cnt) {
+void ExecuteFTSearch(SharedPtr<DocIterator> &et_iter, FullTextScoreResultHeap &result_heap, u32 &blockmax_loop_cnt) {
     // et_iter is nullptr if fulltext index is present but there's no data
     if (et_iter == nullptr) {
         LOG_DEBUG(fmt::format("et_iter is nullptr"));
@@ -203,9 +202,9 @@ void ExecuteFTSearch(UniquePtr<DocIterator> &et_iter, FullTextScoreResultHeap &r
             // update threshold
             et_iter->UpdateScoreThreshold(result_heap.GetScoreThreshold());
         }
-        if (blockmax_loop_cnt % 10 == 0) {
-            LOG_DEBUG(fmt::format("ExecuteFTSearch has evaluated {} candidates", blockmax_loop_cnt));
-        }
+        // if (blockmax_loop_cnt % 10 == 0) {
+        //     LOG_DEBUG(fmt::format("ExecuteFTSearch has evaluated {} candidates", blockmax_loop_cnt));
+        // }
     }
 }
 
@@ -229,10 +228,6 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     bool use_block_max_iter = false;
 
     switch (early_term_algo_) {
-        case EarlyTermAlgo::kBMM: {
-            use_block_max_iter = true;
-            break;
-        }
         case EarlyTermAlgo::kNaive: {
             use_ordinary_iter = true;
             break;
@@ -242,6 +237,8 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
             use_block_max_iter = true;
             break;
         }
+        case EarlyTermAlgo::kMaxscore:
+        case EarlyTermAlgo::kBMM:
         case EarlyTermAlgo::kBMW:
         default: {
             use_block_max_iter = true;
@@ -260,8 +257,8 @@ bool PhysicalMatch::ExecuteInnerHomebrewed(QueryContext *query_context, Operator
     const float *score_result = nullptr;
     const RowID *row_id_result = nullptr;
     // for comparison
-    UniquePtr<DocIterator> et_iter;
-    UniquePtr<DocIterator> doc_iterator;
+    SharedPtr<DocIterator> et_iter;
+    SharedPtr<DocIterator> doc_iterator;
     u32 ordinary_loop_cnt = 0;
     u32 blockmax_loop_cnt = 0;
     u32 ordinary_result_count = 0;

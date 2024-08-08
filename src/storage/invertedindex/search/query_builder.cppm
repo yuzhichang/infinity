@@ -44,7 +44,7 @@ public:
 
     const Map<String, String> &GetColumn2Analyzer() { return index_reader_.GetColumn2Analyzer(); }
 
-    UniquePtr<DocIterator> CreateSearch(FullTextQueryContext &context, EarlyTermAlgo early_term_algo);
+    SharedPtr<DocIterator> CreateSearch(FullTextQueryContext &context, EarlyTermAlgo early_term_algo);
 
 private:
     BaseTableRef* base_table_ref_{nullptr};

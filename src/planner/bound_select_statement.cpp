@@ -203,6 +203,8 @@ SharedPtr<LogicalNode> BoundSelectStatement::BuildPlan(QueryContext *query_conte
                         match_node->early_term_algo_ = EarlyTermAlgo::kBMW;
                     } else if (iter->second == "bmm") {
                         match_node->early_term_algo_ = EarlyTermAlgo::kBMM;
+                    } else if (iter->second == "maxscore") {
+                        match_node->early_term_algo_ = EarlyTermAlgo::kMaxscore;
                     } else if (iter->second == "false") {
                         match_node->early_term_algo_ = EarlyTermAlgo::kNaive;
                     } else if (iter->second == "compare") {

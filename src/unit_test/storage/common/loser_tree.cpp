@@ -16,9 +16,7 @@ public:
         numbers.clear();
         loser.clear();
     }
-    u64 GetRandom(u64 max_val) {
-        return static_cast<u64>(random() % max_val) * random() % max_val;
-    }
+    u64 GetRandom(u64 max_val) { return static_cast<u64>(random() % max_val) * random() % max_val; }
 
     void GenerateData(SizeT num_size, SizeT loser_num, u64 max_val);
 
@@ -29,6 +27,28 @@ protected:
     Vector<u64> num_idx;
     Vector<Vector<u64>> loser;
 };
+
+TEST_F(LoserTreeTest, BasicMerge0) {
+    for (SizeT loser_num = 1; loser_num < 999; loser_num++) {
+        // loser i provides the following sequence of values: loser_num+i, 2*loser_num+i, 3*loser_num+i, 4*loser_num+i, ...
+        auto loser_tree = MakeUnique<LoserTree<u64, std::less<u64>>>(loser_num);
+        for (SizeT i = 0; i < loser_num; ++i) {
+            u64 val = i;
+            loser_tree->InsertStart(&val, static_cast<LoserTree<u64>::Source>(i), false);
+        }
+        loser_tree->Init();
+
+        // Validate the merged sequence
+        for (SizeT j = 0; j < 10 * loser_num; ++j) {
+            auto min_value = loser_tree->TopKey();
+            auto min_source = loser_tree->TopSource();
+            EXPECT_EQ(min_value, j);
+            EXPECT_EQ(min_source, j % loser_num);
+            min_value += loser_num;
+            loser_tree->DeleteTopInsert(&min_value, false);
+        }
+    }
+}
 
 void LoserTreeTest::GenerateData(infinity::SizeT num_size, infinity::SizeT loser_num, infinity::u64 max_val) {
     numbers.clear();
@@ -41,8 +61,10 @@ void LoserTreeTest::GenerateData(infinity::SizeT num_size, infinity::SizeT loser
     for (SizeT i = 0; i < num_size; ++i) {
         auto val = GetRandom(max_val);
         numbers.emplace_back(val);
-        loser[GetRandom(loser_num)].emplace_back(val);
+        u64 loser_idx = GetRandom(loser_num);
+        loser[loser_idx].emplace_back(val);
     }
+    sort(numbers.begin(), numbers.end());
     for (SizeT i = 0; i < loser_num; ++i) {
         std::sort(loser[i].begin(), loser[i].end());
     }
@@ -65,16 +87,18 @@ void LoserTreeTest::MultiWayMerge(infinity::SizeT num_size, infinity::SizeT lose
         auto min_value = loser_tree->TopKey();
         auto min_source = loser_tree->TopSource();
         merge_res.push_back(min_value);
-        auto& min_seq = num_idx[min_source];
+        auto &min_seq = num_idx[min_source];
 
         if (min_seq < loser[min_source].size()) {
             loser_tree->DeleteTopInsert(&(loser[min_source][min_seq]), false);
         } else {
             loser_tree->DeleteTopInsert(nullptr, true);
         }
+#ifdef INFINITY_DEBUG
+        loser_tree->Validate();
+#endif
         min_seq++;
     }
-    sort(numbers.begin(), numbers.end());
     EXPECT_EQ(numbers.size(), merge_res.size());
     for (SizeT i = 0; i < merge_res.size(); ++i) {
         EXPECT_EQ(merge_res[i], numbers[i]);
