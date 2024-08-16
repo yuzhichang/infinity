@@ -38,16 +38,16 @@ public:
 
     ~TermDocIterator() override;
 
-    float GetWeight() const { return weight_; }
+    inline float GetWeight() const { return weight_; }
 
-    void MultiplyWeight(float factor) { weight_ *= factor; }
+    inline void MultiplyWeight(float factor) { weight_ *= factor; }
 
-    u64 GetTermFreq() const { return term_freq_; }
+    inline u64 GetTermFreq() const { return term_freq_; }
 
     void InitBM25Info(UniquePtr<FullTextColumnLengthReader> &&column_length_reader);
 
-    RowID BlockMinPossibleDocID() const { return iter_->BlockLowestPossibleDocID(); }
-    RowID BlockLastDocID() const { return iter_->BlockLastDocID(); }
+    inline RowID BlockMinPossibleDocID() const { return iter_->BlockLowestPossibleDocID(); }
+    inline RowID BlockLastDocID() const { return iter_->BlockLastDocID(); }
     float BlockMaxBM25Score();
 
     // Move block cursor to ensure its last_doc_id is no less than given doc_id.

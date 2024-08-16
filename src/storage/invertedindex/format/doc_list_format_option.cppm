@@ -48,16 +48,16 @@ public:
         }
     }
 
-    bool HasTF() const { return has_tf_ == 1; }
-    bool HasTfList() const { return has_tf_list_ == 1; }
-    bool HasDocPayload() const { return has_doc_payload_ == 1; }
-    bool HasBlockMax() const { return has_block_max_ == 1; }
-    bool operator==(const DocListFormatOption &right) const {
+    inline bool HasTF() const { return has_tf_ == 1; }
+    inline bool HasTfList() const { return has_tf_list_ == 1; }
+    inline bool HasDocPayload() const { return has_doc_payload_ == 1; }
+    inline bool HasBlockMax() const { return has_block_max_ == 1; }
+    inline bool operator==(const DocListFormatOption &right) const {
         return has_tf_ == right.has_tf_ && has_tf_list_ == right.has_tf_list_ && has_doc_payload_ == right.has_doc_payload_ &&
                short_list_vbyte_compress_ == right.short_list_vbyte_compress_ && has_block_max_ == right.has_block_max_;
     }
-    bool IsShortListVbyteCompress() const { return short_list_vbyte_compress_ == 1; }
-    void SetShortListVbyteCompress(bool flag) { short_list_vbyte_compress_ = flag ? 1 : 0; }
+    inline bool IsShortListVbyteCompress() const { return short_list_vbyte_compress_ == 1; }
+    inline void SetShortListVbyteCompress(bool flag) { short_list_vbyte_compress_ = flag ? 1 : 0; }
 
 private:
     u8 has_tf_ : 1;

@@ -43,7 +43,7 @@ public:
 
     virtual ~DocIterator();
 
-    RowID DocID() { return doc_id_; }
+    inline RowID DocID() { return doc_id_; }
 
     inline u32 GetDF() const { return doc_freq_; }
 

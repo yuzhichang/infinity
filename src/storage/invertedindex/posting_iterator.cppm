@@ -27,15 +27,15 @@ public:
 
     void Reset();
 
-    u32 GetDocFreq() const { return doc_freq_; }
+    inline u32 GetDocFreq() const { return doc_freq_; }
 
     bool SkipTo(RowID doc_id);
 
-    RowID PrevBlockLastDocID() const { return last_doc_id_in_prev_block_; }
+    inline RowID PrevBlockLastDocID() const { return last_doc_id_in_prev_block_; }
 
-    RowID BlockLowestPossibleDocID() const { return lowest_possible_doc_id_in_current_block_; }
+    inline RowID BlockLowestPossibleDocID() const { return lowest_possible_doc_id_in_current_block_; }
 
-    RowID BlockLastDocID() const { return last_doc_id_in_current_block_; }
+    inline RowID BlockLastDocID() const { return last_doc_id_in_current_block_; }
 
     // u32: block max tf
     // u16: block max (ceil(tf / doc length) * numeric_limits<u16>::max())
@@ -49,51 +49,43 @@ public:
 
     void SeekPosition(pos_t pos, pos_t &result);
 
-    docpayload_t GetCurrentDocPayload() {
-        if (current_row_id_ == INVALID_ROWID) [[unlikely]] {
+    inline docpayload_t GetCurrentDocPayload() {
+        if (current_row_id_ == INVALID_ROWID || !posting_option_.HasDocPayload()) [[unlikely]] {
             return 0;
         }
-        if (posting_option_.HasDocPayload()) {
-            DecodeTFBuffer();
-            DecodeDocPayloadBuffer();
-            return doc_payload_buffer_[GetDocOffsetInBuffer()];
-        }
-        return 0;
+        DecodeTFBuffer();
+        DecodeDocPayloadBuffer();
+        return doc_payload_buffer_[GetDocOffsetInBuffer()];
     }
 
-    tf_t GetCurrentTF() {
-        if (current_row_id_ == INVALID_ROWID) [[unlikely]] {
+    inline tf_t GetCurrentTF() {
+        if (current_row_id_ == INVALID_ROWID || !posting_option_.HasTfList()) [[unlikely]] {
             return 0;
         }
-        if (posting_option_.HasTfList()) {
-            DecodeTFBuffer();
-            return tf_buffer_[GetDocOffsetInBuffer()];
-        }
-        return 0;
+        DecodeTFBuffer();
+        return tf_buffer_[GetDocOffsetInBuffer()];
     }
 
-    ttf_t GetCurrentTTF() {
-        if (current_row_id_ == INVALID_ROWID) [[unlikely]] {
+    inline ttf_t GetCurrentTTF() {
+        if (current_row_id_ == INVALID_ROWID || !posting_option_.HasTfList()) [[unlikely]] {
             return 0;
         }
-        if (posting_option_.HasTfList()) {
-            DecodeTFBuffer();
-            i32 offset = GetDocOffsetInBuffer();
-            for (; tf_buffer_cursor_ < offset; ++tf_buffer_cursor_) {
-                current_ttf_ += tf_buffer_[tf_buffer_cursor_];
-            }
+        DecodeTFBuffer();
+        i32 offset = GetDocOffsetInBuffer();
+        for (; tf_buffer_cursor_ < offset; ++tf_buffer_cursor_) {
+            current_ttf_ += tf_buffer_[tf_buffer_cursor_];
         }
         return current_ttf_;
     }
 
-    bool HasPosition() const { return posting_option_.HasPositionList(); }
+    inline bool HasPosition() const { return posting_option_.HasPositionList(); }
 
 private:
-    u32 GetCurrentSeekedDocCount() const { return posting_decoder_->InnerGetSeekedDocCount() + (GetDocOffsetInBuffer() + 1); }
+    inline u32 GetCurrentSeekedDocCount() const { return posting_decoder_->InnerGetSeekedDocCount() + (GetDocOffsetInBuffer() + 1); }
 
-    i32 GetDocOffsetInBuffer() const { return doc_buffer_cursor_ - doc_buffer_base_ - 1; }
+    inline i32 GetDocOffsetInBuffer() const { return doc_buffer_cursor_ - doc_buffer_base_ - 1; }
 
-    void DecodeTFBuffer() {
+    inline void DecodeTFBuffer() {
         if (finish_decode_tf_)
             return;
         assert(posting_option_.HasTfList());
@@ -103,7 +95,7 @@ private:
         }
     }
 
-    void DecodeDocPayloadBuffer() {
+    inline void DecodeDocPayloadBuffer() {
         if (posting_option_.HasDocPayload()) {
             posting_decoder_->DecodeCurrentDocPayloadBuffer(doc_payload_buffer_);
         }

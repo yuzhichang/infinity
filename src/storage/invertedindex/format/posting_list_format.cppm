@@ -15,27 +15,27 @@ public:
     inline PostingFormatOption(optionflag_t flag = OPTION_FLAG_ALL)
         : has_term_payload_(flag & of_term_payload), doc_list_format_option_(flag), pos_list_format_option_(flag) {}
 
-    bool HasTfList() const { return doc_list_format_option_.HasTfList(); }
+    inline bool HasTfList() const { return doc_list_format_option_.HasTfList(); }
 
-    bool HasDocPayload() const { return doc_list_format_option_.HasDocPayload(); }
+    inline bool HasDocPayload() const { return doc_list_format_option_.HasDocPayload(); }
 
-    bool HasPositionList() const { return pos_list_format_option_.HasPositionList(); }
+    inline bool HasPositionList() const { return pos_list_format_option_.HasPositionList(); }
 
-    bool HasTermFrequency() const { return doc_list_format_option_.HasTF(); }
+    inline bool HasTermFrequency() const { return doc_list_format_option_.HasTF(); }
 
-    bool HasTermPayload() const { return has_term_payload_; }
+    inline bool HasTermPayload() const { return has_term_payload_; }
 
-    bool IsShortListVbyteCompress() const { return doc_list_format_option_.IsShortListVbyteCompress(); }
+    inline bool IsShortListVbyteCompress() const { return doc_list_format_option_.IsShortListVbyteCompress(); }
 
-    void SetShortListVbyteCompress(bool flag) { doc_list_format_option_.SetShortListVbyteCompress(flag); }
+    inline void SetShortListVbyteCompress(bool flag) { doc_list_format_option_.SetShortListVbyteCompress(flag); }
 
-    const DocListFormatOption &GetDocListFormatOption() const { return doc_list_format_option_; }
+    inline const DocListFormatOption &GetDocListFormatOption() const { return doc_list_format_option_; }
 
-    const PositionListFormatOption &GetPosListFormatOption() const { return pos_list_format_option_; }
+    inline const PositionListFormatOption &GetPosListFormatOption() const { return pos_list_format_option_; }
 
     bool operator==(const PostingFormatOption &right) const;
 
-    bool IsOnlyTermPayLoad() const { return HasTermPayload() && !HasPositionList(); }
+    inline bool IsOnlyTermPayLoad() const { return HasTermPayload() && !HasPositionList(); }
 
 private:
     bool has_term_payload_;
