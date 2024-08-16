@@ -39,9 +39,9 @@ BlockMaxMaxscoreIterator::~BlockMaxMaxscoreIterator() {
             u32 firstRequired = std::get<3>(p);
             msg += fmt::format(" ({}, {:6f}, {}, {})", row_id, threshold, firstEssential, firstRequired);
         }
-        msg += fmt::format("\nloop_cnt_phase1_ {}, loop_cnt_init_boundaries_ {}, loop_cnt_nlb_ {}, loop_cnt_phase2_ {}, loop_cnt_quit_ {}",
+        msg += fmt::format("\nloop_cnt_phase1_ {}, loop_cnt_skip_boundaries_ {}, loop_cnt_nlb_ {}, loop_cnt_phase2_ {}, loop_cnt_quit_ {}",
                            loop_cnt_phase1_,
-                           loop_cnt_init_boundaries_,
+                           loop_cnt_skip_boundaries_,
                            loop_cnt_nlb_,
                            loop_cnt_phase2_,
                            loop_cnt_quit_);
@@ -98,6 +98,32 @@ void BlockMaxMaxscoreIterator::EssentialPqNext(RowID doc_id) {
     }
 }
 
+void BlockMaxMaxscoreIterator::BlockBoundariesInit() {
+    if (firstRequired_ > 0) {
+        block_boundaries_ = MakeUnique<DocIteratorHeap>();
+        for (u32 i = 0; i < firstRequired_; ++i) {
+            DocIteratorEntry entry = {sorted_iterators_[i]->BlockLastDocID(), i};
+            block_boundaries_->AddEntry(entry);
+        }
+        block_boundaries_->BuildHeap();
+        block_last_doc_id_ = block_boundaries_->TopEntry().doc_id_;
+    } else {
+        block_boundaries_.reset();
+        block_last_doc_id_ = INVALID_ROWID;
+    }
+}
+
+void BlockMaxMaxscoreIterator::BlockBoundariesNext(RowID doc_id) {
+    assert(block_boundaries_.get() != nullptr);
+    while (block_boundaries_->TopEntry().doc_id_ < doc_id) {
+        TermDocIterator *top = GetDocIterator(block_boundaries_->TopEntry().entry_id_);
+        bool ok = top->NextShallow(doc_id);
+        RowID child_doc_id = ok ? top->BlockLastDocID() : INVALID_ROWID;
+        block_boundaries_->UpdateTopEntry(child_doc_id);
+    }
+    block_last_doc_id_ = block_boundaries_->TopEntry().doc_id_;
+}
+
 bool BlockMaxMaxscoreIterator::Next(RowID doc_id) {
     assert(doc_id != INVALID_ROWID);
     if (doc_id_ == INVALID_ROWID && num_iterators_ > 0) {
@@ -107,6 +133,7 @@ bool BlockMaxMaxscoreIterator::Next(RowID doc_id) {
             auto &it = sorted_iterators_[i];
             it->Next(doc_id);
         }
+        BlockBoundariesInit();
         EssentialPqInit();
     }
     if (doc_id_ != INVALID_ROWID && doc_id_ >= doc_id)
@@ -160,10 +187,12 @@ bool BlockMaxMaxscoreIterator::Next(RowID doc_id) {
         assert(firstEssential_ < num_iterators_ && essentialPq_.get() != nullptr);
         target_doc_id_ = doc_id;
         do {
-            bool ok = NextPhase1();
-            if (!ok)
-                return false;
-            ok = NextPhase2();
+            if (target_doc_id_ == 0 || target_doc_id_ > block_last_doc_id_) {
+                bool ok = NextPhase1();
+                if (!ok)
+                    return false;
+            }
+            bool ok = NextPhase2();
             if (ok)
                 return true;
             target_doc_id_++;
@@ -175,69 +204,45 @@ bool BlockMaxMaxscoreIterator::Next(RowID doc_id) {
 
 bool BlockMaxMaxscoreIterator::NextPhase1() {
     loop_cnt_phase1_++;
-    non_essential_sum_score_ = 0.0f;
-    essential_sum_score_ = 0.0f;
+    non_essential_sum_bm_score_ = 0.0f;
+    essential_sum_bm_score_ = 0.0f;
+    float sum_score = 0.0f;
     // we first check if the (precomputed) sum of the list maxscores of the non-essential lists plus the sum of the block maxscores of the
     // essential lists is above the threshold.
-    if (firstEssential_ > 0)
-        non_essential_sum_score_ = sum_scores_upper_bound_[firstEssential_ - 1];
+    BlockBoundariesNext(target_doc_id_);
     for (SizeT i = firstEssential_; i < num_iterators_; i++) {
-        const auto &it = sorted_iterators_[i];
-        bool ok = it->NextShallow(target_doc_id_);
-        if (ok) {
-            essential_sum_score_ += it->BlockMaxBM25Score();
-        }
+        essential_sum_bm_score_ += sorted_iterators_[i]->BlockMaxBM25Score();
     }
-    if (non_essential_sum_score_ + essential_sum_score_ > threshold_) {
+    if (firstEssential_ > 0)
+        non_essential_sum_bm_score_ = sum_scores_upper_bound_[firstEssential_ - 1];
+    if (non_essential_sum_bm_score_ + essential_sum_bm_score_ > threshold_) {
         // If yes, then we replace the list maxscores of the non-essential lists with block maxscores, and check again.
-        non_essential_sum_score_ = 0.0f;
+        non_essential_sum_bm_score_ = 0.0f;
         for (SizeT i = 0; i < firstEssential_; i++) {
-            const auto &it = sorted_iterators_[i];
-            bool ok = it->NextShallow(target_doc_id_);
-            if (ok) {
-                non_essential_sum_score_ += it->BlockMaxBM25Score();
-            }
+            non_essential_sum_bm_score_ += sorted_iterators_[i]->BlockMaxBM25Score();
         }
-        if (non_essential_sum_score_ + essential_sum_score_ > threshold_) {
+        sum_score = non_essential_sum_bm_score_ + essential_sum_bm_score_;
+        if (sum_score > threshold_) {
             return true;
         }
     }
     // In case the first (or second) filter above fails, we can in fact not just skip the current posting, but move directly to the end of
     // the shortest (or shortest essential) block. We refer to the version of BMM that uses this optimization as Block-Max Maxscore-Next
     // Live Block (BMM-NLB).
-    loop_cnt_init_boundaries_++;
-    DocIteratorHeap block_boundaries;
-    for (SizeT i = firstEssential_; i < num_iterators_; i++) {
-        DocIteratorEntry entry = {sorted_iterators_[i]->BlockLastDocID(), i};
-        block_boundaries.AddEntry(entry);
-    }
-    block_boundaries.BuildHeap();
-    TermDocIterator *top = GetDocIterator(block_boundaries.TopEntry().entry_id_);
-    while (block_boundaries.TopEntry().doc_id_ != INVALID_ROWID) {
+    loop_cnt_skip_boundaries_++;
+    TermDocIterator *top = GetDocIterator(block_boundaries_->TopEntry().entry_id_);
+    while (block_boundaries_->TopEntry().doc_id_ != INVALID_ROWID) {
         loop_cnt_nlb_++;
-        essential_sum_score_ -= top->BlockMaxBM25Score();
-        target_doc_id_ = block_boundaries.TopEntry().doc_id_ + 1;
+        sum_score -= top->BlockMaxBM25Score();
+        target_doc_id_ = block_boundaries_->TopEntry().doc_id_ + 1;
         bool ok = top->NextShallow(target_doc_id_);
-        if (!ok) {
-            doc_id_ = INVALID_ROWID;
-            return false;
-        }
-        RowID block_last_doc_id = top->BlockLastDocID();
-        block_boundaries.UpdateTopEntry(block_last_doc_id);
-        top = GetDocIterator(block_boundaries.TopEntry().entry_id_);
-        essential_sum_score_ += top->BlockMaxBM25Score();
-        if (non_essential_sum_score_ + essential_sum_score_ > threshold_) {
-            non_essential_sum_score_ = 0.0f;
-            for (SizeT i = 0; i < firstEssential_; i++) {
-                const auto &it = sorted_iterators_[i];
-                bool ok = it->NextShallow(target_doc_id_);
-                if (ok) {
-                    non_essential_sum_score_ += it->BlockMaxBM25Score();
-                }
-            }
-            if (non_essential_sum_score_ + essential_sum_score_ > threshold_) {
-                return true;
-            }
+        RowID block_last_doc_id = ok ? top->BlockLastDocID() : INVALID_ROWID;
+        block_boundaries_->UpdateTopEntry(block_last_doc_id);
+        top = GetDocIterator(block_boundaries_->TopEntry().entry_id_);
+        sum_score += top->BlockMaxBM25Score();
+        if (sum_score > threshold_) {
+            block_last_doc_id_ = block_boundaries_->TopEntry().doc_id_;
+            return true;
         }
     }
     doc_id_ = INVALID_ROWID;
@@ -246,41 +251,47 @@ bool BlockMaxMaxscoreIterator::NextPhase1() {
 
 bool BlockMaxMaxscoreIterator::NextPhase2() {
     loop_cnt_phase2_++;
-    assert(target_doc_id_ != INVALID_ROWID && non_essential_sum_score_ + essential_sum_score_ > threshold_);
+    assert(target_doc_id_ != INVALID_ROWID && target_doc_id_ <= block_last_doc_id_ &&
+           non_essential_sum_bm_score_ + essential_sum_bm_score_ > threshold_);
     // Next, we get the term scores of the candidate in the essential lists, and check if the potential score is still above the
     // threshold.
-    essential_sum_score_ = 0.0f;
+    float essential_sum_score = 0.0f;
+    float non_essential_sum_score = 0.0f;
     RowID min_doc_id = INVALID_ROWID;
     for (SizeT i = firstEssential_; i < num_iterators_; i++) {
         const auto &it = sorted_iterators_[i];
-        bool ok = it->Next(target_doc_id_);
-        if (ok && it->DocID() < min_doc_id) {
-            min_doc_id = it->DocID();
+        if (it->BlockMinPossibleDocID() <= target_doc_id_) {
+            bool ok = it->Next(target_doc_id_);
+            if (ok && it->DocID() < min_doc_id) {
+                min_doc_id = it->DocID();
+            }
         }
     }
+    assert(target_doc_id_ <= min_doc_id);
     target_doc_id_ = min_doc_id;
     for (SizeT i = firstEssential_; i < num_iterators_; i++) {
         const auto &it = sorted_iterators_[i];
         if (it->DocID() == target_doc_id_) {
-            essential_sum_score_ += it->BM25Score();
+            essential_sum_score += it->BM25Score();
         }
     }
-    if (non_essential_sum_score_ + essential_sum_score_ > threshold_) {
+    if (non_essential_sum_bm_score_ + essential_sum_score > threshold_) {
         // If so, we then start scoring the non-essential lists until all terms have been evaluated or the candidate has
         // been ruled out.
-        non_essential_sum_score_ = 0.0f;
         for (SizeT i = 0; i < firstEssential_; i++) {
             const auto &it = sorted_iterators_[i];
-            it->Next(target_doc_id_);
-            if (it->DocID() == target_doc_id_) {
-                non_essential_sum_score_ += it->BM25Score();
+            if (it->BlockMinPossibleDocID() <= target_doc_id_) {
+                bool ok = it->Next(target_doc_id_);
+                if (ok && it->DocID() == target_doc_id_) {
+                    non_essential_sum_score += it->BM25Score();
+                }
             }
         }
-        if (non_essential_sum_score_ + essential_sum_score_ > threshold_) {
+        if (non_essential_sum_score + essential_sum_score > threshold_) {
             loop_cnt_quit_++;
             doc_id_ = target_doc_id_;
             bm25_score_cache_docid_ = doc_id_;
-            bm25_score_cache_ = non_essential_sum_score_ + essential_sum_score_;
+            bm25_score_cache_ = non_essential_sum_score + essential_sum_score;
             return true;
         }
     }
@@ -330,7 +341,11 @@ void BlockMaxMaxscoreIterator::UpdateScoreThreshold(const float threshold) {
         firstEssential_++;
         updated_firstEssential = true;
     }
-    if (updated_firstRequired || updated_firstEssential) {
+    if (updated_firstRequired) {
+        BlockBoundariesInit();
+        EssentialPqInit();
+        pivot_history_.emplace_back(doc_id_.ToUint64(), threshold, firstEssential_, firstRequired_);
+    } else if (updated_firstEssential) {
         EssentialPqInit();
         pivot_history_.emplace_back(doc_id_.ToUint64(), threshold, firstEssential_, firstRequired_);
     }

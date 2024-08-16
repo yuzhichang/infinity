@@ -65,7 +65,9 @@ void TermDocIterator::InitBM25Info(UniquePtr<FullTextColumnLengthReader> &&colum
 
 float TermDocIterator::BlockMaxBM25Score() {
     ++access_bm_score_cnt_;
-    if (const auto last_doc_id = BlockLastDocID(); last_doc_id == block_max_bm25_score_cache_end_id_) [[likely]] {
+    if (doc_id_ == INVALID_ROWID) [[unlikely]] {
+        return 0.0f;
+    } else if (const auto last_doc_id = BlockLastDocID(); last_doc_id == block_max_bm25_score_cache_end_id_) [[likely]] {
         return block_max_bm25_score_cache_;
     } else {
         ++calc_bm_score_cnt_;
@@ -114,7 +116,9 @@ bool TermDocIterator::NextShallow(RowID doc_id) {
 
 float TermDocIterator::BM25Score() {
     ++access_score_cnt_;
-    if (doc_id_ == bm25_score_cache_docid_) [[unlikely]] {
+    if (doc_id_ == INVALID_ROWID) [[unlikely]] {
+        return 0.0f;
+    } else if (doc_id_ == bm25_score_cache_docid_) [[unlikely]] {
         return bm25_score_cache_;
     }
     calc_score_cnt_++;

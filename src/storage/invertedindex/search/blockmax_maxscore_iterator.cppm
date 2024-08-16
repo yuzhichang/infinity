@@ -71,6 +71,10 @@ private:
 
     void EssentialPqNext(RowID doc_id);
 
+    void BlockBoundariesInit();
+
+    void BlockBoundariesNext(RowID doc_id);
+
     TermDocIterator *GetDocIterator(u32 i) { return sorted_iterators_[i]; }
 
     bool NextPhase1();
@@ -81,7 +85,9 @@ private:
     SizeT num_iterators_ = 0;
     Vector<float> sum_scores_upper_bound_;       // value at i: sum of BM25ScoreUpperBound for iter [0, i]
 
-    UniquePtr<DocIteratorHeap> essentialPq_ = nullptr; // OR among iterators [firstEssential_, firstRequired_)
+    UniquePtr<DocIteratorHeap> essentialPq_ = nullptr; // iterators [firstEssential_, firstRequired_) ordered with DocID()
+
+    UniquePtr<DocIteratorHeap> block_boundaries_ = nullptr; // iterators [0, firstRequired_) ordered with BlockLastDocID()
 
     // Index of the first essential iterator, ie. essentialHeap_ contains all iterators from
     // sorted_iterators_[firstEssential:]. All iterators below this index are non-essential.
@@ -90,9 +96,10 @@ private:
     // for a document to match.
     SizeT firstRequired_ = sorted_iterators_.size();
 
-    float non_essential_sum_score_ = 0.0f;
-    float essential_sum_score_ = 0.0f;
+    float non_essential_sum_bm_score_ = 0.0f;
+    float essential_sum_bm_score_ = 0.0f;
     RowID target_doc_id_ = INVALID_ROWID;
+    RowID block_last_doc_id_ = INVALID_ROWID;
 
     // bm25 score cache
     RowID bm25_score_cache_docid_ = INVALID_ROWID;
@@ -104,7 +111,7 @@ private:
     Vector<Tuple<u64, float, u32, u32>> pivot_history_; // row_id, threshold, firstEssential, firstRequired
     u64 loop_cnt_phase1_ = 0;
     u64 loop_cnt_phase2_ = 0;
-    u64 loop_cnt_init_boundaries_ = 0;
+    u64 loop_cnt_skip_boundaries_ = 0;
     u64 loop_cnt_nlb_ = 0;
     u64 loop_cnt_quit_ = 0;
 };
