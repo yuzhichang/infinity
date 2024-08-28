@@ -918,6 +918,7 @@ String WalCmdOptimize::ToString() const {
     for (auto &param_ptr : params_) {
         ss << param_ptr->ToString() << " | ";
     }
+    ss << std::endl;
     return ss.str();
 }
 
@@ -935,6 +936,7 @@ String WalCmdDumpIndex::ToString() const {
     for (auto &chunk_id : deprecate_ids_) {
         ss << chunk_id << " | ";
     }
+    ss << std::endl;
     return ss.str();
 }
 
