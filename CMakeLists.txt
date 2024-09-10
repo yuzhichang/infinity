@@ -25,7 +25,7 @@ if (CLANG_VERSION_STRING VERSION_GREATER 16)
     # Print CMake version and project name
     message(STATUS "Building ${PROJECT_NAME} with CMake version: ${CMAKE_VERSION} On CLANG-${CLANG_VERSION_STRING}")
 
-    set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -Wno-unused-private-field")
+    add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-private-field)
     set(CMAKE_CXX_STANDARD_REQUIRED YES)
     set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -90,13 +90,14 @@ set(CSV_DATA_PATH ${CMAKE_SOURCE_DIR}/third_party/zsv/data)
 set(TMP_DATA_PATH ${CMAKE_SOURCE_DIR}/tmp)
 
 # You can disable jemalloc by passing the `-DENABLE_JEMALLOC=OFF` option to CMake.
-option(ENABLE_JEMALLOC "Enable jemalloc support" OFF)
+option(ENABLE_JEMALLOC "Enable jemalloc support" ON)
 if(ENABLE_JEMALLOC)
+    message(STATUS "ENABLE_JEMALLOC ON")
     find_package(jemalloc REQUIRED)
     set(JEMALLOC_STATIC_LIB "jemalloc.a")
     if(NOT "${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
-        set(CMAKE_C_FLAGS  "${CMAKE_C_FLAGS} -DENABLE_JEMALLOC_PROF")
-        set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -DENABLE_JEMALLOC_PROF")
+        message(STATUS "CXX_FLAGS ENABLE_JEMALLOC_PROF")
+        add_compile_options(-DENABLE_JEMALLOC_PROF)
     endif ()
 endif ()
 
@@ -115,18 +116,15 @@ message(STATUS "Build type = ${CMAKE_BUILD_TYPE}")
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
 
-    set(CMAKE_CXX_FLAGS "-Ofast -DNDEBUG")
-    set(CMAKE_C_FLAGS  "-Ofast -DNDEBUG")
+    add_compile_options(-Ofast -DNDEBUG)
 
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
 
-    set(CMAKE_CXX_FLAGS "-O2 -g -DNDEBUG")
-    set(CMAKE_C_FLAGS  "-O2 -g -DNDEBUG")
+    add_compile_options(-O2 -g -DNDEBUG)
 
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
 
-    set(CMAKE_CXX_FLAGS "-O0 -g")
-    set(CMAKE_C_FLAGS "-O0 -g")
+    add_compile_options(-O0 -g)
 
     if ("${CODE_COVERAGE}" STREQUAL "ON")
         add_compile_options(--coverage)
@@ -139,7 +137,7 @@ elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
 
     if(NOT ENABLE_JEMALLOC)
 
-        set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -fno-stack-protector -fno-var-tracking ")
+        add_compile_options(-fno-stack-protector -fno-var-tracking)
         add_compile_options(-fsanitize=address -fsanitize-recover=all -fsanitize=leak)
         add_link_options(-fsanitize=address -fsanitize-recover=all -fsanitize=leak)
 
@@ -161,12 +159,10 @@ else ()
 endif ()
 
 if (CLANG_VERSION_STRING VERSION_EQUAL 17)
-    set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -Wall -Werror -Wno-asm-operand-widths -Wno-unused-command-line-argument -Wno-deprecated-declarations -Wno-read-modules-implicitly -Wextra -Wno-unused-parameter -Wno-unused-private-field -pthread -fcolor-diagnostics")
+    add_compile_options(-Wall -Werror -Wno-asm-operand-widths -Wno-unused-command-line-argument -Wno-deprecated-declarations -Wno-read-modules-implicitly -Wextra -Wno-unused-parameter -Wno-unused-private-field -pthread -fcolor-diagnostics)
 else ()
-    set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -Wall -Werror -Wno-asm-operand-widths -Wno-unused-command-line-argument -Wno-deprecated-declarations -Wextra -Wno-unused-parameter -Wno-unused-private-field -pthread -fcolor-diagnostics")
+    add_compile_options(-Wall -Werror -Wno-asm-operand-widths -Wno-unused-command-line-argument -Wno-deprecated-declarations -Wextra -Wno-unused-parameter -Wno-unused-private-field -pthread -fcolor-diagnostics)
 endif ()
-
-MESSAGE(STATUS "C++ Compilation flags: " ${CMAKE_CXX_FLAGS})
 
 #add_definitions(-march=native)
 add_definitions(-DSIMDE_ENABLE_NATIVE_ALIASES)
@@ -192,7 +188,7 @@ find_package(Lz4 REQUIRED)
 
 
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+add_compile_options(-fPIC)
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 #find_package(Python 3.8
 #        REQUIRED COMPONENTS Interpreter Development.Module
@@ -210,7 +206,7 @@ add_subdirectory(third_party EXCLUDE_FROM_ALL)
 
 # set parameters for unit test coverage
 # TODO: issue error "cannot merge previous GCDA file" when turn following switch.
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage")
+# add_compile_options(-fprofile-arcs -ftest-coverage)
 
 # Compile the unit test
 
