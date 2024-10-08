@@ -116,6 +116,18 @@ void HTTPSearch::Process(Infinity *infinity_ptr,
                 if (output_columns == nullptr) {
                     return;
                 }
+            } else if(IsEqual(key, "highlight")) {
+                auto &highlight_list = elem.value();
+                if (!highlight_list.is_array()) {
+                    response["error_code"] = ErrorCode::kInvalidExpression;
+                    response["error_message"] = "Output field should be array";
+                    return;
+                }
+
+                highlight_columns = ParseOutput(highlight_list, http_status, response);
+                if (highlight_columns == nullptr) {
+                    return;
+                }
             } else if (IsEqual(key, "sort")) {
                 if (order_by_list != nullptr) {
                     response["error_code"] = ErrorCode::kInvalidExpression;
@@ -298,6 +310,36 @@ void HTTPSearch::Explain(Infinity *infinity_ptr,
 
                 output_columns = ParseOutput(output_list, http_status, response);
                 if (output_columns == nullptr) {
+                    return;
+                }
+            } else if(IsEqual(key, "highlight")) {
+                auto &highlight_list = elem.value();
+                if (!highlight_list.is_array()) {
+                    response["error_code"] = ErrorCode::kInvalidExpression;
+                    response["error_message"] = "Output field should be array";
+                    return;
+                }
+
+                highlight_columns = ParseOutput(highlight_list, http_status, response);
+                if (highlight_columns == nullptr) {
+                    return;
+                }
+            } else if (IsEqual(key, "sort")) {
+                if (order_by_list != nullptr) {
+                    response["error_code"] = ErrorCode::kInvalidExpression;
+                    response["error_message"] = "More than one sort field.";
+                    return;
+                }
+
+                auto &list = elem.value();
+                if (!list.is_array()) {
+                    response["error_code"] = ErrorCode::kInvalidExpression;
+                    response["error_message"] = "Sort field should be array";
+                    return;
+                }
+
+                order_by_list = ParseSort(list, http_status, response);
+                if (order_by_list == nullptr) {
                     return;
                 }
             } else if (IsEqual(key, "filter")) {

@@ -100,6 +100,9 @@ public:
     // Project expression list
     Vector<SharedPtr<BaseExpression>> projection_expressions_{};
 
+    // High expression list
+    Vector<SharedPtr<BaseExpression>> highlight_expressions_{};
+
     // Order by expression list
     Vector<SharedPtr<BaseExpression>> order_by_expressions_{};
     Vector<OrderType> order_by_types_{};

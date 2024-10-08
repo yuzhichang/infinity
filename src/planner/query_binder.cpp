@@ -223,12 +223,23 @@ UniquePtr<BoundSelectStatement> QueryBinder::BindSelect(const SelectStatement &s
     BuildSelectList(query_context_ptr_, bound_select_statement);
     bound_select_statement->aggregate_expressions_ = bind_context_ptr_->aggregate_exprs_;
 
-    // 12. ORDER BY
+    // 12. highlight list
+    if(statement.highlight_list_ != nullptr) {
+        bind_context_ptr_->highlight_expression_.reserve(statement.highlight_list_->size());
+        for (auto *highlight_expr : *statement.highlight_list_) {
+            bind_context_ptr_->highlight_expression_.emplace_back(highlight_expr);
+        }
+
+        // Check highlight columns is also in select list, and match text expression
+        UnrecoverableError("No validation on the highlight list");
+    }
+
+    // 13. ORDER BY
     if (statement.order_by_list != nullptr) {
         BuildOrderBy(query_context_ptr_, statement, bound_select_statement);
     }
 
-    // 13. LIMIT
+    // 14. LIMIT
     if (statement.limit_expr_ != nullptr) {
         BuildLimit(query_context_ptr_, statement, bound_select_statement);
     }
@@ -244,11 +255,8 @@ UniquePtr<BoundSelectStatement> QueryBinder::BindSelect(const SelectStatement &s
         bind_context_ptr_->result_index_ = bind_context_ptr_->project_table_index_;
     }
 
-    // 14. TOP
-    // 15. UNION/INTERSECT/EXCEPT
-    // 16. LIMIT
-    // 17. ORDER BY
-    // 18. TOP
+    // 15. TOP
+    // 16. UNION/INTERSECT/EXCEPT
 
     bound_select_statement->projection_index_ = bind_context_ptr_->project_table_index_;
     bound_select_statement->groupby_index_ = bind_context_ptr_->group_by_table_index_;

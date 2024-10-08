@@ -84,6 +84,9 @@ public:
     // Select list
     Vector<ParsedExpr *> select_expression_; // ParsedExpr won't be free here.
 
+    // Highlight list
+    Vector<ParsedExpr *> highlight_expression_; // ParsedExpr won't be free here.
+
     // Following will be initialized at step 5 of bind select statement
     HashMap<String, i64> select_alias2index_;     // Some select expr has alias, alias_name -> index
     HashMap<String, i64> select_expr_name2index_; // Select expr name -> index
