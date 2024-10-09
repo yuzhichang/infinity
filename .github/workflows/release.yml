@@ -58,11 +58,11 @@ jobs:
           # actions/checkout@v3 fetch-tags doesn't work when triggered by schedule
           git fetch --tags
           if [ "$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG")" = "$GITHUB_SHA" ]; then
-            echo "mutalbe tag $RELEASE_TAG exists and matchs $GITHUB_SHA"
+            echo "mutable tag $RELEASE_TAG exists and matches $GITHUB_SHA"
           else
             git tag -f $RELEASE_TAG $GITHUB_SHA
             git push -f origin $RELEASE_TAG:refs/tags/$RELEASE_TAG
-            echo "created/moved mutalbe tag $RELEASE_TAG to $GITHUB_SHA"
+            echo "created/moved mutable tag $RELEASE_TAG to $GITHUB_SHA"
           fi
         fi
 
