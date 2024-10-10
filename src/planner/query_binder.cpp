@@ -78,6 +78,7 @@ import table_entry;
 import txn;
 import logger;
 import defer_op;
+import highlighter;
 
 namespace infinity {
 
@@ -224,14 +225,16 @@ UniquePtr<BoundSelectStatement> QueryBinder::BindSelect(const SelectStatement &s
     bound_select_statement->aggregate_expressions_ = bind_context_ptr_->aggregate_exprs_;
 
     // 12. highlight list
-    if(statement.highlight_list_ != nullptr) {
-        bind_context_ptr_->highlight_expression_.reserve(statement.highlight_list_->size());
+    if (statement.highlight_list_ != nullptr) {
         for (auto *highlight_expr : *statement.highlight_list_) {
-            bind_context_ptr_->highlight_expression_.emplace_back(highlight_expr);
+            const String &column_name = highlight_expr->GetName();
+            if (!(bind_context_ptr_->project_index_by_name_.contains(column_name))) {
+                Status status = Status::InvalidColumnName(fmt::format("Highlight column: {} not found in select list", column_name));
+                RecoverableError(status);
+            }
+            SizeT column_id = bind_context_ptr_->project_index_by_name_[column_name];
+            bound_select_statement->highlight_columns_.emplace(column_id, MakeShared<HighlightInfo>());
         }
-
-        // Check highlight columns is also in select list, and match text expression
-        UnrecoverableError("No validation on the highlight list");
     }
 
     // 13. ORDER BY

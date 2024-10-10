@@ -26,6 +26,7 @@ import query_context;
 import search_expression;
 import knn_expression;
 import select_statement;
+import highlighter;
 
 export module bound_select_statement;
 
@@ -100,8 +101,8 @@ public:
     // Project expression list
     Vector<SharedPtr<BaseExpression>> projection_expressions_{};
 
-    // High expression list
-    Vector<SharedPtr<BaseExpression>> highlight_expressions_{};
+    // Highlight info
+    Map<SizeT, SharedPtr<HighlightInfo>> highlight_columns_{};
 
     // Order by expression list
     Vector<SharedPtr<BaseExpression>> order_by_expressions_{};
