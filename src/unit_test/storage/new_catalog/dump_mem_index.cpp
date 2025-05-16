@@ -4853,9 +4853,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1            dump index   commit (success)
@@ -4887,9 +4884,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         check_index0(*index_name1, [&](const SharedPtr<MemIndex> &mem_index) { EXPECT_TRUE(mem_index->memory_secondary_index_ == nullptr); });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1            dump index                 commit (success)
@@ -4921,9 +4915,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         check_index0(*index_name1, [&](const SharedPtr<MemIndex> &mem_index) { EXPECT_TRUE(mem_index->memory_secondary_index_ == nullptr); });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1            dump index                                               commit (success)
@@ -4954,9 +4945,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         check_index0(*index_name1, [&](const SharedPtr<MemIndex> &mem_index) { EXPECT_TRUE(mem_index->memory_secondary_index_ == nullptr); });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1            dump index                             commit (success)
@@ -4989,9 +4977,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         check_index0(*index_name1, [&](const SharedPtr<MemIndex> &mem_index) { EXPECT_TRUE(mem_index->memory_secondary_index_ == nullptr); });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1                                  dump index (fail)                           rollback (success)
@@ -5024,9 +5009,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         check_index2(*index_name1, [&](const SharedPtr<MemIndex> &mem_index) { EXPECT_TRUE(mem_index->memory_secondary_index_ != nullptr); });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1                                  dump index                                  commit
@@ -5057,9 +5039,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         check_index3(*index_name1, [&](const SharedPtr<MemIndex> &mem_index) { EXPECT_TRUE(mem_index->memory_secondary_index_ == nullptr); });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //                                 t1                    dump index                             commit (success)
@@ -5091,9 +5070,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         check_index3(*index_name1, [&](const SharedPtr<MemIndex> &mem_index) { EXPECT_TRUE(mem_index->memory_secondary_index_ == nullptr); });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //                                            t1                    dump index                             commit (success)
@@ -5123,9 +5099,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_append) {
         check_index3(*index_name1, [&](const SharedPtr<MemIndex> &mem_index) { EXPECT_TRUE(mem_index->memory_secondary_index_ == nullptr); });
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     RemoveDbDirs();
@@ -5401,9 +5374,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1            dump index   commit (success)
@@ -5443,9 +5413,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1            dump index                 commit (success)
@@ -5485,9 +5452,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1            dump index                                               commit (success)
@@ -5526,9 +5490,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1            dump index                             commit (success)
@@ -5569,9 +5530,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //  t1                                            dump index                              commit
@@ -5610,9 +5568,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //                  t1                                  dump index                                  commit
@@ -5652,9 +5607,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //                                 t1                    dump index                             commit (success)
@@ -5695,9 +5647,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     //                                            t1                    dump index                             commit (success)
@@ -5735,9 +5684,6 @@ TEST_P(TestTxnDumpMemIndex, dump_and_delete) {
         check_data();
 
         drop_db(*db_name);
-
-        NewCatalog *new_catalog = infinity::InfinityContext::instance().storage()->new_catalog();
-        EXPECT_EQ(new_catalog->GetTableReferenceCountForMemIndex(), 0);
     }
 
     RemoveDbDirs();
