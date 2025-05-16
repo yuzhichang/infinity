@@ -1251,6 +1251,9 @@ Status NewTxn::Commit() {
     }
 
     if (status.ok()) {
+        if (base_txn_store_.get() != nullptr) {
+            wal_entry_ = base_txn_store_->ToWalEntry();
+        }
         txn_store_.PrepareCommit1(); // Only for import and compact, pre-commit segment
         status = this->PrepareCommit(commit_ts);
     }
