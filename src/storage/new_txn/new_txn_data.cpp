@@ -374,12 +374,6 @@ Status NewTxn::Append(const String &db_name, const String &table_name, const Sha
         return status;
     }
 
-    Vector<Pair<RowID, u64>> row_ranges;
-    std::tie(row_ranges, status) = GetRowRanges(*table_meta, input_block);
-    if (!status.ok()) {
-        return status;
-    }
-
     // Put the data into local txn store
     if (base_txn_store_ != nullptr) {
         return Status::UnexpectedError("txn store is not null");
@@ -393,34 +387,13 @@ Status NewTxn::Append(const String &db_name, const String &table_name, const Sha
     append_txn_store->table_id_str_ = table_meta->table_id_str();
     append_txn_store->table_id_ = std::stoull(table_meta->table_id_str());
     append_txn_store->input_block_ = input_block;
-    append_txn_store->row_ranges_ = row_ranges;
+    // append_txn_store->row_ranges_ will be populated after conflict check
 
     return AppendInner(db_name, table_name, table_key, *table_meta, input_block, row_ranges);
 }
 
 Status NewTxn::Append(const TableInfo &table_info, const SharedPtr<DataBlock> &input_block) {
     return Append(*table_info.db_name_, *table_info.table_name_, input_block);
-}
-
-Tuple<Vector<Pair<RowID, u64>>, Status> NewTxn::GetRowRanges(TableMeeta &table_meta, const SharedPtr<DataBlock> &input_block) {
-    Vector<Pair<RowID, u64>> row_ranges;
-    RowID begin_row_id;
-    Status status = table_meta.GetNextRowID(begin_row_id);
-    if (!status.ok()) {
-        return {row_ranges, status};
-    }
-    SizeT left_rows = input_block->row_count();
-    while (left_rows > 0) {
-        SegmentID segment_id = begin_row_id.segment_id_;
-        SizeT segment_row_cnt = begin_row_id.segment_offset_;
-        SizeT segment_room = DEFAULT_SEGMENT_CAPACITY - segment_row_cnt;
-        SizeT copyed_rows = left_rows < segment_room ? left_rows : segment_room;
-        row_ranges.push_back({begin_row_id, copyed_rows});
-        left_rows -= copyed_rows;
-        begin_row_id = RowID(segment_id + 1, 0);
-    }
-
-    return {row_ranges, Status::OK()};
 }
 
 Status NewTxn::AppendInner(const String &db_name,
@@ -457,11 +430,6 @@ Status NewTxn::AppendInner(const String &db_name,
             return Status::DataTypeMismatch(column_types.back()->ToString(), input_block->column_vectors[col_id]->data_type()->ToString());
         }
     }
-
-    auto append_command = MakeShared<WalCmdAppendV2>(db_name, table_meta.db_id_str(), table_name, table_meta.table_id_str(), row_ranges, input_block);
-    auto wal_command = static_pointer_cast<WalCmd>(append_command);
-    wal_entry_->cmds_.push_back(wal_command);
-    txn_context_ptr_->AddOperation(MakeShared<String>(append_command->ToString()));
 
     return Status::OK();
 }
@@ -513,12 +481,6 @@ Status NewTxn::Update(const String &db_name, const String &table_name, const Sha
     Optional<TableMeeta> table_meta;
     String table_key;
     Status status = GetTableMeta(db_name, table_name, db_meta, table_meta, &table_key);
-    if (!status.ok()) {
-        return status;
-    }
-
-    Vector<Pair<RowID, u64>> row_ranges;
-    std::tie(row_ranges, status) = GetRowRanges(*table_meta, input_block);
     if (!status.ok()) {
         return status;
     }
