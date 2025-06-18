@@ -69,7 +69,6 @@ import defer_op;
 import base_txn_store;
 import kv_code;
 import buffer_handle;
-import segment_entry;
 import bg_task;
 import mem_index_appender;
 

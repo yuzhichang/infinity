@@ -29,7 +29,6 @@ import operator_state;
 import data_block;
 
 import infinity_exception;
-import table_entry_type;
 import value_expression;
 import logical_show;
 import meta_info;
@@ -72,7 +71,6 @@ import memindex_tracer;
 import persistence_manager;
 import global_resource_usage;
 import infinity_context;
-import cleanup_scanner;
 import obj_status;
 import admin_statement;
 import result_cache_manager;
@@ -1540,7 +1538,7 @@ void PhysicalShow::ExecuteShowTables(QueryContext *query_context, ShowOperatorSt
     // Prepare the output data block
     UniquePtr<DataBlock> output_block_ptr = DataBlock::MakeUniquePtr();
     Vector<SharedPtr<DataType>>
-        column_types{varchar_type, varchar_type, varchar_type, bigint_type, bigint_type, bigint_type, bigint_type, bigint_type, varchar_type};
+        column_types{varchar_type, varchar_type, bigint_type, bigint_type, bigint_type, bigint_type, bigint_type, varchar_type};
     SizeT row_count = 0;
     output_block_ptr->Init(*output_types_);
 
@@ -1570,87 +1568,35 @@ void PhysicalShow::ExecuteShowTables(QueryContext *query_context, ShowOperatorSt
         }
 
         ++column_id;
-        TableEntryType table_type = table_detail_ptr->table_entry_type_;
         {
-            // Append base table type to the 2 column
-            const String &base_table_type_str = ToString(table_type);
-            Value value = Value::MakeVarchar(base_table_type_str);
+            // Append column count the 3 column
+            Value value = Value::MakeBigInt(static_cast<i64>(table_detail_ptr->column_count_));
             ValueExpression value_expr(value);
             value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
         }
 
         ++column_id;
         {
-            // Append column count the 3 column
-            switch (table_type) {
-                case TableEntryType::kTableEntry: {
-                    Value value = Value::MakeBigInt(static_cast<i64>(table_detail_ptr->column_count_));
-                    ValueExpression value_expr(value);
-                    value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
-                    break;
-                }
-                case TableEntryType::kCollectionEntry: {
-                    // TODO: column count need to be given for table.
-                    Value value = Value::MakeBigInt(static_cast<i64>(0));
-                    ValueExpression value_expr(value);
-                    value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
-                    break;
-                }
-            }
-        }
-
-        ++column_id;
-        {
             // Append block count the 4 column
-            switch (table_type) {
-                case TableEntryType::kTableEntry:
-                case TableEntryType::kCollectionEntry: {
-                    Value value = Value::MakeBigInt(static_cast<i64>(table_detail_ptr->block_count_));
-                    ValueExpression value_expr(value);
-                    value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
-                    break;
-                }
-                default: {
-                    String error_message = "Invalid table type";
-                    UnrecoverableError(error_message);
-                }
-            }
+            Value value = Value::MakeBigInt(static_cast<i64>(table_detail_ptr->block_count_));
+            ValueExpression value_expr(value);
+            value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
         }
 
         ++column_id;
         {
             // Append block capacity the 5 column
-            switch (table_type) {
-                case TableEntryType::kCollectionEntry:
-                case TableEntryType::kTableEntry: {
-                    Value value = Value::MakeBigInt(static_cast<i64>(table_detail_ptr->block_capacity_));
-                    ValueExpression value_expr(value);
-                    value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
-                    break;
-                }
-                default: {
-                    String error_message = "Invalid table type";
-                    UnrecoverableError(error_message);
-                }
-            }
+            Value value = Value::MakeBigInt(static_cast<i64>(table_detail_ptr->block_capacity_));
+            ValueExpression value_expr(value);
+            value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
         }
 
         ++column_id;
         {
             // Append segment count the 6 column
-            switch (table_type) {
-                case TableEntryType::kCollectionEntry:
-                case TableEntryType::kTableEntry: {
-                    Value value = Value::MakeBigInt(static_cast<i64>(table_detail_ptr->segment_count_));
-                    ValueExpression value_expr(value);
-                    value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
-                    break;
-                }
-                default: {
-                    String error_message = "Invalid table type";
-                    UnrecoverableError(error_message);
-                }
-            }
+            Value value = Value::MakeBigInt(static_cast<i64>(table_detail_ptr->segment_count_));
+            ValueExpression value_expr(value);
+            value_expr.AppendToChunk(output_block_ptr->column_vectors[column_id]);
         }
 
         ++column_id;

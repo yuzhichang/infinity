@@ -63,6 +63,7 @@ import dump_index_process;
 import mem_index;
 import base_memindex;
 import emvb_index_in_mem;
+import txn_context;
 
 namespace infinity {
 
