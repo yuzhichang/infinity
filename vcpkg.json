@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "infinity",
+  "version": "0.6.0",
+  "description": "The AI-native database built for LLM applications, offering incredibly fast vector and full-text search.",
+  "dependencies": [
+    {
+      "name": "arrow",
+      "version>=": "20.0.0",
+      "features": [
+        "parquet",
+        "filesystem",
+        "csv"
+      ]
+    }
+  ],
+  "builtin-baseline": "9a023fa7d4c8c9ed3fa5b1be466e605b10b9d220"
+}

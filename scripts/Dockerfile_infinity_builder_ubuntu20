@@ -204,6 +204,10 @@ ENV Python3_EXECUTABLE=/usr/local/bin/python3.10
 ENV Python3_INCLUDE_DIR=/usr/local/include/python3.10
 ENV Python3_LIBRARY=/usr/local/lib/libpython3.10.so
 
+# Setup vcpkg environment
+ENV VCPKG_ROOT=/opt/vcpkg
+ENV PATH=$VCPKG_ROOT:$PATH
+
 # Install vectorscan
 RUN --mount=type=bind,source=vectorscan-master.zip,target=/root/vectorscan-master.zip \
     cd /root && unzip vectorscan-master.zip \
@@ -213,6 +217,21 @@ RUN --mount=type=bind,source=vectorscan-master.zip,target=/root/vectorscan-maste
     && cmake -DCMAKE_BUILD_TYPE=Release -DFAT_RUNTIME=Off ..  \
     && make -j 12 install \
     && rm -rf ../../vectorscan-master
+
+# Install and setup vcpkg, then build all dependencies from vcpkg.json
+RUN --mount=type=bind,source=vcpkg,target=/root/vcpkg \
+    --mount=type=bind,source=vcpkg.json,target=/root/vcpkg.json \
+    --mount=type=cache,id=vcpkg_build_cache,target=/opt/vcpkg_build_cache,sharing=locked \
+    cp -r /root/vcpkg $VCPKG_ROOT \
+    && cd $VCPKG_ROOT \
+    && ./vcpkg integrate install \
+    # Build all dependencies from vcpkg.json using project's toolchain
+    && CC=clang CXX=clang++ ./vcpkg install --triplet=x64-linux --x-manifest-root=/root \
+    # Create symlinks for compatibility with existing build system
+    && mkdir -p /usr/local/lib \
+    && find $VCPKG_ROOT/installed/x64-linux/lib -name "*.a" -exec ln -sf {} /usr/local/lib/ \; \
+    && find $VCPKG_ROOT/installed/x64-linux/include -type d -exec mkdir -p /usr/local/include/{} \; 2>/dev/null || true \
+    && find $VCPKG_ROOT/installed/x64-linux/include -type f -exec ln -sf {} /usr/local/include/{} \; 2>/dev/null || true
 
 RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple && pip3 config set global.trusted-host mirrors.aliyun.com
 

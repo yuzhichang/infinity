@@ -16,6 +16,49 @@ download()
     fi
 }
 
+# Download vcpkg and prepare dependencies from vcpkg.json
+download_vcpkg_and_dependencies()
+{
+    echo "Downloading vcpkg..."
+    if [ ! -d "vcpkg" ]; then
+        # Use shallow clone to reduce download size and time
+        git clone --depth 1 --branch 2024.01.12 https://github.com/Microsoft/vcpkg.git
+        cd vcpkg
+        ./bootstrap-vcpkg.sh
+        cd ..
+    else
+        echo "vcpkg already exists, updating..."
+        cd vcpkg
+        git pull
+        cd ..
+    fi
+
+    echo "Downloading dependencies from vcpkg.json..."
+    if [ ! -f "vcpkg.json" ]; then
+        echo "ERROR: vcpkg.json not found in project root"
+        exit 1
+    fi
+
+    cd vcpkg
+    # Use vcpkg to download all dependencies specified in vcpkg.json
+    # This will download source packages but not build them yet
+    echo "Fetching dependencies specified in ../vcpkg.json..."
+
+    # Kill any existing vcpkg processes to avoid lock issues
+    pkill -f vcpkg || true
+    sleep 2
+
+    # Try to download dependencies
+    ./vcpkg install --triplet=x64-linux --x-manifest-root=.. --only-downloads || {
+        echo "Download failed, trying with force..."
+        ./vcpkg install --triplet=x64-linux --x-manifest-root=.. --only-downloads --force
+    }
+    cd ..
+
+    echo "vcpkg dependencies downloaded successfully."
+    # Note: vcpkg cache is handled by Docker's cache mount, no need to create archive
+}
+
 # https://stackoverflow.com/questions/24628076/convert-multiline-string-to-array
 names="https://github.com/Kitware/CMake/releases/download/v3.31.7/cmake-3.31.7-linux-x86_64.tar.gz
 https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-linux.zip
@@ -53,3 +96,9 @@ for ((i=0; i<${#names[@]}; i+=1)); do
 	exit -1
     fi
 done
+
+# Download and setup vcpkg with all dependencies from vcpkg.json
+download_vcpkg_and_dependencies
+if [ $? != 0 ]; then
+    exit -1
+fi

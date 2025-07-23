@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.28.1)
 
+# vcpkg integration - must be before project()
+if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "")
+    message(STATUS "Using vcpkg toolchain: ${CMAKE_TOOLCHAIN_FILE}")
+endif()
+
+# Set vcpkg triplet for libraries
+if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+    set(VCPKG_TARGET_TRIPLET "x64-linux" CACHE STRING "")
+endif()
+
 project(infinity VERSION 0.6.0)
 
 if (NOT CMAKE_GENERATOR STREQUAL "Ninja")

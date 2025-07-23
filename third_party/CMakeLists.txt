@@ -6,9 +6,35 @@ add_compile_options(-Wno-everything)
 add_subdirectory(snappy)
 
 ################################################################################
-### arrow
+### arrow - use vcpkg package
 ################################################################################
-add_subdirectory(arrow)
+find_package(Arrow REQUIRED)
+find_package(Parquet REQUIRED)
+
+if(Arrow_FOUND)
+    message(STATUS "Found Arrow: ${Arrow_VERSION}")
+    message(STATUS "Arrow include dirs: ${Arrow_INCLUDE_DIRS}")
+    message(STATUS "Arrow libraries: ${Arrow_LIBRARIES}")
+
+    # Create alias targets to match the expected names in the main project
+    if(TARGET Arrow::arrow_static)
+        add_library(arrow.a ALIAS Arrow::arrow_static)
+        message(STATUS "Created alias: arrow.a -> Arrow::arrow_static")
+    elseif(TARGET arrow_static)
+        add_library(arrow.a ALIAS arrow_static)
+        message(STATUS "Created alias: arrow.a -> arrow_static")
+    endif()
+
+    if(TARGET Parquet::parquet_static)
+        add_library(parquet.a ALIAS Parquet::parquet_static)
+        message(STATUS "Created alias: parquet.a -> Parquet::parquet_static")
+    elseif(TARGET parquet_static)
+        add_library(parquet.a ALIAS parquet_static)
+        message(STATUS "Created alias: parquet.a -> parquet_static")
+    endif()
+else()
+    message(FATAL_ERROR "Arrow not found. Please install via vcpkg.")
+endif()
 
 # Build doctest
 add_subdirectory(googletest)
