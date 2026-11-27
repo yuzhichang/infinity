@@ -248,6 +248,52 @@ fn is_id_ordered(rows: &[(usize, Vec<Value>)]) -> bool {
 /// the index, and the row each document came from (in document order).
 type PlaidChunkBuild = (u32, usize, PlaidIndex, Vec<u64>);
 
+/// What a document walk asks for after handing one document to its callback.
+///
+/// [`Engine::for_each_tensor_doc`] calls the callback with a document borrowed
+/// from the block it fetched, so the callback cannot await. `Pause` is how it
+/// asks the walk to stop *after* that borrow ends, so the caller can run
+/// blocking work on what it accumulated and then resume from where the walk
+/// stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocStep {
+    /// Keep walking.
+    Continue,
+    /// Stop before the next document; the walk reports where it stopped.
+    Pause,
+}
+
+/// How a document walk ended, so a paused walk can be resumed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkEnd {
+    /// Every document was visited.
+    Finished,
+    /// `DocStep::Pause` was returned; the walk can continue from the cursor.
+    Paused(WalkCursor),
+}
+
+/// Where a paused walk stopped: enough to resume without re-visiting the
+/// documents before it.
+///
+/// Three numbers, and all three are needed:
+///
+/// - `block` indexes into the block list the walk was built from. A value equal
+///   to the list's length means the walk had left the blocks and was draining
+///   the pending-row buffer.
+/// - `within` is the position inside that block's own iteration - the live-slot
+///   list for an `f32` column, the decoded cells for a rendered one, the row
+///   index for the pending buffer. Without it a resumed walk restarts at the
+///   block's first document and delivers everything before the pause again,
+///   which is how an earlier version looped for ever.
+/// - `seen` is how many documents the `skip` accounting had passed before the
+///   one that paused, so a resumed walk neither re-counts nor skips.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalkCursor {
+    pub block: usize,
+    pub within: usize,
+    pub seen: usize,
+}
+
 /// The stored text form of a column default: the same value `AddColumnsData`
 impl Engine {
     /// Root of the C++-format block mirror. The C++ engine keeps the table
@@ -8940,7 +8986,6 @@ impl Engine {
     /// A non-`f32` element type (`BIT` tensors) still renders: its rows are
     /// bit-packed per token, and no index holds that shape anyway.
     ///
-    /// Returns `true` when `each` asked to stop.
     /// Walks the tensor documents of `table.col`, handing each to `each`.
     ///
     /// **The block fetch is awaited, the decode is not.** That split is the
@@ -8961,12 +9006,13 @@ impl Engine {
         col: usize,
         dims: usize,
         skip: usize,
-        each: &'a mut (dyn FnMut(u64, &[&[f32]]) -> bool + Send),
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        resume: Option<WalkCursor>,
+        each: &'a mut (dyn FnMut(u64, &[&[f32]]) -> DocStep + Send),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WalkEnd> + Send + 'a>> {
         Box::pin(async move {
             let table = self.qualified_table(table);
             let Ok(Some(meta)) = self.storage.catalog.get_table_by_name(&table) else {
-                return false;
+                return WalkEnd::Finished;
             };
             let Some(types) = meta
                 .types
@@ -8974,7 +9020,7 @@ impl Engine {
                 .map(|t| column_type_of(t))
                 .collect::<Option<Vec<_>>>()
             else {
-                return false;
+                return WalkEnd::Finished;
             };
             // One `Arc` lookup for the whole walk: `is_deleted` loads the set per
             // call, which would put a lock and a journal scan in the row loop.
@@ -9007,7 +9053,22 @@ impl Engine {
                 })
                 .unwrap_or_default();
             let mut seen = 0usize;
-            for id in block_ids {
+            // Resumable: `Pause` leaves the block index and document offset here,
+            // and a later call restarts from them rather than re-walking.
+            let (start_block, resume_within) = resume.map_or((0, 0), |c| (c.block, c.within));
+            if let Some(cursor) = resume {
+                seen = cursor.seen;
+            }
+            let mut pending_from = 0usize;
+            for (block_at, id) in block_ids.iter().enumerate().skip(start_block) {
+                let id = *id;
+                // Only the block the walk resumes into starts part-way; every
+                // later one begins at its first document.
+                let skip_within = if block_at == start_block {
+                    resume_within
+                } else {
+                    0
+                };
                 // Conservative: `row_count` is the physical row count, which is at
                 // least the documents the block contributes, so a block that passes
                 // this test really does end before the watermark.
@@ -9042,7 +9103,10 @@ impl Engine {
                     };
                     let base = ((id.segment_id as u64) << 32)
                         | (id.block_id as u64 * crate::blocks::DEFAULT_BLOCK_CAPACITY as u64);
-                    for slot in live {
+                    for (slot_at, slot) in live.into_iter().enumerate() {
+                        if slot_at < skip_within {
+                            continue;
+                        }
                         let seq = base + slot as u64;
                         if dead.contains(seq) {
                             continue;
@@ -9077,8 +9141,15 @@ impl Engine {
                             owned.iter().map(Vec::as_slice).collect()
                         };
                         seen += 1;
-                        if !each(seq, &rows) {
-                            return true;
+                        match each(seq, &rows) {
+                            DocStep::Continue => {}
+                            DocStep::Pause => {
+                                return WalkEnd::Paused(WalkCursor {
+                                    block: block_at,
+                                    within: slot_at,
+                                    seen,
+                                })
+                            }
                         }
                     }
                     continue;
@@ -9089,7 +9160,10 @@ impl Engine {
                 else {
                     continue;
                 };
-                for (seq, cell) in cells {
+                for (cell_at, (seq, cell)) in cells.into_iter().enumerate() {
+                    if cell_at < skip_within {
+                        continue;
+                    }
                     if dead.contains(seq as u64) {
                         continue;
                     }
@@ -9105,13 +9179,29 @@ impl Engine {
                     if let Some(doc) = crate::parse_multivector_doc(text, dims) {
                         seen += 1;
                         let rows: Vec<&[f32]> = doc.iter().map(Vec::as_slice).collect();
-                        if !each(seq as u64, &rows) {
-                            return true;
+                        match each(seq as u64, &rows) {
+                            DocStep::Continue => {}
+                            DocStep::Pause => {
+                                return WalkEnd::Paused(WalkCursor {
+                                    block: block_at,
+                                    within: cell_at,
+                                    seen,
+                                })
+                            }
                         }
                     }
                 }
             }
-            for (seq, values) in self.pending_rows_of(&table) {
+            // The pending-row buffer is reached after every block, and a cursor
+            // naming `block == block_ids.len()` means the walk had got here. It
+            // is not block-indexed, so `within` counts buffer entries.
+            if start_block >= block_ids.len() {
+                pending_from = resume_within;
+            }
+            for (row_at, (seq, values)) in self.pending_rows_of(&table).into_iter().enumerate() {
+                if row_at < pending_from {
+                    continue;
+                }
                 if dead.contains(seq as u64) {
                     continue;
                 }
@@ -9129,13 +9219,58 @@ impl Engine {
                 if let Some(doc) = crate::parse_multivector_doc(&text, dims) {
                     seen += 1;
                     let rows: Vec<&[f32]> = doc.iter().map(Vec::as_slice).collect();
-                    if !each(seq as u64, &rows) {
-                        return true;
+                    // The pending buffer is not block-indexed, so a pause here
+                    // has no cursor to resume from; the walk ends instead.
+                    match each(seq as u64, &rows) {
+                        DocStep::Continue => {}
+                        DocStep::Pause => {
+                            return WalkEnd::Paused(WalkCursor {
+                                block: block_ids.len(),
+                                within: row_at,
+                                seen,
+                            })
+                        }
                     }
                 }
             }
-            false
+            WalkEnd::Finished
         })
+    }
+
+    /// Encodes one batch into `index` on the blocking pool, and hands the index
+    /// back.
+    ///
+    /// The index is moved in and out because `PlaidIndex` has no `Clone` and the
+    /// insert needs `&mut self`: the caller passes ownership, the job returns it
+    /// with the batch encoded. Measured at ~149 ms per 32 MiB batch on a 1024-dim
+    /// column, which is far past the point where parked worker matters - a
+    /// worker is one of the pool's cores, and a blocked one blocks every task
+    /// behind it.
+    ///
+    /// Returns the index and how many documents the batch held, so the caller's
+    /// running count stays on its own side of the boundary.
+    async fn insert_plaid_batch(
+        &self,
+        mut index: PlaidIndex,
+        flat: Vec<f32>,
+        lens: Vec<u32>,
+    ) -> Result<(PlaidIndex, u32)> {
+        let count = lens.len() as u32;
+        // The handle is only a probe: what this needs is "is there a pool to
+        // hand the job to", not the engine itself. An engine built without an
+        // `Arc` (a unit test) has neither a pool nor a worker to protect.
+        if self.engine_handle().is_none() {
+            index
+                .add_multiple_docs_embeddings(&flat, &lens)
+                .map_err(Into::into)?;
+            return Ok((index, count));
+        }
+        crate::scheduler::scheduler()
+            .spawn_blocking(move || {
+                index.add_multiple_docs_embeddings(&flat, &lens)?;
+                Ok::<_, ::common::Error>((index, count))
+            })
+            .await
     }
 
     /// Builds one PLAID index over the tensor documents of `table.column` from
@@ -9175,7 +9310,7 @@ impl Engine {
         if reuse.is_none() {
             sample.reserve(sample_limit * dims);
             let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-            self.for_each_tensor_doc(table, col, dims, skip, &mut |_seq, doc| {
+            self.for_each_tensor_doc(table, col, dims, skip, None, &mut |_seq, doc| {
                 for token in doc {
                     total += 1;
                     if token.len() != dims {
@@ -9198,7 +9333,7 @@ impl Engine {
                         }
                     }
                 }
-                true
+                DocStep::Continue
             })
             .await;
         }
@@ -9269,7 +9404,6 @@ impl Engine {
         let mut lens: Vec<u32> = Vec::new();
         let mut batch_tokens = 0usize;
         let mut docs = 0u32;
-        let mut failure: Option<Error> = None;
         // `PlaidIndexInMem::Update`'s outlier buffer: a document that sits
         // farther from the codec than the codec's own scale is buffered, and the
         // centroid set is expanded only when `PLAID_OUTLIER_BUFFER` of them have
@@ -9294,12 +9428,36 @@ impl Engine {
         // it beside the chunk (`rows_{id}.bin`) and a reload uses it instead of
         // re-deriving the rows from a document count.
         let mut rows: Vec<u64> = Vec::new();
-        self.for_each_tensor_doc(table, col, dims, skip, &mut |seq, doc| {
-            if doc.is_empty() {
-                return true;
-            }
-            rows.push(seq);
-            if batch_tokens > 0 && batch_tokens + doc.len() > batch_limit {
+        // One batch at a time, so the insert can be handed to the blocking pool
+        // between batches. The callback's job is only to fill the buffers and
+        // answer `Pause` when one is full: the insert itself is a ~149 ms CPU
+        // job (measured, 1024-dim, 8192 tokens) and must not run on a worker -
+        // the pool is sized to the cores, so a parked worker parks a task.
+        let mut resume: Option<WalkCursor> = None;
+        loop {
+            let ended = self
+                .for_each_tensor_doc(table, col, dims, skip, resume, &mut |seq, doc| {
+                    if doc.is_empty() {
+                        return DocStep::Continue;
+                    }
+                    // The fullness test comes before the bookkeeping, so a
+                    // document that does not fit leaves no trace: the walk
+                    // resumes at it and delivers it into the next batch. Doing
+                    // the push first duplicated it on every resume.
+                    if batch_tokens > 0 && batch_tokens + doc.len() > batch_limit {
+                        return DocStep::Pause;
+                    }
+                    rows.push(seq);
+                    for token in doc {
+                        flat.extend_from_slice(token);
+                    }
+                    lens.push(doc.len() as u32);
+                    batch_tokens += doc.len();
+                    DocStep::Continue
+                })
+                .await;
+            // Insert what the walk accumulated, whether it paused or finished.
+            if !lens.is_empty() {
                 if !probed && reuse.is_some() {
                     probed = true;
                     Self::absorb_plaid_outliers(
@@ -9310,31 +9468,23 @@ impl Engine {
                         threshold_sq,
                     );
                 }
-                if let Err(error) = index.add_multiple_docs_embeddings(&flat, &lens) {
-                    failure = Some(error);
-                    return false;
+                let (batch_flat, batch_lens) =
+                    (std::mem::take(&mut flat), std::mem::take(&mut lens));
+                match self.insert_plaid_batch(index, batch_flat, batch_lens).await {
+                    Ok((back, count)) => {
+                        index = back;
+                        docs += count;
+                    }
+                    Err(error) => return Err(error),
                 }
-                docs += lens.len() as u32;
-                flat.clear();
-                lens.clear();
                 batch_tokens = 0;
-                // No admission check here on purpose. The gate is at the
-                // statement entry (`execute_stmt`), which is the only place a
-                // refusal can still stop the allocation; by this point the
-                // batching buffers exist and the build has to finish or fail
-                // on its own. What holds the ceiling during a long build is
-                // the periodic `memory_tick`, not a check in this loop.
             }
-            for token in doc {
-                flat.extend_from_slice(token);
+            match ended {
+                WalkEnd::Paused(cursor) => {
+                    resume = Some(cursor);
+                }
+                WalkEnd::Finished => break,
             }
-            lens.push(doc.len() as u32);
-            batch_tokens += doc.len();
-            true
-        })
-        .await;
-        if let Some(error) = failure {
-            return Err(error);
         }
         if !lens.is_empty() {
             if !probed && reuse.is_some() {
