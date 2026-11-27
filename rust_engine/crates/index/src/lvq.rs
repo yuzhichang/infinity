@@ -119,15 +119,110 @@ unsafe impl Send for CodeMapper {}
 #[allow(unsafe_code)]
 unsafe impl Sync for CodeMapper {}
 
-/// One compressed vector: the C++ `LVQData<f32, pair<f32,f32>, i8>` record.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct LvqData {
+/// The 16-byte numeric prefix of a record: `scale`, `bias`, `local.0`,
+/// `local.1`, in that order and with no padding - the layout the file uses.
+///
+/// Referenced rather than copied for the same reason [`Code`] is: a loaded store
+/// holds 8.34M of these, so four owned `f32` fields are 334 MB of heap that the
+/// mapping already contains. `repr(C)` is what makes the reference sound; the
+/// file is written by `records_bytes`, which emits the four `to_le_bytes` in
+/// this order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct LvqHeader {
     pub scale: f32,
     pub bias: f32,
     /// `(norm1 * scale, norm2 * scale^2)` for L2, `(norm1 * scale,
     /// <mean, code> * scale)` for cosine/inner product.
-    pub local: (f32, f32),
+    pub local_0: f32,
+    pub local_1: f32,
+}
+
+impl LvqHeader {
+    pub fn local(&self) -> (f32, f32) {
+        (self.local_0, self.local_1)
+    }
+}
+
+/// One compressed vector: the C++ `LVQData<f32, pair<f32,f32>, i8>` record.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LvqData {
+    pub header: Header,
+    /// `(norm1 * scale, norm2 * scale^2)` for L2, `(norm1 * scale,
+    /// <mean, code> * scale)` for cosine/inner product, as `header.local()`.
     pub code: Code,
+}
+
+/// Where a record's numeric prefix lives: owned while a store is built, a
+/// window into the mapping once it is loaded.
+#[derive(Clone, Debug)]
+pub enum Header {
+    Owned(LvqHeader),
+    /// A window onto one record's 16-byte prefix in the mapping. Records are
+    /// `prefix || codes`, so the prefixes are not contiguous and cannot be cast
+    /// as one array; each record keeps its own pointer into the shared owner.
+    Mapped(HeaderMapper),
+}
+
+/// A `LvqHeader` window into the mapping that outlives the store.
+///
+/// SAFETY note: `_owner` keeps the pages mapped while `ptr` is reachable, the
+/// bytes are immutable (a chunk is published by rename), and the cast was
+/// checked by `bytemuck` in [`Self::new`].
+#[derive(Clone)]
+pub struct HeaderMapper {
+    _owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ptr: *const LvqHeader,
+}
+
+impl std::fmt::Debug for HeaderMapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeaderMapper").finish_non_exhaustive()
+    }
+}
+
+impl HeaderMapper {
+    fn new(owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>, bytes: &[u8]) -> Option<Self> {
+        // `LvqHeader` is `repr(C)` over four `f32`, so this is the same 16 bytes
+        // the file holds, and `bytemuck` requires the 4-byte alignment an
+        // `f32` needs.
+        let ptr = bytemuck::try_from_bytes::<LvqHeader>(bytes).ok()? as *const LvqHeader;
+        Some(Self { _owner: owner, ptr })
+    }
+
+    #[allow(unsafe_code)]
+    fn get(&self) -> &LvqHeader {
+        // SAFETY: see the type's note.
+        unsafe { &*self.ptr }
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for HeaderMapper {}
+#[allow(unsafe_code)]
+unsafe impl Sync for HeaderMapper {}
+
+impl Default for Header {
+    fn default() -> Self {
+        Self::Owned(LvqHeader::default())
+    }
+}
+
+impl PartialEq for Header {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::ops::Deref for Header {
+    type Target = LvqHeader;
+
+    fn deref(&self) -> &LvqHeader {
+        match self {
+            Self::Owned(h) => h,
+            Self::Mapped(m) => m.get(),
+        }
+    }
 }
 
 /// A compressed query: the reference's `LVQQuery`.
@@ -247,9 +342,12 @@ impl LvqStore {
         }
         let local = self.local_cache(&code, scale);
         let data = LvqData {
-            scale,
-            bias,
-            local,
+            header: Header::Owned(LvqHeader {
+                scale,
+                bias,
+                local_0: local.0,
+                local_1: local.1,
+            }),
             code: Code::Owned(code),
         };
         self.data.push(data);
@@ -344,9 +442,12 @@ impl LvqStore {
         let local = self.local_cache(&code, scale);
         LvqQuery {
             data: LvqData {
-                scale,
-                bias,
-                local,
+                header: Header::Owned(LvqHeader {
+                    scale,
+                    bias,
+                    local_0: local.0,
+                    local_1: local.1,
+                }),
                 code: Code::Owned(code),
             },
         }
@@ -360,7 +461,11 @@ impl LvqStore {
                 .as_slice()
                 .iter()
                 .enumerate()
-                .map(|(j, c)| f64::from(d.scale) * f64::from(*c) + f64::from(d.bias) + self.mean[j])
+                .map(|(j, c)| {
+                    f64::from(d.header.scale) * f64::from(*c)
+                        + f64::from(d.header.bias)
+                        + self.mean[j]
+                })
                 .collect(),
         )
     }
@@ -387,22 +492,22 @@ impl LvqStore {
         let ip = i8_ip_residual(q.code.as_slice(), v.code.as_slice());
         match self.metric {
             Metric::L2 => {
-                let beta = q.bias - v.bias;
-                q.local.1 + v.local.1 + beta * beta * self.dim as f32
-                    - 2.0 * q.scale * v.scale * ip as f32
-                    + 2.0 * beta * q.local.0
-                    - 2.0 * beta * v.local.0
+                let beta = q.header.bias - v.header.bias;
+                q.header.local_1 + v.header.local_1 + beta * beta * self.dim as f32
+                    - 2.0 * q.header.scale * v.header.scale * ip as f32
+                    + 2.0 * beta * q.header.local_0
+                    - 2.0 * beta * v.header.local_0
             }
             Metric::Ip | Metric::Cos => {
                 let (n1_mean, n2_mean) = self.global.unwrap_or((0.0, 0.0));
-                let dist = f64::from(q.scale) * f64::from(v.scale) * f64::from(ip)
-                    + f64::from(v.bias) * f64::from(q.local.0)
-                    + f64::from(q.bias) * f64::from(v.local.0)
-                    + self.dim as f64 * f64::from(q.bias) * f64::from(v.bias)
+                let dist = f64::from(q.header.scale) * f64::from(v.header.scale) * f64::from(ip)
+                    + f64::from(v.header.bias) * f64::from(q.header.local_0)
+                    + f64::from(q.header.bias) * f64::from(v.header.local_0)
+                    + self.dim as f64 * f64::from(q.header.bias) * f64::from(v.header.bias)
                     + n2_mean
-                    + (f64::from(q.bias) + f64::from(v.bias)) * n1_mean
-                    + f64::from(q.local.1)
-                    + f64::from(v.local.1);
+                    + (f64::from(q.header.bias) + f64::from(v.header.bias)) * n1_mean
+                    + f64::from(q.header.local_1)
+                    + f64::from(v.header.local_1);
                 -(dist as f32)
             }
         }
@@ -435,10 +540,10 @@ impl LvqStore {
     pub fn records_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len() * self.record_size());
         for d in &self.data {
-            out.extend_from_slice(&d.scale.to_le_bytes());
-            out.extend_from_slice(&d.bias.to_le_bytes());
-            out.extend_from_slice(&d.local.0.to_le_bytes());
-            out.extend_from_slice(&d.local.1.to_le_bytes());
+            out.extend_from_slice(&d.header.scale.to_le_bytes());
+            out.extend_from_slice(&d.header.bias.to_le_bytes());
+            out.extend_from_slice(&d.header.local_0.to_le_bytes());
+            out.extend_from_slice(&d.header.local_1.to_le_bytes());
             for c in d.code.as_slice() {
                 out.push(*c as u8);
             }
@@ -529,25 +634,29 @@ impl LvqStore {
         self.data.clear();
         self.data.reserve(n);
         for _ in 0..n {
-            let scale = f32::from_le_bytes(records[at..at + 4].try_into().ok()?);
-            let bias = f32::from_le_bytes(records[at + 4..at + 8].try_into().ok()?);
-            let l0 = f32::from_le_bytes(records[at + 8..at + 12].try_into().ok()?);
-            let l1 = f32::from_le_bytes(records[at + 12..at + 16].try_into().ok()?);
+            let prefix = &records[at..at + 16];
             at += 16;
             let raw = &records[at..at + self.dim];
             // `i8` accepts every alignment, so this cast cannot fail.
             let codes: &[i8] = bytemuck::cast_slice(raw);
-            let code = match &backing {
-                Some(owner) => Code::Mapped(CodeMapper::new(std::sync::Arc::clone(owner), codes)),
-                None => Code::Owned(codes.to_vec()),
-            };
             at += self.dim;
-            self.data.push(LvqData {
-                scale,
-                bias,
-                local: (l0, l1),
-                code,
-            });
+            // Both halves are windows onto the same record when a mapping is
+            // supplied: the 16-byte prefix is `repr(C)` over four `f32`, which
+            // is the layout the file writes, so reading it in place costs
+            // nothing and a store of 8.34M records holds no numeric fields of
+            // its own.
+            let (header, code) = match &backing {
+                Some(owner) => {
+                    let h = HeaderMapper::new(std::sync::Arc::clone(owner), prefix)?;
+                    let c = CodeMapper::new(std::sync::Arc::clone(owner), codes);
+                    (Header::Mapped(h), Code::Mapped(c))
+                }
+                None => {
+                    let h: LvqHeader = bytemuck::pod_read_unaligned(prefix);
+                    (Header::Owned(h), Code::Owned(codes.to_vec()))
+                }
+            };
+            self.data.push(LvqData { header, code });
         }
         Some(())
     }
@@ -808,8 +917,13 @@ mod tests {
                 mapped.data[i].code.as_slice(),
                 "vector {i} codes differ"
             );
-            assert_eq!(copied.data[i].scale, mapped.data[i].scale);
-            assert_eq!(copied.data[i].bias, mapped.data[i].bias);
+            // All four fields, not just the two that happen to be compared by
+            // the distance: `local_0`/`local_1` are at offsets 8 and 12, which
+            // is exactly where a wrong record stride would show up.
+            assert_eq!(
+                *copied.data[i].header, *mapped.data[i].header,
+                "vector {i} header differs"
+            );
             let q = mapped.make_query(&stored[i]);
             assert_eq!(
                 copied.distance(&q, i).unwrap(),
@@ -825,7 +939,7 @@ mod tests {
             .as_slice()
             .iter()
             .enumerate()
-            .map(|(j, c)| data.scale * f32::from(*c) + data.bias + mean[j] as f32)
+            .map(|(j, c)| data.header.scale * f32::from(*c) + data.header.bias + mean[j] as f32)
             .collect()
     }
 
