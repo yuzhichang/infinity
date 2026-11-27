@@ -9231,13 +9231,12 @@ impl Engine {
                 flat.clear();
                 lens.clear();
                 batch_tokens = 0;
-                // The process governor's lever, between batches: a build that
-                // is already at the ceiling must not keep growing. `forced`
-                // drops the page cache a scan filled in, which is the memory a
-                // bulk build would otherwise sit on top of.
-                if self.memory_pressure().refuses_new_work() {
-                    self.reclaim_memory_sync(0, true);
-                }
+                // No admission check here on purpose. The gate is at the
+                // statement entry (`execute_stmt`), which is the only place a
+                // refusal can still stop the allocation; by this point the
+                // batching buffers exist and the build has to finish or fail
+                // on its own. What holds the ceiling during a long build is
+                // the periodic `memory_tick`, not a check in this loop.
             }
             for token in doc {
                 flat.extend_from_slice(token);

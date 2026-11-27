@@ -572,10 +572,19 @@ impl super::Engine {
     /// most to redo - the SPANN handles' own page bookkeeping and the caches
     /// that are pure copies (results, plans, the whole-column vector cache an
     /// exact scan builds when it has no index).
-    /// Synchronous part of [`Self::reclaim_memory`]: allocator arenas, resident
-    /// mapped pages, SPANN bookkeeping, pure-copy caches, and unmapping idle
-    /// block mappings. Used directly from synchronous CPU loops.
-    pub(crate) fn reclaim_memory_sync(&self, want: u64, forced: bool) -> u64 {
+    /// The synchronous half of [`Self::reclaim_memory`]: allocator arenas,
+    /// resident mapped pages, SPANN bookkeeping, pure-copy caches, and unmapping
+    /// idle block mappings.
+    ///
+    /// It is not a complete pass, and it is not offered as one: the unsealed
+    /// drain (buffered rows and index tails) lives in the async caller, because
+    /// writing a block and sealing an index tail await. Anything that needs the
+    /// whole ladder must go through [`Self::reclaim_memory`].
+    ///
+    /// Private since the admission gate moved to the statement entry: no caller
+    /// outside this module runs a partial pass any more, and a single call site
+    /// keeps that visible.
+    fn reclaim_memory_sync(&self, want: u64, forced: bool) -> u64 {
         storage::trim_allocator();
         let mut released = storage::mapped::release_mapped_pages(want as usize) as u64;
         if forced {

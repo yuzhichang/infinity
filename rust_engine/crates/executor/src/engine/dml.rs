@@ -775,11 +775,13 @@ impl Engine {
         // not in the SQL layer, so every caller of this primitive - the SQL
         // `INSERT`, the Thrift RPC, the REST handler, `COPY` - gets the gate.
         self.ensure_writable()?;
-        // And the memory governor's admission, which the statement path applies
-        // at its entry (`execute_stmt`, before the plan is built): this
-        // primitive is reached directly by the RPC and the REST handler, so a
-        // direct insert has to be refused at the same ceiling - before the row
-        // range is allocated and before the WAL frame is written.
+        // And the memory governor's admission. The SQL path already applied it
+        // at `execute_stmt`, so this is the second check for a statement - but
+        // it is the *first and only* one for the direct callers: the Thrift
+        // `Insert` RPC and the REST handler reach this primitive without going
+        // through a statement at all. Re-checking costs a cached reading
+        // (`CHECK_INTERVAL_MS`), while omitting it would leave the two busiest
+        // write entry points ungoverned.
         self.admit_statement().await?;
         let meta = self
             .storage
