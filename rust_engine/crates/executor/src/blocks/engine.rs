@@ -9235,7 +9235,7 @@ impl Engine {
                 // is already at the ceiling must not keep growing. `forced`
                 // drops the page cache a scan filled in, which is the memory a
                 // bulk build would otherwise sit on top of.
-                if self.memory_pressure().blocks_writes() {
+                if self.memory_pressure().refuses_new_work() {
                     self.reclaim_memory_sync(0, true);
                 }
             }

@@ -1166,6 +1166,23 @@ pub(crate) fn cacheable_result(res: &QueryResult) -> bool {
     matches!(res, QueryResult::Rows { rows, .. } if rows.len() <= 4096)
 }
 
+/// True when a statement is a search: a `SELECT` carrying a `SEARCH` clause.
+///
+/// These are the reads the memory governor admits like writes. The distinction
+/// is allocation shape, not cost: a search builds a `top-k` heap and a candidate
+/// set per statement, which the reclaim ladder cannot see and cannot free, while
+/// a plain `SELECT` is bounded by the table and by its `LIMIT` and is what an
+/// operator reads the engine with when memory is already tight.
+pub(crate) fn is_search(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Select {
+            search: Some(_),
+            ..
+        }
+    )
+}
+
 /// True when a statement can change data or metadata and therefore invalidates
 /// cached `SELECT` results.
 pub(crate) fn invalidates_result_cache(stmt: &Statement) -> bool {

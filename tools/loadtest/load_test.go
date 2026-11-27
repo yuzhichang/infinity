@@ -105,14 +105,26 @@ func loadConfig(t *testing.T) config {
 	}
 }
 
+// connectionCount is how many Thrift clients a scenario opens: one per
+// connection, each blocking on its batch's response before sending the next.
+//
+// The multiplier follows the table count, because the engine's work per insert
+// is mostly per table (the catalog lookups and the index tail are per table,
+// the row encoding is per row) and a run with more tables keeps more of them
+// live at once. Measured on L: 32 clients (2x) left the server at 6.25 of 16
+// cores with sys+us at 46%, so the clients were the limit, not the engine.
+//
+// S/M/L/XL = 1/2/4/8.
 func connectionCount(scenario string, cpus int) int {
 	base := strings.SplitN(scenario, "/", 2)[0]
 	multiplier := 1
 	switch base {
-	case "L":
+	case "M":
 		multiplier = 2
+	case "L":
+		multiplier = 4
 	case "XL":
-		multiplier = 5
+		multiplier = 8
 	}
 	return max(1, cpus) * multiplier
 }
@@ -124,13 +136,14 @@ func TestConnectionCount(t *testing.T) {
 		want     int
 	}{
 		{"S", cpus},
-		{"M", cpus},
-		{"L", cpus * 2},
-		{"L/100", cpus * 2},
-		{"XL", cpus * 5},
-		{"XL/100", cpus * 5},
+		{"M", cpus * 2},
+		{"L", cpus * 4},
+		{"L/100", cpus * 4},
+		{"XL", cpus * 8},
+		{"XL/100", cpus * 8},
 		{"S:10x200", cpus},
-		{"L:10x200", cpus * 2},
+		{"M:10x200", cpus * 2},
+		{"L:10x200", cpus * 4},
 	}
 	for _, tc := range cases {
 		sc, err := parseScenario(tc.scenario)
@@ -141,8 +154,8 @@ func TestConnectionCount(t *testing.T) {
 			t.Errorf("connectionCount(%q, %d) = %d, want %d", sc.Name, cpus, got, tc.want)
 		}
 	}
-	if got := connectionCount("L", 0); got != 2 {
-		t.Errorf("connectionCount(\"L\", 0) = %d, want 2", got)
+	if got := connectionCount("L", 0); got != 4 {
+		t.Errorf("connectionCount(\"L\", 0) = %d, want 4", got)
 	}
 }
 

@@ -776,11 +776,11 @@ impl Engine {
         // `INSERT`, the Thrift RPC, the REST handler, `COPY` - gets the gate.
         self.ensure_writable()?;
         // And the memory governor's admission, which the statement path applies
-        // at the same point (`execute_statements`): this primitive is reached
-        // directly by the RPC and the REST handler, so a direct insert has to be
-        // refused at the same ceiling - before the row range is allocated and
-        // before the WAL frame is written.
-        self.admit_write().await?;
+        // at its entry (`execute_stmt`, before the plan is built): this
+        // primitive is reached directly by the RPC and the REST handler, so a
+        // direct insert has to be refused at the same ceiling - before the row
+        // range is allocated and before the WAL frame is written.
+        self.admit_statement().await?;
         let meta = self
             .storage
             .catalog

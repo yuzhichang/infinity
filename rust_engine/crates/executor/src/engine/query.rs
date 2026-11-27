@@ -575,10 +575,10 @@ impl Engine {
             // (`PhysicalFlush::Execute` does the same before its switch).
             if invalidates_result_cache(&qualified) {
                 self.ensure_writable()?;
-                // Backpressure, the same admission the direct insert primitives
-                // apply (`Engine::admit_write`): a statement is refused at the
-                // critical watermark, after one reclaim pass.
-                self.admit_write().await?;
+                // The memory admission for this statement is applied in
+                // `execute_stmt`, before the logical plan is built - one gate
+                // for every statement, rather than one here and another for the
+                // paths that never reach this loop.
             }
             // Result cache: `SELECT` results are reused verbatim when the cache
             // is active; any data-modifying statement invalidates it.
@@ -1138,6 +1138,23 @@ impl Engine {
     /// duration moves to the profile history when it returns — including on the
     /// error path, because the guard deregisters on drop.
     pub(crate) async fn execute_stmt(&self, stmt: &Statement, sql: &str) -> Result<QueryResult> {
+        // Admission, before anything about the statement is planned or
+        // allocated - `execute_stmt_inner` below is where the logical plan is
+        // built, and by then the binder has already materialised column lists,
+        // predicates and search parameters.
+        //
+        // This sits below `execute_statements` on purpose rather than being
+        // repeated per statement arm: every statement reaches here (the SQL
+        // path, the retrying wrapper, the internal builds that go through a
+        // `Statement`), so the ceiling is checked once, at the point where a
+        // refusal costs nothing.
+        //
+        // The class decides the gate: a write or a search reclaims and refuses
+        // (`admit_statement`); a plain `SELECT` does not, because it is what an
+        // operator reads the engine with while memory is already tight.
+        if invalidates_result_cache(stmt) || is_search(stmt) {
+            self.admit_statement().await?;
+        }
         let _query = self.begin_query(stmt, sql);
         // `NewTxnManager::BeginTxnShared`: a statement reads the state as of the
         // clock when it started, so a commit that lands while it runs is not

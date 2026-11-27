@@ -81,6 +81,38 @@ Use `uv` for package management.
 
 ## 4. Testing Instructions
 
+### Where test data goes: `.scratch/`, never `/tmp`
+
+Every directory a test creates — data dirs, WAL, snapshots, heap dumps, logs
+from a load run — goes under the repository's `.scratch/` (gitignored), one
+subdirectory per run, e.g. `.scratch/loadtest/L-2026-11-27/`.
+
+```bash
+mkdir -p .scratch/loadtest/L-2026-11-27
+```
+
+Three reasons, and the first two are not stylistic:
+
+- **`/tmp` shares a filesystem with the system.** Filling it stops the machine,
+  not just the test: a run that writes 129 GB into `/tmp` leaves the root
+  partition at 0 bytes and every later process fails with `No space left on
+  device`, including unrelated builds.
+- **A RAM-backed directory corrupts a memory measurement.** If the data dir is
+  on tmpfs, the pages the engine writes are page cache that the kernel cannot
+  evict to disk, so the process's resident size and the page cache stop being
+  separable. An RSS or ceiling experiment run that way measures the wrong
+  thing.
+- **It is where the earlier runs are.** `.scratch/` keeps a run's output next
+  to the repo, so a later investigation can compare against it instead of
+  re-running.
+
+`rust_engine/docs/MANUAL_ACCEPTANCE.md` states the same rule for manual
+acceptance runs (`.scratch/manual/<case>/`); this section extends it to every
+test and benchmark.
+
+Do not place start/stop scripts in `.scratch/` — they are one-shot and nobody
+else can reproduce them. Only the run's *output* belongs there.
+
 ### Unit Tests (C++)
 - **Build**: `ymake 1 d test_main` or `cmake --build cmake-build-debug --target test_main`
 - **Run**: `./cmake-build-debug/src/test_main`

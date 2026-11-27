@@ -1734,6 +1734,11 @@ impl Engine {
         // The optimize task only runs on a writable node
         // (`optimization_process_impl.cpp:174-185`).
         self.ensure_writable()?;
+        // An optimize rewrites every index chunk, which allocates on top of
+        // whatever the ingest already holds. It is a write for the purpose of
+        // the ceiling: admitting it while over the critical watermark is how a
+        // process that was merely close to the ceiling goes over it.
+        self.admit_statement().await?;
         // An optimize rewrites the index chunks; a dump that was staged before
         // it no longer matches the index state.
         self.index_epoch

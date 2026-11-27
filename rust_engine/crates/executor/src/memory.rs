@@ -50,12 +50,29 @@
 
 use std::sync::atomic::Ordering;
 
-/// Below this share of the ceiling nothing is touched.
+/// The share of the ceiling a reclaim pass aims to leave in use.
+///
+/// It is also the floor: below it nothing is touched. A pass stops here rather
+/// than at the high watermark because stopping at `high` reruns on the next
+/// tick and thrashes the working set.
+///
+/// 50% is deliberate headroom, not thrift. The governor is polled on a 1s tick
+/// (and `memory_pressure` reuses its verdict for 500ms), so between two ticks a
+/// burst of concurrent writers can allocate whatever their rate allows. Aiming
+/// at half the ceiling absorbs one tick's worth of that burst instead of
+/// discovering it at the high watermark and overshooting the ceiling before the
+/// next pass runs - measured: 64 clients at 16 GiB reached 20 GiB resident with
+/// a 70% reclaim target, and still 16.8 GiB with an 80% high watermark.
 pub(crate) const LOW_PERCENT: u64 = 70;
 /// Above this share a reclaim pass starts.
-pub(crate) const HIGH_PERCENT: u64 = 85;
+///
+/// 80 leaves a 10-point band to `critical` - the only room a burst has before
+/// writes are refused - while still using most of the ceiling. Lowering `low`
+/// further (to 50) kept RSS far below the ceiling, but it also meant the engine
+/// never used the memory it was given and paid for a reclaim pass every tick.
+pub(crate) const HIGH_PERCENT: u64 = 80;
 /// Above this share writes are refused once a pass has failed to get under it.
-pub(crate) const CRITICAL_PERCENT: u64 = 95;
+pub(crate) const CRITICAL_PERCENT: u64 = 90;
 
 /// The ceiling the process is governed by, and where it came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,12 +97,12 @@ pub(crate) enum Pressure {
     Ok,
     /// Over the high watermark: reclaim on the next tick.
     High,
-    /// Over the critical watermark: reclaim, and refuse new writes.
+    /// Over the critical watermark: reclaim, and refuse new statements.
     Critical,
 }
 
 impl Pressure {
-    pub(crate) fn blocks_writes(self) -> bool {
+    pub(crate) fn refuses_new_work(self) -> bool {
         matches!(self, Self::Critical)
     }
 
@@ -100,14 +117,21 @@ impl Pressure {
 
 /// How long a measured pressure is reused.
 ///
-/// The measurement is not free: on Linux it reads the cgroup's `memory.current`,
-/// and on macOS the resident size comes from `ps` (a fork per call). Throttling
-/// it is also correct - the watermarks are compared against a level that only
-/// moves over seconds, and the reclaim pass that follows a refusal measures
-/// again anyway.
-const CHECK_INTERVAL_MS: u64 = 500;
+/// The measurement is not free: on Linux it reads the cgroup's `memory.current`
+/// (or `/proc/self/status` under a configured ceiling), and on macOS the
+/// resident size comes from `ps` - a fork per call. Throttling keeps that off
+/// every write.
+///
+/// 200ms is the compromise between two measurements. At 500ms a burst of 64
+/// clients crossed from below `high` to above the ceiling inside one cached
+/// window, so the write gate admitted exactly the allocations it exists to stop
+/// (RSS reached 16.8 GiB against a 16 GiB ceiling). Measuring on every write
+/// instead removed the staleness but stat'ed `/proc` once per batch. At 200ms
+/// the window is five times shorter than the 1s tick that reclaims, so a burst
+/// can overshoot by at most a fifth of a tick's allocation.
+const CHECK_INTERVAL_MS: u64 = 200;
 
-/// The message [`Engine::admit_write`] refuses with. One constant, because a
+/// The message [`Engine::admit_statement`] refuses with. One constant, because a
 /// batched insert recognises the refusal by it ([`Engine::is_admission_refusal`]).
 pub(crate) const ADMISSION_REFUSED: &str = "memory limit exceeded";
 
@@ -715,16 +739,37 @@ impl super::Engine {
     /// only the statement path: the Thrift `Insert` RPC, the REST handler and
     /// `COPY` insert through the primitives in `dml`, which never pass through
     /// `execute_statements`.
-    /// Whether `error` is the refusal [`Self::admit_write`] makes, as opposed to
-    /// any other `Error::Invalid` a write can return. A batched insert asks so it
-    /// can tell "nothing was written" from "the batches before this one are
-    /// durable".
+    /// Whether `error` is the refusal [`Self::admit_statement`] makes, as opposed
+    /// to any other `Error::Invalid` a statement can return. A batched insert
+    /// asks so it can tell "nothing was written" from "the batches before this
+    /// one are durable".
     pub(crate) fn is_admission_refusal(error: &::common::Error) -> bool {
         matches!(error, ::common::Error::Invalid(message) if message.starts_with(ADMISSION_REFUSED))
     }
 
-    pub(crate) async fn admit_write(&self) -> ::common::Result<()> {
-        if !self.memory_pressure().blocks_writes() {
+    /// Admission for one statement, read or write.
+    ///
+    /// It is not only writes that allocate beyond the reclaim ladder's reach.
+    /// A search builds a `top-k` heap and a candidate set per statement; a
+    /// plain `SELECT` materialises its result set. Neither is a block mapping
+    /// or an unsealed table, so neither is released when the ceiling is hit -
+    /// which makes either one a way for a process already near the ceiling to
+    /// go past it. The caller decides which statements are subject to this
+    /// (`execute_stmt`), so the name states what it does rather than who calls
+    /// it.
+    pub(crate) async fn admit_statement(&self) -> ::common::Result<()> {
+        // The cached verdict, reused for at most `CHECK_INTERVAL_MS` (200ms).
+        //
+        // Measuring on every statement was tried and works, but it costs a
+        // `/proc/self/status` read per 1024-row batch for a figure that moves
+        // over hundreds of milliseconds. Shortening the window instead keeps
+        // that read off the statement path while staying well inside the 1s
+        // tick that reclaims: a burst can overshoot by a fifth of what it could
+        // before, rather than by a full tick.
+        //
+        // The loop below re-measures after each pass, so a stale reading costs
+        // at most one reclaim attempt, never a missed refusal.
+        if !self.memory_pressure().refuses_new_work() {
             return Ok(());
         }
         // Reclaim now; if memory is actively draining (released > 0 or RSS is
@@ -745,7 +790,7 @@ impl super::Engine {
             self.context
                 .memory_ceiling_generation
                 .store(generation, Ordering::Relaxed);
-            if !after.blocks_writes() {
+            if !after.refuses_new_work() {
                 return Ok(());
             }
             if attempt == 4 || (released == 0 && after_usage >= before) {
@@ -827,6 +872,55 @@ impl super::Engine {
 mod tests {
     use super::*;
 
+    /// The cached verdict expires, so a burst cannot hide behind it forever.
+    ///
+    /// `admit_statement` reads the cache (see `CHECK_INTERVAL_MS` for why it is not
+    /// measured per write), and the guarantee it needs is that the cache is
+    /// short-lived enough to see a burst. This pins that the window is bounded
+    /// and that a verdict older than it is re-measured rather than reused.
+    #[tokio::test]
+    async fn a_pressure_verdict_expires_after_the_configured_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = super::super::Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+        e.execute("CREATE TABLE stale (id INT);").await.unwrap();
+
+        // A fresh measurement is `Critical`, and it is what gets cached.
+        e.set_memory_limit(1);
+        assert_eq!(e.memory_pressure(), Pressure::Critical);
+
+        // Poison the cache with a verdict that would admit the write, but leave
+        // it inside the window: this is the case the cache is *allowed* to serve,
+        // and it must be reclaimed by the loop below rather than trusted.
+        e.context
+            .memory_pressure_level
+            .store(Pressure::Ok as u8, Ordering::Relaxed);
+        e.context
+            .memory_checked_at
+            .store(elapsed_millis(), Ordering::Relaxed);
+
+        // Past the window the verdict is dropped and measured again, which is
+        // what keeps a burst from hiding behind a stale `Ok`.
+        e.context.memory_checked_at.store(
+            elapsed_millis().saturating_sub(CHECK_INTERVAL_MS + 1),
+            Ordering::Relaxed,
+        );
+        assert_eq!(
+            e.memory_pressure(),
+            Pressure::Critical,
+            "an expired verdict must be re-measured, not reused"
+        );
+
+        // And the gate refuses once the verdict is current again.
+        let err = e
+            .execute("INSERT INTO stale VALUES (1);")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("memory limit exceeded"), "{err}");
+    }
+
     /// A ceiling below the working set is the one case the levers cannot fix, so
     /// it is the one that decides the process's fate: writes are refused (the
     /// front end renders that as an error) while reads keep working.
@@ -840,7 +934,7 @@ mod tests {
         // One byte: every pass runs the levers and still cannot get under it,
         // which is exactly the state that must not take the process down.
         e.set_memory_limit(1);
-        assert!(e.memory_pressure().blocks_writes());
+        assert!(e.memory_pressure().refuses_new_work());
         let _ = e.memory_tick().await;
         assert_eq!(
             e.context.memory_reclaim_passes.load(Ordering::Relaxed),
@@ -853,8 +947,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("memory limit exceeded"), "{err}");
-        // Reads allocate nothing new and stay available under the same ceiling.
+        // A plain `SELECT` still answers: it is what an operator reads the
+        // process with while it is in trouble, and its result set is bounded by
+        // the table and the `LIMIT`. Only a search is admitted like a write.
         e.execute("SELECT COUNT(*) FROM meml;").await.unwrap();
+    }
+
+    /// A search is refused at the critical watermark; a plain `SELECT` is not.
+    ///
+    /// The two allocate differently. A search builds a `top-k` heap and a
+    /// candidate set per statement, neither of which the reclaim ladder can see
+    /// or free, so starting one while over the watermark is how a process that
+    /// was already at the ceiling goes past it. A plain `SELECT` is bounded by
+    /// its table and is the instrument an operator uses to look at a process in
+    /// trouble - refusing it would take that away exactly when it is needed.
+    #[tokio::test]
+    async fn a_search_is_refused_at_the_critical_watermark_but_a_select_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = super::super::Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+        e.execute("CREATE TABLE mems (id INT, v EMBEDDING(4));")
+            .await
+            .unwrap();
+        e.set_memory_limit(1);
+
+        // A search carries a `SEARCH` clause, so it is admitted like a write.
+        let err = e
+            .execute(
+                "SELECT id FROM mems SEARCH MATCH VECTOR (v, [0.1, 0.2, 0.3, 0.4], 'float', 'l2', 3)",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("memory limit exceeded"), "{err}");
+
+        // A plain aggregate does not.
+        e.execute("SELECT COUNT(*) FROM mems;").await.unwrap();
     }
 
     /// A pass that cannot release enough by advising pages has to drop the
@@ -1120,13 +1249,15 @@ mod tests {
     #[test]
     fn watermarks_follow_the_ceiling_and_the_kernels_soft_limit() {
         let (low, high, critical) = watermarks(1000, None);
-        assert_eq!((low, high, critical), (700, 850, 950));
-        let (low, high, critical) = watermarks(1000, Some(800));
-        assert_eq!((low, high, critical), (700, 800, 950));
-        // A `memory.high` outside (low, critical) is not a watermark this engine
-        // can use, so the percentage stands.
-        assert_eq!(watermarks(1000, Some(990)).1, 850);
-        assert_eq!(watermarks(1000, Some(100)).1, 850);
+        assert_eq!((low, high, critical), (700, 800, 900));
+        // A kernel soft limit inside (low, critical) replaces the percentage.
+        let (low, high, critical) = watermarks(1000, Some(850));
+        assert_eq!((low, high, critical), (700, 850, 900));
+        // Outside that open interval it is not a watermark this engine can use,
+        // so the percentage stands: 700 is the floor, not a valid high mark.
+        assert_eq!(watermarks(1000, Some(990)).1, 800);
+        assert_eq!(watermarks(1000, Some(700)).1, 800);
+        assert_eq!(watermarks(1000, Some(100)).1, 800);
     }
 
     fn a_hundred() -> u64 {
