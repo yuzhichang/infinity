@@ -69,6 +69,203 @@ impl Code {
     }
 }
 
+/// The mean vector: owned while building, a window once loaded.
+#[derive(Clone, Debug)]
+pub enum MeanVec {
+    Owned(Vec<f64>),
+    Mapped(MappedF64s),
+}
+
+impl PartialEq for MeanVec {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::ops::Deref for MeanVec {
+    type Target = [f64];
+
+    fn deref(&self) -> &[f64] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(m) => m,
+        }
+    }
+}
+
+/// A `f64` array window into a mapping that outlives its owner.
+///
+/// The mean vector: `dim` `f64`s, which the chunk stores as those doubles.
+#[derive(Clone)]
+pub struct MappedF64s {
+    _owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ptr: *const f64,
+    len: usize,
+}
+
+impl std::fmt::Debug for MappedF64s {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedF64s")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MappedF64s {
+    pub fn new(owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>, bytes: &[u8]) -> Option<Self> {
+        let v: &[f64] = bytemuck::try_cast_slice(bytes).ok()?;
+        Some(Self {
+            _owner: owner,
+            ptr: v.as_ptr(),
+            len: v.len(),
+        })
+    }
+}
+
+#[allow(unsafe_code)]
+impl std::ops::Deref for MappedF64s {
+    type Target = [f64];
+
+    fn deref(&self) -> &[f64] {
+        // SAFETY: `_owner` keeps the mapping alive for `&self`; the bytes are
+        // immutable; `ptr`/`len` were checked by `bytemuck`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for MappedF64s {}
+#[allow(unsafe_code)]
+unsafe impl Sync for MappedF64s {}
+
+/// An `f32` array window into a mapping that outlives its owner.
+///
+/// `Deref<Target = [f32]>`; the point is that a store loaded from a chunk reads
+/// the matrix and centroid it was trained with instead of decoding them.
+#[derive(Clone)]
+pub struct MappedF32s {
+    _owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ptr: *const f32,
+    len: usize,
+}
+
+impl std::fmt::Debug for MappedF32s {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedF32s")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MappedF32s {
+    /// A window over `bytes`, which must be `f32`s inside `owner`'s mapping.
+    /// `None` for a misaligned buffer, which is what `bytemuck` rejects.
+    pub fn new(owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>, bytes: &[u8]) -> Option<Self> {
+        let floats: &[f32] = bytemuck::try_cast_slice(bytes).ok()?;
+        Some(Self {
+            _owner: owner,
+            ptr: floats.as_ptr(),
+            len: floats.len(),
+        })
+    }
+}
+
+#[allow(unsafe_code)]
+impl std::ops::Deref for MappedF32s {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        // SAFETY: `_owner` keeps the mapping alive for `&self`; the bytes are
+        // immutable; `ptr`/`len` were checked by `bytemuck`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for MappedF32s {}
+#[allow(unsafe_code)]
+unsafe impl Sync for MappedF32s {}
+
+/// RaBitQ's sign bits: one `u8` per eight dimensions.
+///
+/// Owned while a store is built; a window into the chunk mapping once loaded -
+/// the bits need no decoding, so that is the whole cost of a load.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CodeBytes {
+    Owned(Vec<u8>),
+    Mapped(CodeByteWindow),
+}
+
+impl Default for CodeBytes {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl std::ops::Deref for CodeBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl CodeBytes {
+    pub fn owned(bytes: Vec<u8>) -> Self {
+        Self::Owned(bytes)
+    }
+
+    pub fn mapped(owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>, bytes: &[u8]) -> Self {
+        Self::Mapped(CodeByteWindow {
+            _owner: owner,
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(m) => m.as_slice(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CodeByteWindow {
+    _owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl std::fmt::Debug for CodeByteWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodeByteWindow")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for CodeByteWindow {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl CodeByteWindow {
+    #[allow(unsafe_code)]
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `_owner` keeps the mapping alive for `&self`, and the bytes
+        // are immutable.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for CodeByteWindow {}
+#[allow(unsafe_code)]
+unsafe impl Sync for CodeByteWindow {}
+
 /// An `i8` window into a mapping that outlives the store.
 ///
 /// SAFETY note: `_owner` keeps the pages mapped for as long as `ptr` is
@@ -243,8 +440,9 @@ pub struct LvqStore {
     dim: usize,
     metric: Metric,
     normalize: bool,
-    /// `MeanType` in the reference is `double`.
-    mean: Vec<f64>,
+    /// `MeanType` in the reference is `double`. A window into the chunk mapping
+    /// once loaded.
+    mean: MeanVec,
     /// `(sum(mean), sum(mean^2))`, used by cosine/inner product.
     global: Option<(f64, f64)>,
     data: Records,
@@ -352,7 +550,7 @@ impl LvqStore {
             dim,
             metric,
             normalize,
-            mean,
+            mean: MeanVec::Owned(mean),
             global,
             data: Records::Owned(Vec::new()),
         }
@@ -495,7 +693,7 @@ impl LvqStore {
         for m in &mut mean {
             *m /= n;
         }
-        self.mean = mean;
+        self.mean = MeanVec::Owned(mean);
         self.global = match self.metric {
             Metric::L2 => None,
             Metric::Ip | Metric::Cos => Some(global_cache(&self.mean)),
@@ -617,7 +815,7 @@ impl LvqStore {
     pub fn meta_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + 8 * self.dim + 16);
         out.extend_from_slice(&(self.dim as u64).to_le_bytes());
-        for m in &self.mean {
+        for m in self.mean.iter() {
             out.extend_from_slice(&m.to_le_bytes());
         }
         if let Some((a, b)) = self.global {
@@ -660,6 +858,16 @@ impl LvqStore {
 
     /// Loads the meta blob alone (C++ `LoadFromPtr`).
     pub fn from_meta(metric: Metric, normalize: bool, bytes: &[u8]) -> Option<(Self, usize)> {
+        Self::from_meta_with(metric, normalize, bytes, None)
+    }
+
+    /// [`Self::from_meta`] borrowing the mean from `backing`.
+    pub fn from_meta_with(
+        metric: Metric,
+        normalize: bool,
+        bytes: &[u8],
+        mean_backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    ) -> Option<(Self, usize)> {
         if bytes.len() < 8 {
             return None;
         }
@@ -669,12 +877,7 @@ impl LvqStore {
         if bytes.len() < at + mean_bytes {
             return None;
         }
-        let mut mean = Vec::with_capacity(dim);
-        for i in 0..dim {
-            mean.push(f64::from_le_bytes(
-                bytes[at + i * 8..at + i * 8 + 8].try_into().ok()?,
-            ));
-        }
+        let mean_bytes_slice = bytes.get(at..at + mean_bytes)?;
         at += mean_bytes;
         let global = match metric {
             Metric::L2 => None,
@@ -696,6 +899,17 @@ impl LvqStore {
                 at += 8;
                 Some((f64::from(a), f64::from(b)))
             }
+        };
+        let mean = match mean_backing {
+            Some(owner) => MeanVec::Mapped(MappedF64s::new(owner, mean_bytes_slice)?),
+            None => MeanVec::Owned(
+                mean_bytes_slice
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| f64::from_le_bytes(*c))
+                    .collect(),
+            ),
         };
         Some((
             Self {
@@ -778,7 +992,7 @@ impl LvqStore {
         backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
         n: usize,
     ) -> Option<Self> {
-        let (mut store, _) = Self::from_meta(metric, normalize, meta)?;
+        let (mut store, _) = Self::from_meta_with(metric, normalize, meta, backing.clone())?;
         store.load_records(records, backing, n)?;
         Some(store)
     }
@@ -800,7 +1014,7 @@ impl LvqStore {
 fn global_cache(mean: &[f64]) -> (f64, f64) {
     let mut n1 = 0.0;
     let mut n2 = 0.0;
-    for m in mean {
+    for m in mean.iter() {
         n1 += m;
         n2 += m * m;
     }

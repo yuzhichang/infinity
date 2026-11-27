@@ -42,8 +42,9 @@ pub struct RabitqData {
     pub sum: f32,
     /// `<bar{o}, o>`: the quantization error factor.
     pub error: f32,
-    /// One sign bit per dimension, LSB first.
-    pub code: Vec<u8>,
+    /// One sign bit per dimension, LSB first. A window into the chunk mapping
+    /// once loaded; owned while building.
+    pub code: crate::lvq::CodeBytes,
 }
 
 /// One quantized query: C++ `RabitqQueryData<f32, u8>`.
@@ -131,10 +132,130 @@ fn inverse_rotate(v: &[f32], rot: &[f32], dim: usize) -> Vec<f32> {
 pub struct RabitqStore {
     origin_dim: usize,
     dim: usize,
-    rom: Vec<f32>,
-    rot_centroid: Vec<f32>,
+    /// The rotation matrix (`dim x dim` `f32`, 4 MB at dims=1024). `Mapped`
+    /// when loaded from a chunk, where the bytes already are those floats.
+    rom: LvqVec,
+    rot_centroid: LvqVec,
     metric: Metric,
-    data: Vec<RabitqData>,
+    data: Records,
+}
+
+/// A `f32` array that is either owned or a window into a chunk mapping.
+///
+/// `Deref<Target = [f32]>`, so every reader is unchanged.
+#[derive(Clone, Debug)]
+pub enum LvqVec {
+    Owned(Vec<f32>),
+    Mapped(crate::lvq::MappedF32s),
+}
+
+impl Default for LvqVec {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl PartialEq for LvqVec {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::ops::Deref for LvqVec {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(m) => m,
+        }
+    }
+}
+
+/// The compressed records of a store: owned while building, addressed by offset
+/// once loaded.
+///
+/// Every record is `16 + dim / 8` bytes, so record `i` starts at
+/// `i * record_size`. Holding a `Vec<RabitqData>` instead meant a heap `Vec<u8>`
+/// per vector for codes that are already in the file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Records {
+    Owned(Vec<RabitqData>),
+    Mapped(MappedRecords),
+}
+
+#[derive(Clone)]
+pub struct MappedRecords {
+    owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    at: usize,
+    record_size: usize,
+    code_len: usize,
+    n: usize,
+}
+
+impl std::fmt::Debug for MappedRecords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedRecords")
+            .field("n", &self.n)
+            .field("record_size", &self.record_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for MappedRecords {
+    fn eq(&self, other: &Self) -> bool {
+        self.n == other.n
+            && self.record_size == other.record_size
+            && self.code_len == other.code_len
+    }
+}
+
+impl MappedRecords {
+    fn record(&self, index: usize) -> Option<RabitqData> {
+        if index >= self.n {
+            return None;
+        }
+        let bytes = self.owner.as_ref().as_ref();
+        let start = self.at + index * self.record_size;
+        let head = bytes.get(start..start + 16)?;
+        let code_at = start + 16;
+        let code_bytes = bytes.get(code_at..code_at + self.code_len)?;
+        let read = |o: usize| f32::from_le_bytes(head[o..o + 4].try_into().unwrap());
+        Some(RabitqData {
+            raw_norm: read(0),
+            norm: read(4),
+            sum: read(8),
+            error: read(12),
+            code: crate::lvq::CodeBytes::mapped(std::sync::Arc::clone(&self.owner), code_bytes),
+        })
+    }
+}
+
+impl Records {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(v) => v.len(),
+            Self::Mapped(m) => m.n,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, index: usize) -> Option<RabitqData> {
+        match self {
+            Self::Owned(v) => v.get(index).cloned(),
+            Self::Mapped(m) => m.record(index),
+        }
+    }
+
+    fn as_owned(&self) -> Option<&[RabitqData]> {
+        match self {
+            Self::Owned(v) => Some(v),
+            Self::Mapped(_) => None,
+        }
+    }
 }
 
 impl RabitqStore {
@@ -144,10 +265,10 @@ impl RabitqStore {
         Self {
             origin_dim,
             dim,
-            rom: random_orthogonal_matrix(dim, seed),
-            rot_centroid: vec![0.0f32; dim],
+            rom: LvqVec::Owned(random_orthogonal_matrix(dim, seed)),
+            rot_centroid: LvqVec::Owned(vec![0.0f32; dim]),
             metric,
-            data: Vec::new(),
+            data: Records::Owned(Vec::new()),
         }
     }
 
@@ -179,8 +300,13 @@ impl RabitqStore {
         &self.rot_centroid
     }
 
-    pub fn data(&self) -> &[RabitqData] {
-        &self.data
+    /// The record at `index`, from wherever it lives.
+    pub fn record(&self, index: usize) -> Option<RabitqData> {
+        self.data.get(index)
+    }
+
+    pub fn data(&self) -> Option<&[RabitqData]> {
+        self.data.as_owned()
     }
 
     /// Bytes one compressed vector occupies (C++ `compress_data_size`).
@@ -211,27 +337,27 @@ impl RabitqStore {
         for c in &mut centroid {
             *c /= n;
         }
-        self.rot_centroid = rotate(&centroid, &self.rom, self.dim);
+        self.rot_centroid = LvqVec::Owned(rotate(&centroid, &self.rom, self.dim));
     }
 
     /// C++ `RabitqVecStoreMeta::Optimize`: the rotated centroid is the mean of
     /// the raw vectors, rotated; then the store is (re)compressed.
     pub fn build(&mut self, vectors: &[Vec<f32>]) {
         self.train(vectors);
-        self.data.clear();
+        self.data = Records::Owned(Vec::new());
         for v in vectors {
             self.compress(v);
         }
     }
 
     /// C++ `CompressToCode`.
-    pub fn compress(&mut self, v: &[f32]) -> &RabitqData {
+    pub fn compress(&mut self, v: &[f32]) -> RabitqData {
         let src = self.padded(v);
         let raw_norm: f32 = src.iter().map(|x| x * x).sum();
         let mut rot = rotate(&src, &self.rom, self.dim);
         let mut norm: f32 = rot
             .iter()
-            .zip(&self.rot_centroid)
+            .zip(self.rot_centroid.iter())
             .map(|(a, b)| (a - b) * (a - b))
             .sum();
         norm = if is_approx_zero(norm) {
@@ -239,7 +365,7 @@ impl RabitqStore {
         } else {
             norm.sqrt()
         };
-        for (r, c) in rot.iter_mut().zip(&self.rot_centroid) {
+        for (r, c) in rot.iter_mut().zip(self.rot_centroid.iter()) {
             *r = (*r - *c) / norm;
         }
         let mut code = vec![0u8; self.dim / 8];
@@ -258,14 +384,20 @@ impl RabitqStore {
             error += x_i * *x;
         }
         error = if is_approx_zero(error) { 0.8 } else { error };
-        self.data.push(RabitqData {
+        let record = RabitqData {
             raw_norm,
             norm,
             sum,
             error,
-            code,
-        });
-        self.data.last().unwrap()
+            code: crate::lvq::CodeBytes::owned(code),
+        };
+        match &mut self.data {
+            Records::Owned(v) => {
+                v.push(record);
+                v.last().unwrap().clone()
+            }
+            Records::Mapped(_) => unreachable!("compress into a mapped Rabitq store"),
+        }
     }
 
     /// C++ `CompressToQuery`.
@@ -275,7 +407,7 @@ impl RabitqStore {
         let mut rot = rotate(&src, &self.rom, self.dim);
         let mut norm: f32 = rot
             .iter()
-            .zip(&self.rot_centroid)
+            .zip(self.rot_centroid.iter())
             .map(|(a, b)| (a - b) * (a - b))
             .sum();
         norm = if is_approx_zero(norm) {
@@ -283,7 +415,7 @@ impl RabitqStore {
         } else {
             norm.sqrt()
         };
-        for (r, c) in rot.iter_mut().zip(&self.rot_centroid) {
+        for (r, c) in rot.iter_mut().zip(self.rot_centroid.iter()) {
             *r = (*r - *c) / norm;
         }
         let mut lower_bound = f32::MAX;
@@ -352,7 +484,7 @@ impl RabitqStore {
     /// The RaBitQ distance used by the HNSW graph (smaller is closer).
     pub fn distance(&self, query: &RabitqQuery, index: usize) -> Option<f32> {
         let base = self.data.get(index)?;
-        let estimate = Self::ip_estimate(query, base, self.dim);
+        let estimate = Self::ip_estimate(query, &base, self.dim);
         let ip = Self::recover_ip(
             estimate,
             self.dim,
@@ -393,7 +525,7 @@ impl RabitqStore {
             let bit = (d.code[j / 8] >> (j % 8)) & 1;
             *r = if bit == 1 { inv_sqrt_d } else { -inv_sqrt_d };
         }
-        for (r, c) in rot.iter_mut().zip(&self.rot_centroid) {
+        for (r, c) in rot.iter_mut().zip(self.rot_centroid.iter()) {
             *r = *r * d.norm + *c;
         }
         Some(inverse_rotate(&rot, &self.rom, self.dim))
@@ -403,10 +535,10 @@ impl RabitqStore {
     pub fn meta_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + 4 * self.dim * self.dim + 4 * self.dim);
         out.extend_from_slice(&(self.origin_dim as u64).to_le_bytes());
-        for x in &self.rom {
+        for x in self.rom.iter() {
             out.extend_from_slice(&x.to_le_bytes());
         }
-        for x in &self.rot_centroid {
+        for x in self.rot_centroid.iter() {
             out.extend_from_slice(&x.to_le_bytes());
         }
         out
@@ -415,12 +547,12 @@ impl RabitqStore {
     /// C++ `Inner::Save`: the per-vector records.
     pub fn records_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len() * self.record_size());
-        for d in &self.data {
+        for d in self.data.as_owned().unwrap_or(&[]) {
             out.extend_from_slice(&d.raw_norm.to_le_bytes());
             out.extend_from_slice(&d.norm.to_le_bytes());
             out.extend_from_slice(&d.sum.to_le_bytes());
             out.extend_from_slice(&d.error.to_le_bytes());
-            out.extend_from_slice(&d.code);
+            out.extend_from_slice(d.code.as_slice());
         }
         out
     }
@@ -434,6 +566,20 @@ impl RabitqStore {
 
     /// Loads the meta blob (C++ `LoadFromPtr`).
     pub fn from_meta(metric: Metric, bytes: &[u8]) -> Option<(Self, usize)> {
+        Self::from_meta_with(metric, bytes, None)
+    }
+
+    /// [`Self::from_meta`] borrowing the matrix and centroid from `backing`
+    /// instead of decoding them.
+    ///
+    /// `rom` is `dim * dim` `f32` (4 MB at dims=1024) and the chunk stores it as
+    /// those floats, so a load has nothing to decode. Without a backing (the
+    /// builder, the tests) the same bytes are copied out.
+    pub fn from_meta_with(
+        metric: Metric,
+        bytes: &[u8],
+        backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    ) -> Option<(Self, usize)> {
         if bytes.len() < 8 {
             return None;
         }
@@ -443,20 +589,32 @@ impl RabitqStore {
         if bytes.len() < at + 4 * dim * dim + 4 * dim {
             return None;
         }
-        let mut rom = Vec::with_capacity(dim * dim);
-        for i in 0..dim * dim {
-            rom.push(f32::from_le_bytes(
-                bytes[at + i * 4..at + i * 4 + 4].try_into().ok()?,
-            ));
-        }
+        let rom_bytes = bytes.get(at..at + 4 * dim * dim)?;
         at += 4 * dim * dim;
-        let mut rot_centroid = Vec::with_capacity(dim);
-        for i in 0..dim {
-            rot_centroid.push(f32::from_le_bytes(
-                bytes[at + i * 4..at + i * 4 + 4].try_into().ok()?,
-            ));
-        }
+        let centroid_bytes = bytes.get(at..at + 4 * dim)?;
         at += 4 * dim;
+        let (rom, rot_centroid) = match backing {
+            Some(owner) => (
+                LvqVec::Mapped(crate::lvq::MappedF32s::new(
+                    std::sync::Arc::clone(&owner),
+                    rom_bytes,
+                )?),
+                LvqVec::Mapped(crate::lvq::MappedF32s::new(owner, centroid_bytes)?),
+            ),
+            None => {
+                let decode = |b: &[u8]| -> Vec<f32> {
+                    b.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect()
+                };
+                (
+                    LvqVec::Owned(decode(rom_bytes)),
+                    LvqVec::Owned(decode(centroid_bytes)),
+                )
+            }
+        };
         Some((
             Self {
                 origin_dim,
@@ -464,43 +622,79 @@ impl RabitqStore {
                 rom,
                 rot_centroid,
                 metric,
-                data: Vec::new(),
+                data: Records::Owned(Vec::new()),
             },
             at,
         ))
     }
 
     /// Loads the per-vector records into an existing meta.
-    pub fn load_records(&mut self, records: &[u8], n: usize) -> Option<()> {
+    ///
+    /// With `backing`, nothing is read here: `Records::Mapped` keeps the offset
+    /// and the stride, and `record(i)` builds the window when one is asked for.
+    /// That is what a loaded store holds - five numbers instead of a heap
+    /// `Vec<u8>` per vector.
+    pub fn load_records(
+        &mut self,
+        records: &[u8],
+        backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
+        n: usize,
+    ) -> Option<()> {
         let record = self.record_size();
         if records.len() < n * record {
             return None;
         }
-        let mut at = 0;
-        self.data.clear();
-        for _ in 0..n {
-            let raw_norm = f32::from_le_bytes(records[at..at + 4].try_into().ok()?);
-            let norm = f32::from_le_bytes(records[at + 4..at + 8].try_into().ok()?);
-            let sum = f32::from_le_bytes(records[at + 8..at + 12].try_into().ok()?);
-            let error = f32::from_le_bytes(records[at + 12..at + 16].try_into().ok()?);
-            at += 16;
-            let code = records[at..at + self.dim / 8].to_vec();
-            at += self.dim / 8;
-            self.data.push(RabitqData {
-                raw_norm,
-                norm,
-                sum,
-                error,
-                code,
+        if let Some(owner) = backing {
+            let base = owner.as_ref().as_ref().as_ptr() as usize;
+            let at = records.as_ptr() as usize - base;
+            self.data = Records::Mapped(MappedRecords {
+                owner,
+                at,
+                record_size: record,
+                code_len: self.dim / 8,
+                n,
             });
+            return Some(());
+        }
+        self.data = Records::Owned(Vec::with_capacity(n));
+        let mut at = 0;
+        for _ in 0..n {
+            let read =
+                |o: usize| f32::from_le_bytes(records[at + o..at + o + 4].try_into().unwrap());
+            let record_val = RabitqData {
+                raw_norm: read(0),
+                norm: read(4),
+                sum: read(8),
+                error: read(12),
+                code: crate::lvq::CodeBytes::owned(
+                    records[at + 16..at + 16 + self.dim / 8].to_vec(),
+                ),
+            };
+            at += record;
+            match &mut self.data {
+                Records::Owned(v) => v.push(record_val),
+                Records::Mapped(_) => unreachable!("just assigned"),
+            }
         }
         Some(())
     }
 
     /// Loads a complete store from the meta and record blobs.
     pub fn from_parts(metric: Metric, meta: &[u8], records: &[u8], n: usize) -> Option<Self> {
-        let (mut store, _) = Self::from_meta(metric, meta)?;
-        store.load_records(records, n)?;
+        Self::from_parts_with(metric, meta, records, None, n)
+    }
+
+    /// [`Self::from_parts`] borrowing both the meta and the records from
+    /// `backing`.
+    pub fn from_parts_with(
+        metric: Metric,
+        meta: &[u8],
+        records: &[u8],
+        backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
+        n: usize,
+    ) -> Option<Self> {
+        let (mut store, _) = Self::from_meta_with(metric, meta, backing.clone())?;
+        store.load_records(records, backing, n)?;
         Some(store)
     }
 
@@ -508,13 +702,68 @@ impl RabitqStore {
     pub fn from_bytes(metric: Metric, bytes: &[u8], n: usize) -> Option<(Self, usize)> {
         let (mut store, at) = Self::from_meta(metric, bytes)?;
         let record = store.record_size();
-        store.load_records(&bytes[at..], n)?;
+        store.load_records(&bytes[at..], None, n)?;
         Some((store, at + n * record))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The mapped load must agree with the copied one on every field and every
+    /// distance.
+    ///
+    /// The mapped path is what a loaded index takes (three windows: the
+    /// rotation matrix, the centroid, and each record's sign bits), and the
+    /// copied path is what the builder and the other tests take. A divergence
+    /// would still produce a distance - just the wrong one.
+    #[test]
+    fn mapped_load_matches_the_copied_one() {
+        let mut rng = Rng(17);
+        let dim = 64usize;
+        let vectors: Vec<Vec<f32>> = (0..64).map(|_| rng.vector(dim, 0.0, 1.0)).collect();
+        let mut built = RabitqStore::new(dim, Metric::L2, 31);
+        built.build(&vectors);
+        let meta = built.meta_bytes();
+        let records = built.records_bytes();
+
+        let copied =
+            RabitqStore::from_parts(Metric::L2, &meta, &records, vectors.len()).expect("copied");
+        let owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> =
+            std::sync::Arc::new(records.clone());
+        let mapped = RabitqStore::from_parts_with(
+            Metric::L2,
+            &meta,
+            owner.as_ref().as_ref(),
+            Some(std::sync::Arc::clone(&owner)),
+            vectors.len(),
+        )
+        .expect("mapped");
+
+        assert_eq!(copied.rom().len(), mapped.rom().len());
+        assert_eq!(*copied.rom(), *mapped.rom(), "rotation matrix differs");
+        assert_eq!(
+            *copied.rot_centroid(),
+            *mapped.rot_centroid(),
+            "centroid differs"
+        );
+
+        let q = mapped.make_query(&vectors[0]);
+        for i in 0..vectors.len() {
+            let c = copied.record(i).expect("copied record");
+            let m = mapped.record(i).expect("mapped record");
+            assert_eq!(c.raw_norm, m.raw_norm, "record {i} raw_norm");
+            assert_eq!(c.norm, m.norm, "record {i} norm");
+            assert_eq!(c.sum, m.sum, "record {i} sum");
+            assert_eq!(c.error, m.error, "record {i} error");
+            assert_eq!(c.code.as_slice(), m.code.as_slice(), "record {i} code");
+            assert_eq!(
+                copied.distance(&q, i).unwrap(),
+                mapped.distance(&q, i).unwrap(),
+                "record {i} distance"
+            );
+        }
+    }
+
     use super::*;
 
     struct Rng(u64);
@@ -595,7 +844,7 @@ mod tests {
         store.build(&vectors);
         assert_eq!(store.len(), VEC_N);
         assert_eq!(store.dim(), 128);
-        for (i, record) in store.data().iter().enumerate() {
+        for (i, record) in store.data().expect("owned").iter().enumerate() {
             assert_eq!(record.code.len(), store.dim() / 8);
             let mut sum = 0usize;
             for d in 0..store.dim() {
@@ -725,7 +974,7 @@ mod tests {
             *x /= qn;
         }
         for (i, v) in vectors.iter().enumerate().take(256) {
-            let data = &store.data()[i];
+            let data = &store.data().expect("owned")[i];
             let inv_sqrt_d = 1.0 / (dim as f32).sqrt();
             let mut ip_bar = 0.0f32;
             for d in 0..dim {

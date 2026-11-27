@@ -1819,10 +1819,11 @@ impl HnswIndex {
                     Metric::Ip => crate::rabitq::Metric::Ip,
                     Metric::Cos => crate::rabitq::Metric::Cos,
                 };
-                Store::Rabitq(crate::rabitq::RabitqStore::from_parts(
+                Store::Rabitq(crate::rabitq::RabitqStore::from_parts_with(
                     rabitq_metric,
                     meta,
                     records,
+                    backing,
                     n,
                 )?)
             }
