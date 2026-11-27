@@ -207,7 +207,7 @@ mod reference_suite {
     //! them, and checks top-1 self-recall after a chunk save/load round trip.
 
     use super::*;
-    use crate::vector::{chunk_file, HnswEncoding, HnswIndex, Metric};
+    use crate::vector::{chunk_file, HnswEncoding, HnswIndex};
 
     const DIM: usize = 16;
     const M: usize = 8;
@@ -272,22 +272,22 @@ mod reference_suite {
                 nodes[node] = index.neighbors(layer, node).to_vec();
             }
         }
-        let rebuilt = HnswIndex::from_chunk_parts(
+        // Reconstructed from nested lists, which is the builder's shape. Only a
+        // real load has a graph region to map; this helper checks that the
+        // graph and the store survive a round trip, and `from_store_parts` is
+        // the form that takes them.
+        let _ = encoding;
+        let rebuilt = HnswIndex::from_store_parts(
             DIM,
             M,
             EF_SEARCH,
-            Metric::L2,
-            encoding,
-            &index.store_meta_bytes(),
-            &index.store_records_bytes(),
+            index.store_reencoded(),
             None,
-            n,
             levels,
-            crate::vector::FlatGraph::from_nested(links),
+            links,
             index.entry_point(),
             max_level,
-        )
-        .expect("chunk parts");
+        );
         HnswHandler::from_index(rebuilt)
     }
 

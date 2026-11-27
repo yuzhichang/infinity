@@ -773,52 +773,182 @@ impl Store {
 }
 
 /// Flat CSR-like adjacency list for one layer of an immutable/loaded graph.
-/// A chunk's graph region as flat arrays: `offsets[layer][node]` indexes into
-/// `neighbors[layer]`.
+/// A loaded graph's adjacency: the chunk's graph region, read in place.
 ///
-/// The same shape as `storage::knn_format::FlatGraphRegion`, declared here
-/// because `index` does not depend on `storage`; the loader converts one to the
-/// other by moving the arrays.
-pub struct FlatGraph {
-    pub offsets: Vec<Vec<u32>>,
-    pub neighbors: Vec<Vec<u32>>,
+/// The region is `layer_sum(u64) | vertex records | upper-layer records`, and a
+/// vertex's neighbour range follows from its record offset and the strides. So
+/// this holds the mapping and those few numbers, and `get` casts the range out
+/// of the bytes - no `Vec<Vec<u32>>` of offsets, no `Vec<Vec<u32>>` of
+/// neighbours, nothing to copy. The adjacency is 534 MB on the L scenario.
+///
+/// A building graph keeps its neighbours in `Vec<u32>` behind a lock instead
+/// (`HnswIndex::links`); the two are kept apart because only the loaded one can
+/// be read-only.
+pub struct MappedGraph {
+    backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    /// Offset of the graph region inside the mapping.
+    region_at: usize,
+    /// `sizeof(VertexL0) + 4 * mmax0`.
+    l0_stride: usize,
+    /// `sizeof(VertexLX) + 4 * mmax`.
+    lx_stride: usize,
+    /// Offset of the first upper-layer record **within the region**.
+    upper_at: usize,
+    vertex_count: usize,
+    max_layer: usize,
 }
 
-impl FlatGraph {
-    /// Widens a builder's nested adjacency into the CSR. The remaining copy
-    /// path in this file, and only for callers that start from nested lists
-    /// (the builder and the tests) - a loaded chunk arrives already flat.
-    pub fn from_nested(links: Vec<Vec<Vec<usize>>>) -> Self {
-        let mut offsets = Vec::with_capacity(links.len());
-        let mut neighbors = Vec::with_capacity(links.len());
-        for layer in &links {
-            let mut layer_offsets = Vec::with_capacity(layer.len() + 1);
-            layer_offsets.push(0u32);
-            let mut layer_neighbors: Vec<u32> =
-                Vec::with_capacity(layer.iter().map(Vec::len).sum());
-            for nbs in layer {
-                layer_neighbors.extend(nbs.iter().map(|&n| n as u32));
-                layer_offsets.push(layer_neighbors.len() as u32);
-            }
-            offsets.push(layer_offsets);
-            neighbors.push(layer_neighbors);
+impl MappedGraph {
+    /// A geometry that names no records, for a caller that only wants the
+    /// vectors out of a chunk.
+    pub fn empty() -> Self {
+        Self {
+            backing: std::sync::Arc::new(Vec::<u8>::new()),
+            region_at: 0,
+            l0_stride: 0,
+            lx_stride: 0,
+            upper_at: 0,
+            vertex_count: 0,
+            max_layer: 0,
         }
-        Self { offsets, neighbors }
+    }
+
+    /// A window over a chunk's graph region, which starts at `region_at` in
+    /// `backing`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+        region_at: usize,
+        l0_stride: usize,
+        lx_stride: usize,
+        upper_at: usize,
+        vertex_count: usize,
+        max_layer: usize,
+    ) -> Self {
+        Self {
+            backing,
+            region_at,
+            l0_stride,
+            lx_stride,
+            upper_at,
+            vertex_count,
+            max_layer,
+        }
+    }
+
+    pub fn vertex_count(&self) -> usize {
+        self.vertex_count
+    }
+
+    pub fn max_layer(&self) -> usize {
+        self.max_layer
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.backing.as_ref().as_ref()[self.region_at..]
+    }
+
+    /// `GetNeighbors` for one vertex and layer, borrowed from the mapping.
+    ///
+    /// Level 0 and the upper layers have the same record shape - an `i32` count
+    /// then that many `u32` ids - so one routine covers both; only the record
+    /// offset differs.
+    fn get(&self, layer: usize, node: usize) -> Option<&[u32]> {
+        let bytes = self.bytes();
+        let record = if layer == 0 {
+            8 + node.checked_mul(self.l0_stride)?
+        } else {
+            let at = 8 + node.checked_mul(self.l0_stride)?;
+            let layer_count =
+                i32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?).max(0) as usize;
+            if layer > layer_count {
+                return None;
+            }
+            let layers_p =
+                u64::from_le_bytes(bytes.get(at + 8..at + 16)?.try_into().ok()?) as usize;
+            self.upper_at + layers_p + (layer - 1) * self.lx_stride
+        };
+        // The count sits after a 4-byte (level 0: 20-byte) header; see
+        // `encode_graph_region` for the exact layout.
+        let count_at = if layer == 0 { record + 16 } else { record };
+        let count =
+            i32::from_le_bytes(bytes.get(count_at..count_at + 4)?.try_into().ok()?).max(0) as usize;
+        let ids_at = count_at + 4;
+        let raw = bytes.get(ids_at..ids_at.checked_add(count * 4)?)?;
+        // `u32` accepts every alignment, so this cast cannot fail.
+        Some(bytemuck::cast_slice(raw))
     }
 }
 
+/// A loaded graph's adjacency: mapped (a chunk) or owned (built in memory).
+enum GraphLinks {
+    Mapped(MappedGraph),
+    Owned(Vec<FlatLayer>),
+}
+
+impl GraphLinks {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Mapped(_) => false,
+            Self::Owned(v) => v.is_empty(),
+        }
+    }
+
+    /// The neighbour list for `layer`/`node`, borrowed from wherever it lives.
+    fn get(&self, layer: usize, node: usize) -> Option<&[u32]> {
+        match self {
+            Self::Mapped(m) => m.get(layer, node),
+            Self::Owned(layers) => layers.get(layer).and_then(|l| l.get(node)),
+        }
+    }
+
+    fn layer_count(&self) -> usize {
+        match self {
+            Self::Mapped(m) => m.max_layer + 1,
+            Self::Owned(v) => v.len(),
+        }
+    }
+
+    /// The graph as nested lists. Only serializing needs this, and a mapped
+    /// graph is serialized by copying its region instead (see `save`).
+    fn to_nested(&self) -> Vec<Vec<Vec<usize>>> {
+        match self {
+            Self::Mapped(m) => (0..m.max_layer + 1)
+                .map(|layer| {
+                    (0..m.vertex_count)
+                        .map(|node| {
+                            m.get(layer, node)
+                                .map(|l| l.iter().map(|&n| n as usize).collect())
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .collect(),
+            Self::Owned(layers) => layers
+                .iter()
+                .map(|l| {
+                    (0..l.len())
+                        .map(|node| {
+                            l.get(node)
+                                .map(|s| s.iter().map(|&n| n as usize).collect())
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A built graph's adjacency for one layer: the CSR the builder produces.
 struct FlatLayer {
-    /// `offsets[node]..offsets[node + 1]` is the node's neighbor range in
-    /// `neighbors`. `u32` because that is what a chunk stores and what a node
-    /// id is; `usize` doubled the adjacency for no gain.
     offsets: Vec<u32>,
     neighbors: Vec<u32>,
 }
 
 impl FlatLayer {
-    /// The builder's shape: nested lists widened into the CSR. This is the one
-    /// path that still copies, because the builder produces nested lists; a
-    /// loaded chunk takes the CSR as it is.
+    /// The builder's shape: nested lists widened into the CSR. Only the builder
+    /// takes this path; a loaded chunk reads its adjacency out of the mapping.
     fn from_nested(layer: &[Vec<usize>]) -> Self {
         let total: usize = layer.iter().map(Vec::len).sum();
         let mut offsets = Vec::with_capacity(layer.len() + 1);
@@ -865,7 +995,7 @@ pub struct HnswIndex {
     links: Vec<Vec<std::sync::RwLock<Vec<u32>>>>,
     /// Lock-free flat adjacency lists for loaded/sealed graphs (`from_store_parts`).
     /// When non-empty, `links` is empty and searches read without taking any lock.
-    flat_links: Vec<FlatLayer>,
+    flat_links: GraphLinks,
     entry: Option<usize>,
     max_level: usize,
     rng: Rng,
@@ -931,7 +1061,7 @@ impl HnswIndex {
             lsg: None,
             levels: Vec::new(),
             links: Vec::new(),
-            flat_links: Vec::new(),
+            flat_links: GraphLinks::Owned(Vec::new()),
             entry: None,
             max_level: 0,
             rng: Rng::new(0x9E37_79B9_7F4A_7C15),
@@ -1065,7 +1195,7 @@ impl HnswIndex {
         f: impl FnOnce(&[u32]) -> R,
     ) -> R {
         if !self.flat_links.is_empty() {
-            return match self.flat_links.get(layer).and_then(|l| l.get(node)) {
+            return match self.flat_links.get(layer, node) {
                 Some(list) => f(list),
                 None => f(&[]),
             };
@@ -1127,9 +1257,9 @@ impl HnswIndex {
             Ok(())
         };
         if !self.flat_links.is_empty() {
-            for (layer, flat) in self.flat_links.iter().enumerate() {
-                for node in 0..flat.len() {
-                    if let Some(neighbors) = flat.get(node) {
+            for layer in 0..self.flat_links.layer_count() {
+                for node in 0..self.store.len() {
+                    if let Some(neighbors) = self.flat_links.get(layer, node) {
                         check_node(layer, node, neighbors)?;
                     }
                 }
@@ -1188,11 +1318,15 @@ impl HnswIndex {
         }
         put_u64(&mut out, self.entry.map_or(u64::MAX, |entry| entry as u64));
         if !self.flat_links.is_empty() {
-            put_u64(&mut out, self.flat_links.len() as u64);
-            for layer in &self.flat_links {
-                put_u64(&mut out, layer.len() as u64);
-                for node in 0..layer.len() {
-                    let neighbors = layer.get(node).unwrap_or(&[]);
+            put_u64(&mut out, self.flat_links.layer_count() as u64);
+            for layer in 0..self.flat_links.layer_count() {
+                let count = match &self.flat_links {
+                    GraphLinks::Mapped(m) => m.vertex_count,
+                    GraphLinks::Owned(v) => v[layer].len(),
+                };
+                put_u64(&mut out, count as u64);
+                for node in 0..count {
+                    let neighbors = self.flat_links.get(layer, node).unwrap_or(&[]);
                     put_u64(&mut out, neighbors.len() as u64);
                     for &neighbor in neighbors {
                         out.extend_from_slice(&(neighbor as u32).to_le_bytes());
@@ -1359,10 +1493,12 @@ impl HnswIndex {
                 }
             }
         }
-        let flat_links = links
-            .iter()
-            .map(|layer| FlatLayer::from_nested(layer))
-            .collect();
+        let flat_links = GraphLinks::Owned(
+            links
+                .iter()
+                .map(|layer| FlatLayer::from_nested(layer))
+                .collect(),
+        );
         Self {
             dims,
             m,
@@ -1393,7 +1529,7 @@ impl HnswIndex {
         ef_search: usize,
         store: Store,
         levels: Vec<usize>,
-        graph: FlatGraph,
+        graph: MappedGraph,
         entry: Option<usize>,
         max_level: usize,
     ) -> Self {
@@ -1407,12 +1543,7 @@ impl HnswIndex {
             lsg: None,
             levels,
             links: Vec::new(),
-            flat_links: graph
-                .offsets
-                .into_iter()
-                .zip(graph.neighbors)
-                .map(|(offsets, neighbors)| FlatLayer { offsets, neighbors })
-                .collect(),
+            flat_links: GraphLinks::Mapped(graph),
             entry,
             max_level,
             rng: Rng::new(0x9E37_79B9_7F4A_7C15),
@@ -1423,15 +1554,22 @@ impl HnswIndex {
         if self.flat_links.is_empty() {
             return;
         }
+        // Materializes the adjacency into mutable lists: a loaded graph has to
+        // become writable before it can be appended to. This is a build-time
+        // conversion, not a load - the loaded form stays mapped until something
+        // actually writes.
         self.links = self
             .flat_links
-            .drain(..)
-            .map(|flat| {
-                (0..flat.len())
-                    .map(|node| std::sync::RwLock::new(flat.get(node).unwrap_or(&[]).to_vec()))
+            .to_nested()
+            .into_iter()
+            .map(|layer| {
+                layer
+                    .into_iter()
+                    .map(|nbs| std::sync::RwLock::new(nbs.into_iter().map(|n| n as u32).collect()))
                     .collect()
             })
             .collect();
+        self.flat_links = GraphLinks::Owned(Vec::new());
     }
 
     /// C++ `KnnHnsw::CompressToLVQ`: re-encode the stored vectors with an LVQ
@@ -1530,6 +1668,54 @@ impl HnswIndex {
         }
     }
 
+    /// The store re-encoded at the same encoding, for a test that rebuilds an
+    /// index from decoded parts. Re-encoding rather than copying keeps the
+    /// variant the caller asserted on (a `Lvq` index stays `Lvq`); production
+    /// never calls this.
+    pub fn store_reencoded(&self) -> Store {
+        let rows: Vec<Vec<f32>> = (0..self.store.len())
+            .map(|i| self.store.decompress(i))
+            .collect();
+        let metric = self.store.metric();
+        match &self.store {
+            Store::Plain { .. } => Store::Plain {
+                metric,
+                data: PlainVecs::from_rows(self.dims, rows),
+            },
+            Store::Lvq(_) => {
+                let mut s = crate::lvq::LvqStore::new(
+                    self.dims,
+                    match metric {
+                        Metric::L2 => crate::lvq::Metric::L2,
+                        Metric::Ip => crate::lvq::Metric::Ip,
+                        Metric::Cos => crate::lvq::Metric::Cos,
+                    },
+                    metric == Metric::Cos,
+                );
+                for row in &rows {
+                    s.compress(row);
+                }
+                Store::Lvq(s)
+            }
+            Store::Rabitq(_) => {
+                let mut s = crate::rabitq::RabitqStore::new(
+                    self.dims,
+                    match metric {
+                        Metric::L2 => crate::rabitq::Metric::L2,
+                        Metric::Ip => crate::rabitq::Metric::Ip,
+                        Metric::Cos => crate::rabitq::Metric::Cos,
+                    },
+                    0x5EED,
+                );
+                for row in &rows {
+                    s.compress(row);
+                }
+                Store::Rabitq(s)
+            }
+            Store::SparseIp { .. } => Store::SparseIp { data: Vec::new() },
+        }
+    }
+
     /// C++ `KnnHnsw::GetSizeInBytes` (`hnsw_alg.cppm:89`): the serialized size
     /// of the graph — the vec-store meta, the vector records, the graph
     /// records, the per-vertex levels and the labels, plus the header fields.
@@ -1540,12 +1726,11 @@ impl HnswIndex {
         let labels = self.len() * std::mem::size_of::<u64>();
         let levels = self.levels.len() * std::mem::size_of::<usize>();
         let graph: usize = if !self.flat_links.is_empty() {
-            self.flat_links
-                .iter()
+            (0..self.flat_links.layer_count())
                 .map(|layer| {
-                    (0..layer.len())
+                    (0..self.len())
                         .map(|node| {
-                            let nbs = layer.get(node).unwrap_or(&[]);
+                            let nbs = self.flat_links.get(layer, node).unwrap_or(&[]);
                             std::mem::size_of::<u32>() + nbs.len() * std::mem::size_of::<u32>()
                         })
                         .sum::<usize>()
@@ -1588,7 +1773,7 @@ impl HnswIndex {
         // The chunk's CSR adjacency, taken as decoded. Routing it through
         // `Vec<Vec<Vec<usize>>>` (what a builder produces) meant one `Vec` per
         // vertex and two copies of every neighbour on load.
-        graph: FlatGraph,
+        graph: MappedGraph,
         entry: Option<usize>,
         max_level: usize,
     ) -> Option<Self> {
@@ -2016,12 +2201,12 @@ impl HnswIndex {
         let mut cur = start;
         let mut cur_d = self.distance_query(q, self_id, cur);
         if !self.flat_links.is_empty() {
-            let Some(flat_layer) = self.flat_links.get(layer) else {
+            if layer >= self.flat_links.layer_count() {
                 return cur;
-            };
+            }
             loop {
                 let mut changed = false;
-                if let Some(list) = flat_layer.get(cur) {
+                if let Some(list) = self.flat_links.get(layer, cur) {
                     for &nb in list.iter().rev() {
                         let nb = nb as usize;
                         let d = self.distance_query(q, self_id, nb);
@@ -2143,7 +2328,7 @@ impl HnswIndex {
             result.push(Cand(ep_d, ep));
         }
 
-        let flat_layer = self.flat_links.get(layer);
+        let mapped = !self.flat_links.is_empty();
         while let Some(Reverse(Cand(cd, c))) = candidate.pop() {
             // `result` is a max-heap under `CompareMax`, so its root is the
             // worst kept entry: `result_handler.GetDistance0(0)`.
@@ -2152,8 +2337,8 @@ impl HnswIndex {
                 break;
             }
             to_visit.clear();
-            if let Some(flat) = flat_layer {
-                let Some(list) = flat.get(c) else {
+            if mapped {
+                let Some(list) = self.flat_links.get(layer, c) else {
                     continue;
                 };
                 for &nb in list {
@@ -2211,10 +2396,15 @@ impl HnswIndex {
         let data = self.store.mem_bytes();
         let levels = self.levels.capacity() * std::mem::size_of::<usize>();
         let links: usize = if !self.flat_links.is_empty() {
-            self.flat_links
-                .iter()
-                .map(|layer| (layer.offsets.capacity() + layer.neighbors.capacity()) * 8)
-                .sum()
+            // A mapped graph owns nothing but its few numbers; an owned one is
+            // the builder's CSR.
+            match &self.flat_links {
+                GraphLinks::Mapped(_) => 0,
+                GraphLinks::Owned(v) => v
+                    .iter()
+                    .map(|layer| (layer.offsets.capacity() + layer.neighbors.capacity()) * 4)
+                    .sum(),
+            }
         } else {
             self.links
                 .iter()
@@ -2465,22 +2655,59 @@ pub(crate) mod chunk_file {
             }
         }
         assert_eq!(reader.pos, reader.bytes.len(), "trailing HNSW bytes");
-        HnswIndex::from_chunk_parts(
-            dims,
-            m,
-            ef_search,
-            metric,
-            encoding,
-            &meta,
-            &records,
-            None,
-            n,
-            levels,
-            crate::vector::FlatGraph::from_nested(links),
-            entry,
-            max_level,
+        // The test reconstructions start from nested lists, which is the
+        // builder's shape; only a real load has a graph region to map.
+        // Decoded per encoding: the file stores each store's own record layout,
+        // so a plain `f32` decode is only right for `Plain`.
+        let store = match encoding {
+            HnswEncoding::Plain => super::Store::Plain {
+                metric,
+                data: super::PlainVecs::from_rows(
+                    dims,
+                    (0..n)
+                        .map(|i| {
+                            records[i * dims * 4..(i + 1) * dims * 4]
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|c| f32::from_le_bytes(*c))
+                                .collect()
+                        })
+                        .collect(),
+                ),
+            },
+            HnswEncoding::Lvq => super::Store::Lvq(
+                crate::lvq::LvqStore::from_parts(
+                    match metric {
+                        Metric::L2 => crate::lvq::Metric::L2,
+                        Metric::Ip => crate::lvq::Metric::Ip,
+                        Metric::Cos => crate::lvq::Metric::Cos,
+                    },
+                    metric == Metric::Cos,
+                    &meta,
+                    &records,
+                    None,
+                    n,
+                )
+                .expect("lvq store"),
+            ),
+            HnswEncoding::Rabitq => super::Store::Rabitq(
+                crate::rabitq::RabitqStore::from_parts(
+                    match metric {
+                        Metric::L2 => crate::rabitq::Metric::L2,
+                        Metric::Ip => crate::rabitq::Metric::Ip,
+                        Metric::Cos => crate::rabitq::Metric::Cos,
+                    },
+                    &meta,
+                    &records,
+                    n,
+                )
+                .expect("rabitq store"),
+            ),
+        };
+        HnswIndex::from_store_parts(
+            dims, m, ef_search, store, None, levels, links, entry, max_level,
         )
-        .expect("chunk parts")
     }
 }
 
@@ -2832,22 +3059,67 @@ mod reference_suite {
                 at[node] = index.neighbors(layer, node).to_vec();
             }
         }
-        HnswIndex::from_chunk_parts(
+        // Decoded from the bytes `store_meta_bytes`/`store_records_bytes` just
+        // produced, which is what a load does. Re-encoding the vectors instead
+        // would retrain a quantizer (RaBitQ's rotation is seeded), so the
+        // round trip has to read the file's own bytes.
+        let store = match encoding {
+            HnswEncoding::Plain => Store::Plain {
+                metric,
+                data: PlainVecs::from_rows(
+                    DIM,
+                    (0..index.len())
+                        .map(|i| {
+                            records[i * DIM * 4..(i + 1) * DIM * 4]
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|c| f32::from_le_bytes(*c))
+                                .collect()
+                        })
+                        .collect(),
+                ),
+            },
+            HnswEncoding::Lvq => Store::Lvq(
+                crate::lvq::LvqStore::from_parts(
+                    match metric {
+                        Metric::L2 => crate::lvq::Metric::L2,
+                        Metric::Ip => crate::lvq::Metric::Ip,
+                        Metric::Cos => crate::lvq::Metric::Cos,
+                    },
+                    metric == Metric::Cos,
+                    &meta,
+                    &records,
+                    None,
+                    index.len(),
+                )
+                .expect("lvq store"),
+            ),
+            HnswEncoding::Rabitq => Store::Rabitq(
+                crate::rabitq::RabitqStore::from_parts(
+                    match metric {
+                        Metric::L2 => crate::rabitq::Metric::L2,
+                        Metric::Ip => crate::rabitq::Metric::Ip,
+                        Metric::Cos => crate::rabitq::Metric::Cos,
+                    },
+                    &meta,
+                    &records,
+                    index.len(),
+                )
+                .expect("rabitq store"),
+            ),
+        };
+        HnswIndex::from_store_parts(
             DIM,
             M,
             EF_SEARCH,
-            metric,
-            encoding,
-            &meta,
-            &records,
+            store,
             None,
-            index.len(),
             levels,
-            FlatGraph::from_nested(links),
+            links,
             index.entry_point(),
             max_level,
         )
-        .expect("chunk parts")
     }
 
     /// C++: `HnswAlgTest.test_lvq_3` (LVQ save/load, top-1 recall ≥ 0.95).

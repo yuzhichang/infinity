@@ -7887,11 +7887,10 @@ impl Engine {
             Some(backing.clone()),
             parts.n,
             Vec::new(),
-            // Reading the vectors only; the graph is not consulted.
-            index::vector::FlatGraph {
-                offsets: Vec::new(),
-                neighbors: Vec::new(),
-            },
+            // Reading the vectors only; the graph is not consulted. A zeroed
+            // geometry names no records, so `MappedGraph::get` returns `None`
+            // for every node.
+            index::vector::MappedGraph::empty(),
             None,
             0,
         )
@@ -7938,7 +7937,7 @@ impl Engine {
             knn_format::VERTEX_LX_SIZE,
         )
         .ok()?;
-        let graph = knn_format::decode_graph_region_flat(
+        let graph = knn_format::graph_geometry(
             chunk.graph,
             chunk.cur_vec_num as usize,
             chunk.mmax0,
@@ -7955,6 +7954,7 @@ impl Engine {
             store_meta: chunk.store_meta,
             records: chunk.vectors,
             graph,
+            graph_at: chunk.graph_at,
             labels: chunk.labels,
             options,
         })
@@ -7974,23 +7974,30 @@ impl Engine {
         // Each vertex's level is how many upper layers it appears in: the CSR
         // offsets for layer 0 count every vertex, so the level is one less than
         // the number of layers whose offset grew at this node.
+        // The chunk has no level array: a vertex's level is how many upper
+        // layers its record reaches, which the geometry can answer from the
+        // mapping directly.
         let levels: Vec<usize> = (0..parts.n)
             .map(|node| {
-                (1..parts.graph.offsets.len())
-                    .filter(|&l| parts.graph.offsets[l][node + 1] > parts.graph.offsets[l][node])
-                    .count()
+                let bytes = backing.as_ref().as_ref();
+                let mut level = 0usize;
+                while parts
+                    .graph
+                    .upper_record(node, level + 1, &bytes[parts.graph_at..])
+                    .is_some()
+                {
+                    level += 1;
+                }
+                level
             })
             .collect();
         let entry = parts.enterpoint.map(|e| e.min(parts.n.saturating_sub(1)));
         // The flat region is already the CSR the index searches with, so it is
         // moved straight in. Rebuilding a nested `Vec<Vec<Vec<usize>>>` here
         // allocated one `Vec` per vertex and copied every neighbour twice.
-        let graph_bytes: usize = parts
-            .graph
-            .neighbors
-            .iter()
-            .map(|neighbors| neighbors.len() * 4 + 24)
-            .sum();
+        // The adjacency is mapped, not held, so it costs no heap; the figure is
+        // only for the buffer budget's accounting.
+        let graph_bytes = parts.graph.len;
         let bytes = parts.records.len() + parts.labels.len() * 4 + levels.len() * 8 + graph_bytes;
         let index = HnswIndex::from_chunk_parts(
             parts.dims,
@@ -8003,10 +8010,15 @@ impl Engine {
             Some(backing.clone()),
             parts.n,
             levels,
-            index::vector::FlatGraph {
-                offsets: parts.graph.offsets,
-                neighbors: parts.graph.neighbors,
-            },
+            index::vector::MappedGraph::new(
+                backing.clone(),
+                parts.graph_at,
+                parts.graph.l0_stride,
+                parts.graph.lx_stride,
+                parts.graph.upper_at,
+                parts.graph.vertex_count,
+                parts.graph.max_layer,
+            ),
             entry,
             parts.max_layer,
         )?;

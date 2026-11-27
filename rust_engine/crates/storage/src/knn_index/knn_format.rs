@@ -158,6 +158,9 @@ pub fn decode_labels(buf: &[u8]) -> Result<&[u32], FormatError> {
 /// A decoded chunk with an opaque vec-store meta blob (LVQ / RaBitQ).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HnswChunkExt<'a> {
+    /// Byte offset of `graph` within the decoded buffer, so a reader can build
+    /// a window into the mapping rather than a copy of the region.
+    pub graph_at: usize,
     pub m: u64,
     pub ef_construction: u64,
     pub cur_vec_num: u64,
@@ -262,10 +265,12 @@ pub fn decode_hnsw_chunk_ext<'a>(
             got: buf.len(),
         });
     }
+    let graph_at = at;
     let graph = &buf[at..at + graph_len];
     at += graph_len;
     let labels = decode_labels(&buf[at..])?;
     Ok(HnswChunkExt {
+        graph_at,
         m,
         ef_construction,
         cur_vec_num,
@@ -509,39 +514,57 @@ pub fn decode_graph_region(
     Ok(out)
 }
 
-/// The graph region as three flat arrays: `offsets[layer][node]` indexes into
-/// `neighbors[layer]`.
+/// Where a graph region's parts are, without reading them.
 ///
-/// This is the shape a loaded index actually searches with - the CSR the
-/// `HnswIndex` keeps - so decoding straight into it avoids the two conversions
-/// the nested form needs: bytes to `Vec<Vec<u32>>` per vertex, then that to
-/// `Vec<Vec<usize>>`, then that to the flat arrays again. On the L scenario the
-/// nested form was 8.34M vertices x (one `Vec` for level 0 + one per upper
-/// layer), about 17M allocations, and two full copies of the adjacency data.
-///
-/// `neighbors` stays `u32` because that is what the file holds and what a node
-/// id is; widening to `usize` doubles the bytes for no gain.
-pub struct FlatGraphRegion {
-    /// `offsets[layer]` has `vertex_count + 1` entries, the last being the
-    /// layer's total neighbor count.
-    pub offsets: Vec<Vec<u32>>,
-    /// Neighbor ids, one array per layer.
-    pub neighbors: Vec<Vec<u32>>,
+/// The region is `layer_sum(u64) | vertex records | upper-layer records`, and
+/// every record's shape follows from the strides `mmax0`/`mmax` imply. So a
+/// reader can compute any vertex's neighbour range from these numbers alone and
+/// cast it out of the mapping - no `Vec` of offsets, no `Vec` of neighbours, and
+/// nothing to copy. That matters: on the L scenario the adjacency is 534 MB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphGeometry {
+    pub vertex_count: usize,
+    /// `sizeof(VertexL0) + 4 * mmax0`.
+    pub l0_stride: usize,
+    /// `sizeof(VertexLX) + 4 * mmax`.
+    pub lx_stride: usize,
+    /// Offset of the first upper-layer record.
+    pub upper_at: usize,
+    /// Highest layer any vertex appears in (0 when every vertex is level 0).
+    pub max_layer: usize,
+    /// Total length of the region, so a caller can bounds-check the mapping.
+    pub len: usize,
 }
 
-/// Decodes a `GraphStoreInner` region into CSR form, in one pass.
-///
-/// The same layout [`decode_graph_region`] reads, but without building a
-/// `Vec`-of-`Vec` per vertex: every layer's neighbor block is filled into one
-/// contiguous array as the vertices are walked.
-pub fn decode_graph_region_flat(
+impl GraphGeometry {
+    /// Byte offset of `node`'s level-0 record within the region.
+    pub fn level0_record(&self, node: usize) -> Option<usize> {
+        (node < self.vertex_count).then(|| 8 + node * self.l0_stride)
+    }
+
+    /// Byte offset of `node`'s record for `layer` (1-based), or `None` when the
+    /// vertex does not reach that layer.
+    pub fn upper_record(&self, node: usize, layer: usize, bytes: &[u8]) -> Option<usize> {
+        let at = self.level0_record(node)?;
+        let layer_count =
+            i32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?).max(0) as usize;
+        if layer == 0 || layer > layer_count {
+            return None;
+        }
+        let layers_p = u64::from_le_bytes(bytes.get(at + 8..at + 16)?.try_into().ok()?) as usize;
+        Some(self.upper_at + layers_p + (layer - 1) * self.lx_stride)
+    }
+}
+
+/// Reads the geometry of a graph region, checking its length.
+pub fn graph_geometry(
     bytes: &[u8],
     vertex_count: usize,
     mmax0: u64,
     mmax: u64,
-) -> Result<FlatGraphRegion, FormatError> {
-    let l0 = level0_stride(VERTEX_L0_SIZE, mmax0);
-    let lx = levelx_stride(VERTEX_LX_SIZE, mmax);
+) -> Result<GraphGeometry, FormatError> {
+    let l0_stride = level0_stride(VERTEX_L0_SIZE, mmax0);
+    let lx_stride = levelx_stride(VERTEX_LX_SIZE, mmax);
     if bytes.len() < 8 {
         return Err(FormatError::Truncated {
             need: 8,
@@ -549,67 +572,28 @@ pub fn decode_graph_region_flat(
         });
     }
     let layer_sum = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let upper_at = 8 + vertex_count * l0;
-    if bytes.len() != upper_at + layer_sum as usize * lx {
+    let upper_at = 8 + vertex_count * l0_stride;
+    if bytes.len() != upper_at + layer_sum as usize * lx_stride {
         return Err(FormatError::Truncated {
-            need: upper_at + layer_sum as usize * lx,
+            need: upper_at + layer_sum as usize * lx_stride,
             got: bytes.len(),
         });
     }
-
-    // Level 0 first: its stride is fixed, so the offsets are one sequential
-    // pass and the neighbor block is its exact total.
-    let mut level0_offsets = Vec::with_capacity(vertex_count + 1);
-    level0_offsets.push(0u32);
-    let mut level0_neighbors: Vec<u32> = Vec::new();
-    for v in 0..vertex_count {
-        let at = 8 + v * l0;
-        let n = i32::from_le_bytes(bytes[at + 16..at + 20].try_into().unwrap()).max(0) as usize;
-        for k in 0..n {
-            let s = at + 20 + k * 4;
-            level0_neighbors.push(u32::from_le_bytes(bytes[s..s + 4].try_into().unwrap()));
-        }
-        level0_offsets.push(level0_neighbors.len() as u32);
-    }
-
-    // Upper layers are interleaved by vertex (`upper_at + layers_p + l * lx`),
-    // so they are collected per vertex and then laid out a layer at a time.
     let max_layer = (0..vertex_count)
         .map(|v| {
-            let at = 8 + v * l0;
+            let at = 8 + v * l0_stride;
             i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).max(0) as usize
         })
         .max()
         .unwrap_or(0);
-    let mut offsets = Vec::with_capacity(max_layer + 1);
-    let mut neighbors = Vec::with_capacity(max_layer + 1);
-    offsets.push(level0_offsets);
-    neighbors.push(level0_neighbors);
-    for layer in 0..max_layer {
-        let mut layer_offsets = Vec::with_capacity(vertex_count + 1);
-        layer_offsets.push(0u32);
-        let mut layer_neighbors: Vec<u32> = Vec::new();
-        for v in 0..vertex_count {
-            let at = 8 + v * l0;
-            let layer_count =
-                i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).max(0) as usize;
-            if layer < layer_count {
-                let layers_p =
-                    u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
-                let s = upper_at + layers_p + layer * lx;
-                let n = i32::from_le_bytes(bytes[s..s + 4].try_into().unwrap()).max(0) as usize;
-                for k in 0..n {
-                    let e = s + 4 + k * 4;
-                    layer_neighbors.push(u32::from_le_bytes(bytes[e..e + 4].try_into().unwrap()));
-                }
-            }
-            layer_offsets.push(layer_neighbors.len() as u32);
-        }
-        offsets.push(layer_offsets);
-        neighbors.push(layer_neighbors);
-    }
-
-    Ok(FlatGraphRegion { offsets, neighbors })
+    Ok(GraphGeometry {
+        vertex_count,
+        l0_stride,
+        lx_stride,
+        upper_at,
+        max_layer,
+        len: bytes.len(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,11 +1641,14 @@ mod tests {
         assert_eq!(decoded, vertices);
     }
 
-    /// The flat decoder must produce exactly what the nested one produces -
-    /// it is the path a loaded index takes, and a mismatch would silently
-    /// search the wrong neighbours.
+    /// Reading the graph by offset must agree with decoding it.
+    ///
+    /// `graph_geometry` is what a loaded index uses: it names each record's
+    /// address and the reader casts the neighbour ids straight out of the
+    /// mapping. A mismatch would search the wrong neighbours silently, so every
+    /// vertex of every layer is compared against the decoded form.
     #[test]
-    fn graph_region_flat_matches_the_nested_decoder() {
+    fn graph_region_read_by_offset_matches_the_decoded_form() {
         let mmax0 = 4u64;
         let mmax = 2u64;
         let vertices = vec![
@@ -1687,24 +1674,39 @@ mod tests {
             },
         ];
         let bytes = encode_graph_region(&vertices, mmax0, mmax);
-        let nested = decode_graph_region(&bytes, vertices.len(), mmax0, mmax).unwrap();
-        let flat = decode_graph_region_flat(&bytes, vertices.len(), mmax0, mmax).unwrap();
+        let decoded = decode_graph_region(&bytes, vertices.len(), mmax0, mmax).unwrap();
+        let geo = graph_geometry(&bytes, vertices.len(), mmax0, mmax).unwrap();
 
-        assert_eq!(
-            flat.offsets.len(),
-            3,
-            "three layers: level 0 plus two upper"
-        );
-        for (layer, (offsets, neighbors)) in flat.offsets.iter().zip(&flat.neighbors).enumerate() {
-            assert_eq!(offsets.len(), vertices.len() + 1);
+        assert_eq!(geo.max_layer, 2, "level 0 plus two upper layers");
+        // Read every record out of `bytes` the way a mapped reader does.
+        let read = |layer: usize, node: usize| -> Vec<u32> {
+            let at = if layer == 0 {
+                geo.level0_record(node).unwrap()
+            } else {
+                match geo.upper_record(node, layer, &bytes) {
+                    Some(at) => at,
+                    None => return Vec::new(),
+                }
+            };
+            let count_at = if layer == 0 { at + 16 } else { at };
+            let count = i32::from_le_bytes(bytes[count_at..count_at + 4].try_into().unwrap()).max(0)
+                as usize;
+            (0..count)
+                .map(|k| {
+                    let p = count_at + 4 + k * 4;
+                    u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap())
+                })
+                .collect()
+        };
+
+        for layer in 0..=geo.max_layer {
             for node in 0..vertices.len() {
                 let expect: &[u32] = if layer == 0 {
-                    &nested[node].neighbors_l0
+                    &decoded[node].neighbors_l0
                 } else {
-                    nested[node].upper.get(layer - 1).map_or(&[], |v| v)
+                    decoded[node].upper.get(layer - 1).map_or(&[], |v| v)
                 };
-                let got = &neighbors[offsets[node] as usize..offsets[node + 1] as usize];
-                assert_eq!(got, expect, "layer {layer} node {node}");
+                assert_eq!(read(layer, node), expect, "layer {layer} node {node}");
             }
         }
     }
