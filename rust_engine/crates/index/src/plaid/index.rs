@@ -357,6 +357,13 @@ impl PlaidIndex {
         self.centroid_norms_neg_half.is_mapped()
     }
 
+    /// Whether the quantizer's bucket tables are windows into the mapping.
+    pub fn is_quantizer_mapped(&self) -> bool {
+        self.quantizer
+            .as_ref()
+            .is_some_and(|q| q.is_bucket_tables_mapped())
+    }
+
     /// The packed residual codes: the heap buffer, or the mmap'd chunk's slice.
     fn packed(&self) -> &[u8] {
         match &self.packed_map {
@@ -2052,7 +2059,7 @@ impl PlaidIndex {
             }
             at = end;
             let (quantizer, used) =
-                PlaidQuantizer::from_bytes(nbits, embedding_dimension, &bytes[at..])?;
+                PlaidQuantizer::from_bytes_with(nbits, embedding_dimension, &bytes[at..], mapped)?;
             at += used;
             index.quantizer = Some(quantizer);
         }
@@ -2586,6 +2593,10 @@ mod tests {
         assert!(loaded.is_doc_lens_mapped(), "doc_lens was copied");
         assert!(loaded.is_doc_offsets_mapped(), "doc_offsets was copied");
         assert!(loaded.is_centroid_ids_mapped(), "centroid_ids was copied");
+        assert!(
+            loaded.is_quantizer_mapped(),
+            "the quantizer bucket tables were copied"
+        );
 
         // A mutation materializes them (the file is read-only) and keeps working.
         let mut loaded = loaded;

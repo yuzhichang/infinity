@@ -26,6 +26,58 @@ use common::{Error, Result};
 /// reservoir-sampled down to this bound (`MAX_RESIDUAL_VALUES`).
 pub const MAX_RESIDUAL_VALUES: u64 = 50_000 * 1024;
 
+/// An `f32` table that is either owned or a range in the chunk mapping.
+///
+/// The bucket cutoffs and weights: `n_buckets` floats each, contiguous in the
+/// file, so a load keeps them where they lie.
+#[derive(Clone)]
+pub enum MappedF32 {
+    Owned(Vec<f32>),
+    Mapped(
+        std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+        std::ops::Range<usize>,
+    ),
+}
+
+impl std::fmt::Debug for MappedF32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl Default for MappedF32 {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl PartialEq for MappedF32 {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::ops::Deref for MappedF32 {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(owner, range) => {
+                // The range was bounds-checked when the table was located, and
+                // `owner` is the mapping it points into.
+                bytemuck::cast_slice(&owner.as_ref().as_ref()[range.clone()])
+            }
+        }
+    }
+}
+
+impl MappedF32 {
+    pub fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped(..))
+    }
+}
+
 /// C++: `PlaidQuantizer`.
 #[derive(Debug, Clone)]
 pub struct PlaidQuantizer {
@@ -34,9 +86,9 @@ pub struct PlaidQuantizer {
     n_buckets: u32,
     packed_dim: u32,
     /// `n_buckets - 1` quantile boundaries.
-    bucket_cutoffs: Vec<f32>,
+    bucket_cutoffs: MappedF32,
     /// `n_buckets` reconstruction values.
-    bucket_weights: Vec<f32>,
+    bucket_weights: MappedF32,
     /// Mean residual removed before bucketing and added back on reconstruction.
     avg_residual: f32,
     /// Bit reversal per byte, used to unpack the MSB-first stream.
@@ -60,7 +112,7 @@ impl PlaidQuantizer {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&self.n_buckets.to_le_bytes());
-        for value in &self.bucket_weights {
+        for value in self.bucket_weights.iter() {
             out.extend_from_slice(&value.to_le_bytes());
         }
     }
@@ -84,8 +136,8 @@ impl PlaidQuantizer {
             embedding_dim,
             n_buckets,
             packed_dim,
-            bucket_cutoffs: Vec::new(),
-            bucket_weights: Vec::new(),
+            bucket_cutoffs: MappedF32::default(),
+            bucket_weights: MappedF32::default(),
             avg_residual: 0.0,
             byte_reversed_bits_map,
             bucket_weight_indices_lookup,
@@ -112,6 +164,12 @@ impl PlaidQuantizer {
     }
     pub fn bucket_weights(&self) -> &[f32] {
         &self.bucket_weights
+    }
+
+    /// Whether the bucket tables are windows into the chunk mapping. Comparing
+    /// their values passes for a copy too, so this is what a test asserts.
+    pub fn is_bucket_tables_mapped(&self) -> bool {
+        self.bucket_cutoffs.is_mapped() && self.bucket_weights.is_mapped()
     }
     pub fn is_trained(&self) -> bool {
         !self.bucket_weights.is_empty()
@@ -176,18 +234,22 @@ impl PlaidQuantizer {
 
         let len = all.len();
         let last = len - 1;
-        self.bucket_cutoffs = (1..self.n_buckets)
-            .map(|i| {
-                let q = i as f64 / self.n_buckets as f64;
-                all[((q * len as f64) as usize).min(last)]
-            })
-            .collect();
-        self.bucket_weights = (0..self.n_buckets)
-            .map(|i| {
-                let q = (i as f64 + 0.5) / self.n_buckets as f64;
-                all[((q * len as f64) as usize).min(last)] + self.avg_residual
-            })
-            .collect();
+        self.bucket_cutoffs = MappedF32::Owned(
+            (1..self.n_buckets)
+                .map(|i| {
+                    let q = i as f64 / self.n_buckets as f64;
+                    all[((q * len as f64) as usize).min(last)]
+                })
+                .collect(),
+        );
+        self.bucket_weights = MappedF32::Owned(
+            (0..self.n_buckets)
+                .map(|i| {
+                    let q = (i as f64 + 0.5) / self.n_buckets as f64;
+                    all[((q * len as f64) as usize).min(last)] + self.avg_residual
+                })
+                .collect(),
+        );
         Ok(())
     }
 
@@ -322,7 +384,7 @@ impl PlaidQuantizer {
         }
         for (d, row) in output.chunks_exact_mut(n_buckets).take(dim).enumerate() {
             let q = query[d];
-            for (slot, weight) in row.iter_mut().zip(&self.bucket_weights) {
+            for (slot, weight) in row.iter_mut().zip(self.bucket_weights.iter()) {
                 *slot = q * *weight;
             }
         }
@@ -462,18 +524,74 @@ impl PlaidQuantizer {
         out.extend_from_slice(&self.avg_residual.to_le_bytes());
         let n_cutoffs = self.bucket_cutoffs.len() as u32;
         out.extend_from_slice(&n_cutoffs.to_le_bytes());
-        for c in &self.bucket_cutoffs {
+        for c in self.bucket_cutoffs.iter() {
             out.extend_from_slice(&c.to_le_bytes());
         }
         out.extend_from_slice(&self.n_buckets.to_le_bytes());
-        for w in &self.bucket_weights {
+        for w in self.bucket_weights.iter() {
             out.extend_from_slice(&w.to_le_bytes());
         }
         out
     }
 
     /// C++: `PlaidQuantizer::Load` / `LoadFromPtr`.
+    /// `count` `f32`s at `at`: a range in `backing` when there is one, else a
+    /// copy. Returns the table and the offset just past it.
+    fn take_floats(
+        bytes: &[u8],
+        at: usize,
+        count: usize,
+        backing: Option<&std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    ) -> Result<(MappedF32, usize)> {
+        let end = at + count * 4;
+        let slice = bytes
+            .get(at..end)
+            .ok_or_else(|| Error::Invalid("PlaidQuantizer::Load: truncated".into()))?;
+        // The packing before this table is a byte count, so the table need not
+        // start on a `f32` boundary; `bytemuck` in `Deref` requires one. An
+        // unaligned table falls back to the copy rather than panicking at query
+        // time.
+        let aligned = (slice.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>());
+        let table = match backing.filter(|_| aligned) {
+            Some(owner) => {
+                // The table is `f32`s inside the mapping; record where.
+                let base = owner.as_ref().as_ref().as_ptr() as usize;
+                MappedF32::Mapped(
+                    std::sync::Arc::clone(owner),
+                    (slice.as_ptr() as usize - base)..(slice.as_ptr() as usize - base + count * 4),
+                )
+            }
+            // The owned path copies from whatever buffer the caller has, which
+            // need not be aligned as `f32` (a caller may hand a slice that
+            // starts mid-buffer); `pod_read_unaligned` is what the scalar
+            // `from_le_bytes` loop did.
+            None => MappedF32::Owned(
+                slice
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect(),
+            ),
+        };
+        Ok((table, end))
+    }
+
     pub fn from_bytes(nbits: u32, embedding_dim: u32, bytes: &[u8]) -> Result<(Self, usize)> {
+        Self::from_bytes_with(nbits, embedding_dim, bytes, None)
+    }
+
+    /// [`Self::from_bytes`] taking the bucket tables from `backing`.
+    ///
+    /// The cutoffs and weights are `f32` arrays, so a load has nothing to
+    /// decode: with a backing they become ranges in the chunk mapping, and only
+    /// a quantizer built from raw training data copies them.
+    pub fn from_bytes_with(
+        nbits: u32,
+        embedding_dim: u32,
+        bytes: &[u8],
+        backing: Option<&std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    ) -> Result<(Self, usize)> {
         let mut quantizer = Self::new(nbits, embedding_dim)?;
         let mut at = 0usize;
         let read_u32 = |at: &mut usize| -> Result<u32> {
@@ -499,18 +617,18 @@ impl PlaidQuantizer {
         }
         quantizer.avg_residual = read_f32(&mut at)?;
         let n_cutoffs = read_u32(&mut at)? as usize;
-        quantizer.bucket_cutoffs = (0..n_cutoffs)
-            .map(|_| read_f32(&mut at))
-            .collect::<Result<_>>()?;
+        let (cutoffs, cutoffs_end) = Self::take_floats(bytes, at, n_cutoffs, backing)?;
+        at = cutoffs_end;
+        quantizer.bucket_cutoffs = cutoffs;
         let n_buckets = read_u32(&mut at)?;
         if n_buckets != quantizer.n_buckets {
             return Err(Error::Invalid(
                 "PlaidQuantizer::Load: n_buckets mismatch".into(),
             ));
         }
-        quantizer.bucket_weights = (0..n_buckets)
-            .map(|_| read_f32(&mut at))
-            .collect::<Result<_>>()?;
+        let (weights, weights_end) = Self::take_floats(bytes, at, n_buckets as usize, backing)?;
+        at = weights_end;
+        quantizer.bucket_weights = weights;
         Ok((quantizer, at))
     }
 
