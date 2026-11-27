@@ -1200,13 +1200,13 @@ impl HnswIndex {
                 None => f(&[]),
             };
         }
-        // The building graph keeps its lists as `Vec<usize>` behind a lock; only
-        // this path widens, and it is never the one a loaded index takes.
+        // The building graph keeps its neighbour lists as `u32` behind a lock;
+        // only this path needs a contiguous copy, and it is never the one a
+        // loaded index takes (`flat_links` is, above).
         match self.links.get(layer).and_then(|l| l.get(node)) {
             Some(cell) => {
                 let list = cell.read().unwrap_or_else(|e| e.into_inner());
-                let narrowed: Vec<u32> = list.iter().map(|&n| n as u32).collect();
-                f(&narrowed)
+                f(&list)
             }
             None => f(&[]),
         }
@@ -1329,7 +1329,7 @@ impl HnswIndex {
                     let neighbors = self.flat_links.get(layer, node).unwrap_or(&[]);
                     put_u64(&mut out, neighbors.len() as u64);
                     for &neighbor in neighbors {
-                        out.extend_from_slice(&(neighbor as u32).to_le_bytes());
+                        out.extend_from_slice(&neighbor.to_le_bytes());
                     }
                 }
             }
@@ -1341,7 +1341,7 @@ impl HnswIndex {
                     let neighbors = cell.read().unwrap_or_else(|e| e.into_inner());
                     put_u64(&mut out, neighbors.len() as u64);
                     for &neighbor in neighbors.iter() {
-                        out.extend_from_slice(&(neighbor as u32).to_le_bytes());
+                        out.extend_from_slice(&neighbor.to_le_bytes());
                     }
                 }
             }
@@ -1731,7 +1731,7 @@ impl HnswIndex {
                     (0..self.len())
                         .map(|node| {
                             let nbs = self.flat_links.get(layer, node).unwrap_or(&[]);
-                            std::mem::size_of::<u32>() + nbs.len() * std::mem::size_of::<u32>()
+                            std::mem::size_of::<u32>() + std::mem::size_of_val(nbs)
                         })
                         .sum::<usize>()
                 })

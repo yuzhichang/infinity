@@ -97,9 +97,10 @@ impl PlaidQueryResult {
     }
 }
 
-/// The mmap'd chunk a PLAID index was read from: the backing bytes, and the
-/// range inside them that holds the packed residual codes.
-type MappedPacked = (Arc<dyn AsRef<[u8]> + Send + Sync>, std::ops::Range<usize>);
+/// The mmap'd chunk a PLAID index was read from. Every mapped field below holds
+/// one of these plus the byte range it points at, so the alias names the pair.
+type MappedBacking = Arc<dyn AsRef<[u8]> + Send + Sync>;
+type MappedSpan = (MappedBacking, std::ops::Range<usize>);
 
 /// A `T` array that is either owned or a range inside the chunk mapping.
 ///
@@ -110,7 +111,7 @@ type MappedPacked = (Arc<dyn AsRef<[u8]> + Send + Sync>, std::ops::Range<usize>)
 struct MappedSlice<T> {
     owned: Vec<T>,
     /// `None` for an owned array.
-    mapped: Option<(Arc<dyn AsRef<[u8]> + Send + Sync>, std::ops::Range<usize>)>,
+    mapped: Option<MappedSpan>,
 }
 
 impl<T: bytemuck::Pod + Default> Default for MappedSlice<T> {
@@ -197,7 +198,7 @@ pub struct PlaidIndex {
     /// (file-backed, like the reference's buffer-manager chunk) and
     /// `packed_residuals` is empty; a mutation materializes the codes into it
     /// first.
-    packed_map: Option<MappedPacked>,
+    packed_map: Option<MappedSpan>,
     ivf_lists: Vec<Vec<u32>>,
     ivf_data: MappedSlice<u32>,
     ivf_offsets: Vec<u32>,
@@ -2573,8 +2574,8 @@ mod tests {
         // layout change cannot hide a divergence.
         for c in 0..index.n_centroids() {
             assert_eq!(
-                loaded.ivf_list(c as u32),
-                index.ivf_list(c as u32),
+                loaded.ivf_list(c),
+                index.ivf_list(c),
                 "centroid {c} ivf list"
             );
         }

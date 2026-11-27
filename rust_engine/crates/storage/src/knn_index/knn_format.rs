@@ -1700,11 +1700,11 @@ mod tests {
         };
 
         for layer in 0..=geo.max_layer {
-            for node in 0..vertices.len() {
+            for (node, vertex) in decoded.iter().enumerate().take(vertices.len()) {
                 let expect: &[u32] = if layer == 0 {
-                    &decoded[node].neighbors_l0
+                    &vertex.neighbors_l0
                 } else {
-                    decoded[node].upper.get(layer - 1).map_or(&[], |v| v)
+                    vertex.upper.get(layer - 1).map_or(&[], |v| v)
                 };
                 assert_eq!(read(layer, node), expect, "layer {layer} node {node}");
             }

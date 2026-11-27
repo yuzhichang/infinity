@@ -1231,7 +1231,7 @@ mod tests {
         .expect("mapped");
 
         assert_eq!(copied.len(), mapped.len());
-        for i in 0..vec_n {
+        for (i, vector) in stored.iter().enumerate().take(vec_n) {
             assert_eq!(
                 copied.record(i).unwrap().code.as_slice(),
                 mapped.record(i).unwrap().code.as_slice(),
@@ -1245,7 +1245,7 @@ mod tests {
                 *mapped.record(i).unwrap().header,
                 "vector {i} header differs"
             );
-            let q = mapped.make_query(&stored[i]);
+            let q = mapped.make_query(vector);
             assert_eq!(
                 copied.distance(&q, i).unwrap(),
                 mapped.distance(&q, i).unwrap(),

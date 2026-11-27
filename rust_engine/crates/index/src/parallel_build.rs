@@ -274,7 +274,7 @@ impl<'a> Builder<'a> {
             // A reverse-link prune runs the heuristic again, which reuses
             // `select`'s buffers, so the loop walks its own copy of the list
             // (the slice borrows `select` and cannot outlive that call).
-            let neighbors: Vec<usize> = neighbors.iter().map(|&n| n as usize).collect();
+            let neighbors: Vec<usize> = neighbors.to_vec();
             for nb in neighbors {
                 self.connect_neighbors(nb, node, layer, select);
             }
