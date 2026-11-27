@@ -149,6 +149,13 @@ impl<T: bytemuck::Pod + Default> MappedSlice<T> {
         }
     }
 
+    /// Whether the array is a window into the chunk mapping rather than an
+    /// owned copy. A test asserts on this: comparing the values would pass
+    /// either way, so only this distinguishes the two layouts.
+    fn is_mapped(&self) -> bool {
+        self.mapped.is_some()
+    }
+
     /// The owned buffer, moving the mapped bytes into it first. Only a mutation
     /// needs this.
     fn to_mut(&mut self) -> &mut Vec<T> {
@@ -320,6 +327,34 @@ impl PlaidIndex {
     }
     pub fn packed_residuals(&self) -> &[u8] {
         self.packed()
+    }
+
+    /// Whether the IVF id region is a window into the chunk mapping. Comparing
+    /// the ids against an in-memory index passes for both layouts, so this is
+    /// the only assertion that says the load did not copy them.
+    pub fn is_ivf_data_mapped(&self) -> bool {
+        self.ivf_data.is_mapped()
+    }
+
+    /// The same, for the arrays that are read-only after a load.
+    pub fn is_centroids_data_mapped(&self) -> bool {
+        self.centroids_data.is_mapped()
+    }
+
+    pub fn is_doc_lens_mapped(&self) -> bool {
+        self.doc_lens.is_mapped()
+    }
+
+    pub fn is_doc_offsets_mapped(&self) -> bool {
+        self.doc_offsets.is_mapped()
+    }
+
+    pub fn is_centroid_ids_mapped(&self) -> bool {
+        self.centroid_ids.is_mapped()
+    }
+
+    pub fn is_centroid_norms_mapped(&self) -> bool {
+        self.centroid_norms_neg_half.is_mapped()
     }
 
     /// The packed residual codes: the heap buffer, or the mmap'd chunk's slice.
@@ -1972,25 +2007,33 @@ impl PlaidIndex {
             (starts, lens)
         };
         let (starts, lens) = ivf_start;
-        // The ids for every centroid are stored back to back - each block is a
-        // `u32` count followed by that many `u32` ids, and the next count comes
-        // right after. So the whole region is one contiguous `u32` run once the
-        // per-centroid counts are skipped, and `ivf_offsets` can name a position
-        // inside it directly.
-        let mut offsets = Vec::with_capacity(k);
-        let mut ids: Vec<u32> = Vec::new();
-        for (&start, &len) in starts.iter().zip(&lens) {
-            offsets.push(ids.len() as u32);
-            ids.extend(
-                bytemuck::try_cast_slice::<u8, u32>(&bytes[start..start + len * 4])
-                    .map_err(|_| Error::Invalid("PlaidIndex::Load: misaligned".into()))?,
-            );
+        // The whole IVF region as one `u32` range: `count, ids..., count, ids...`
+        // per centroid. Keeping the region whole - rather than concatenating the
+        // id blocks - is what lets a mapped chunk read the ids in place;
+        // `ivf_offsets` then names each block's position *inside that range*.
+        let ivf_at = starts.first().copied().unwrap_or(at);
+        // The last block ends where the next field begins, which is `at`.
+        let ivf_end = lens
+            .iter()
+            .zip(&starts)
+            .map(|(l, s)| s + l * 4)
+            .max()
+            .unwrap_or(ivf_at);
+        let mut block_offsets: Vec<u32> = Vec::with_capacity(k);
+        for &start in &starts {
+            block_offsets.push(((start - ivf_at) / 4) as u32);
         }
-        // The concatenation above is the region with the counts removed, so a
-        // mapped chunk can still not point at it in place; keep the ids owned
-        // and the offsets computed, which is the flattened form a query uses.
-        index.ivf_data = MappedSlice::owned(ids);
-        index.ivf_offsets = offsets;
+        index.ivf_data = match mapped {
+            Some(backing) if ivf_end > ivf_at => {
+                MappedSlice::from_mapped(std::sync::Arc::clone(backing), ivf_at..ivf_end)
+            }
+            _ => {
+                let data: &[u32] = bytemuck::try_cast_slice(&bytes[ivf_at..ivf_end])
+                    .map_err(|_| Error::Invalid("PlaidIndex::Load: misaligned".into()))?;
+                MappedSlice::owned(data.to_vec())
+            }
+        };
+        index.ivf_offsets = block_offsets;
         index.ivf_lengths = lens.iter().map(|&l| l as u32).collect();
         index.ivf_lists = Vec::new();
         index.ivf_flattened = true;
@@ -2528,6 +2571,21 @@ mod tests {
                 "centroid {c} ivf list"
             );
         }
+        // Comparing values cannot tell a mapped array from a copied one - both
+        // hold the same numbers - so the layout itself is asserted here. These
+        // are the arrays a chunk load must not copy.
+        assert!(
+            loaded.is_ivf_data_mapped(),
+            "the IVF ids were copied out of the mapping"
+        );
+        assert!(loaded.is_centroids_data_mapped(), "centroids were copied");
+        assert!(
+            loaded.is_centroid_norms_mapped(),
+            "centroid norms were copied"
+        );
+        assert!(loaded.is_doc_lens_mapped(), "doc_lens was copied");
+        assert!(loaded.is_doc_offsets_mapped(), "doc_offsets was copied");
+        assert!(loaded.is_centroid_ids_mapped(), "centroid_ids was copied");
 
         // A mutation materializes them (the file is read-only) and keeps working.
         let mut loaded = loaded;
