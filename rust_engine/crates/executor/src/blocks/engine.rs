@@ -4385,6 +4385,66 @@ impl Engine {
     /// page cache (which is what the budget was approximating) and the mapping
     /// is shared, not copied. A block the index does not know yet (written
     /// between its open and this read) is mapped from its directory.
+    /// [`Self::decode_block_cells`] with its block fetch moved off the worker.
+    ///
+    /// The decode itself is CPU over bytes the block already holds, so only the
+    /// map can block - and on the common path it is a cache hit that returns
+    /// without yielding.
+    async fn decode_block_cells_async(
+        &self,
+        table: &str,
+        root: &std::path::Path,
+        meta: &catalog::TableMeta,
+        types: &[i32],
+        id: BlockId,
+        wanted: Option<&[usize]>,
+    ) -> Option<Vec<(usize, Vec<String>)>> {
+        // Ensure the mapping is in place first, off the worker; the sync call
+        // below then finds it and does no I/O.
+        let _ = self
+            .block_map_async(table.to_string(), root.to_path_buf(), id)
+            .await;
+        self.decode_block_cells(table, root, meta, types, id, wanted)
+    }
+
+    /// The mapping for `id` when it is already resident, without opening
+    /// anything. Used by [`Self::block_map_async`] to keep a hit off the pool.
+    fn block_map_cached(&self, id: BlockId) -> Option<Arc<MappedBlock>> {
+        self.context.block_maps.lock().unwrap().get(&id)
+    }
+
+    /// [`Self::block_map`] with the file open moved off the worker.
+    ///
+    /// A cache hit needs no I/O, so it is answered inline and costs an await
+    /// that never yields. A miss opens and maps the file - real blocking I/O -
+    /// and that part runs on the blocking pool. Both go through `block_map`
+    /// afterwards so the cache, the budget and the generation check stay in one
+    /// place.
+    ///
+    /// `table` and `root` are owned rather than borrowed because a
+    /// `spawn_blocking` closure must be `'static`; the caller in
+    /// `for_each_tensor_doc` has both as owned values already.
+    async fn block_map_async(
+        &self,
+        table: String,
+        root: std::path::PathBuf,
+        id: BlockId,
+    ) -> std::io::Result<Arc<MappedBlock>> {
+        // A hit is the common case for a second pass over the same column, and
+        // it must not be handed to the pool: the mapping is already there.
+        if self.block_map_cached(id).is_some() {
+            return self.block_map(&table, &root, id);
+        }
+        let Some(engine) = self.engine_handle() else {
+            // No `Arc` around this engine (a unit test that built one directly):
+            // there is no pool to hand it to, and no worker to protect either.
+            return self.block_map(&table, &root, id);
+        };
+        crate::scheduler::scheduler()
+            .spawn_blocking(move || engine.block_map(&table, &root, id))
+            .await
+    }
+
     pub(crate) fn block_map(
         &self,
         table: &str,
@@ -8881,148 +8941,192 @@ impl Engine {
     /// bit-packed per token, and no index holds that shape anyway.
     ///
     /// Returns `true` when `each` asked to stop.
-    fn for_each_tensor_doc(
-        &self,
-        table: &str,
+    /// Walks the tensor documents of `table.col`, handing each to `each`.
+    ///
+    /// **The block fetch is awaited, the decode is not.** That split is the
+    /// point of this function being async: `block_map` opens and mmaps a block
+    /// file, which is real blocking I/O, while the decode and the callback are
+    /// pure CPU over bytes already in memory. Fetching every block the walk
+    /// needs up front costs the peak of "one block per table" in mappings and
+    /// defeats the per-batch ceiling the caller keeps; awaiting each fetch in
+    /// place keeps one block resident and moves the wait off the worker.
+    ///
+    /// `each` stays a synchronous callback. It is handed a slice borrowed from
+    /// the block this iteration fetched, so it cannot await without extending
+    /// that borrow across a suspension point - and it represents CPU work that
+    /// belongs on this thread anyway.
+    fn for_each_tensor_doc<'a>(
+        &'a self,
+        table: &'a str,
         col: usize,
         dims: usize,
         skip: usize,
-        each: &mut dyn FnMut(u64, &[&[f32]]) -> bool,
-    ) -> bool {
-        let table = self.qualified_table(table);
-        let Ok(Some(meta)) = self.storage.catalog.get_table_by_name(&table) else {
-            return false;
-        };
-        let Some(types) = meta
-            .types
-            .iter()
-            .map(|t| column_type_of(t))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return false;
-        };
-        // One `Arc` lookup for the whole walk: `is_deleted` loads the set per
-        // call, which would put a lock and a journal scan in the row loop.
-        let dead = self.deleted_set(&table);
-        let root = self.blocks_root();
-        let wanted = [col];
-        // The element type decides the path: a `FLOAT` tensor borrows its
-        // tokens out of the outline, anything else (a `BIT` tensor) still has
-        // to be rendered.
-        let elem = tensor_shape(meta.types.get(col).map(String::as_str).unwrap_or(""))
-            .map(|(_, _, elem)| elem);
-        // Rows per block, read once from the block metas. The watermark is a
-        // **document** offset, so a block that ends before it contributes nothing
-        // and must not be decoded: parsing every mirrored row on every dump is
-        // what made an incremental write cost O(table) - the very thing a delta
-        // exists to avoid.
-        let block_ids = self.visible_block_ids(&table);
-        let rows_of_block: std::collections::HashMap<(u32, u16), usize> = self
-            .block_index_for(&table)
-            .map(|index| {
-                let index = index.lock().unwrap();
-                block_ids
-                    .iter()
-                    .filter_map(|id| {
-                        index
-                            .get_block_meta(id.segment_id, id.block_id)
-                            .map(|meta| ((id.segment_id, id.block_id), meta.row_count))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut seen = 0usize;
-        for id in block_ids {
-            // Conservative: `row_count` is the physical row count, which is at
-            // least the documents the block contributes, so a block that passes
-            // this test really does end before the watermark.
-            if seen < skip {
-                if let Some(rows) = rows_of_block.get(&(id.segment_id, id.block_id)) {
-                    if seen + rows <= skip {
-                        seen += rows;
-                        continue;
-                    }
-                }
-            }
-            if elem == Some(6) {
-                let Ok(block) = self.block_map(&table, &root, id) else {
-                    continue;
-                };
-                let version = block.version();
-                let Some((slots, outline, live)) = self.block_tensor_body(
-                    &meta.ids,
-                    TensorColumn {
-                        declared: &meta.types,
-                        storage: &types,
-                        col,
-                    },
-                    version,
-                    block.as_ref(),
-                ) else {
-                    continue;
-                };
-                let base = ((id.segment_id as u64) << 32)
-                    | (id.block_id as u64 * crate::blocks::DEFAULT_BLOCK_CAPACITY as u64);
-                for slot in live {
-                    let seq = base + slot as u64;
-                    if dead.contains(seq) {
-                        continue;
-                    }
-                    if seen < skip {
-                        seen += 1;
-                        continue;
-                    }
-                    let Some(word) = slots.get(slot * 8..slot * 8 + 8) else {
-                        continue;
-                    };
-                    let Ok(word) = <[u8; 8]>::try_from(word) else {
-                        continue;
-                    };
-                    let word = u64::from_le_bytes(word);
-                    let count = (word & 0xffff) as usize;
-                    let offset = (word >> 16) as usize;
-                    let owned: Vec<Vec<f32>>;
-                    let rows: Vec<&[f32]> = if let Some(rows) =
-                        storage::definition::fixed_f32::tensor_rows_f32(
-                            outline, offset, count, dims,
-                        ) {
-                        rows
-                    } else {
-                        // A misaligned outline: decode instead of borrowing.
-                        owned = match storage::definition::fixed_f32::copy_tensor_rows(
-                            outline, offset, count, dims,
-                        ) {
-                            Some(rows) => rows,
-                            None => continue,
-                        };
-                        owned.iter().map(Vec::as_slice).collect()
-                    };
-                    seen += 1;
-                    if !each(seq, &rows) {
-                        return true;
-                    }
-                }
-                continue;
-            }
-            let Some(cells) =
-                self.decode_block_cells(&table, &root, &meta, &types, id, Some(&wanted))
-            else {
-                continue;
+        each: &'a mut (dyn FnMut(u64, &[&[f32]]) -> bool + Send),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let table = self.qualified_table(table);
+            let Ok(Some(meta)) = self.storage.catalog.get_table_by_name(&table) else {
+                return false;
             };
-            for (seq, cell) in cells {
+            let Some(types) = meta
+                .types
+                .iter()
+                .map(|t| column_type_of(t))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return false;
+            };
+            // One `Arc` lookup for the whole walk: `is_deleted` loads the set per
+            // call, which would put a lock and a journal scan in the row loop.
+            let dead = self.deleted_set(&table);
+            let root = self.blocks_root();
+            let wanted = [col];
+            // The element type decides the path: a `FLOAT` tensor borrows its
+            // tokens out of the outline, anything else (a `BIT` tensor) still has
+            // to be rendered.
+            let elem = tensor_shape(meta.types.get(col).map(String::as_str).unwrap_or(""))
+                .map(|(_, _, elem)| elem);
+            // Rows per block, read once from the block metas. The watermark is a
+            // **document** offset, so a block that ends before it contributes nothing
+            // and must not be decoded: parsing every mirrored row on every dump is
+            // what made an incremental write cost O(table) - the very thing a delta
+            // exists to avoid.
+            let block_ids = self.visible_block_ids(&table);
+            let rows_of_block: std::collections::HashMap<(u32, u16), usize> = self
+                .block_index_for(&table)
+                .map(|index| {
+                    let index = index.lock().unwrap();
+                    block_ids
+                        .iter()
+                        .filter_map(|id| {
+                            index
+                                .get_block_meta(id.segment_id, id.block_id)
+                                .map(|meta| ((id.segment_id, id.block_id), meta.row_count))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut seen = 0usize;
+            for id in block_ids {
+                // Conservative: `row_count` is the physical row count, which is at
+                // least the documents the block contributes, so a block that passes
+                // this test really does end before the watermark.
+                if seen < skip {
+                    if let Some(rows) = rows_of_block.get(&(id.segment_id, id.block_id)) {
+                        if seen + rows <= skip {
+                            seen += rows;
+                            continue;
+                        }
+                    }
+                }
+                if elem == Some(6) {
+                    // The one blocking call in the walk: opening and mapping a
+                    // block file. Awaited here, before anything borrows the bytes,
+                    // so the wait does not hold the worker.
+                    let Ok(block) = self.block_map_async(table.clone(), root.clone(), id).await
+                    else {
+                        continue;
+                    };
+                    let version = block.version();
+                    let Some((slots, outline, live)) = self.block_tensor_body(
+                        &meta.ids,
+                        TensorColumn {
+                            declared: &meta.types,
+                            storage: &types,
+                            col,
+                        },
+                        version,
+                        block.as_ref(),
+                    ) else {
+                        continue;
+                    };
+                    let base = ((id.segment_id as u64) << 32)
+                        | (id.block_id as u64 * crate::blocks::DEFAULT_BLOCK_CAPACITY as u64);
+                    for slot in live {
+                        let seq = base + slot as u64;
+                        if dead.contains(seq) {
+                            continue;
+                        }
+                        if seen < skip {
+                            seen += 1;
+                            continue;
+                        }
+                        let Some(word) = slots.get(slot * 8..slot * 8 + 8) else {
+                            continue;
+                        };
+                        let Ok(word) = <[u8; 8]>::try_from(word) else {
+                            continue;
+                        };
+                        let word = u64::from_le_bytes(word);
+                        let count = (word & 0xffff) as usize;
+                        let offset = (word >> 16) as usize;
+                        let owned: Vec<Vec<f32>>;
+                        let rows: Vec<&[f32]> = if let Some(rows) =
+                            storage::definition::fixed_f32::tensor_rows_f32(
+                                outline, offset, count, dims,
+                            ) {
+                            rows
+                        } else {
+                            // A misaligned outline: decode instead of borrowing.
+                            owned = match storage::definition::fixed_f32::copy_tensor_rows(
+                                outline, offset, count, dims,
+                            ) {
+                                Some(rows) => rows,
+                                None => continue,
+                            };
+                            owned.iter().map(Vec::as_slice).collect()
+                        };
+                        seen += 1;
+                        if !each(seq, &rows) {
+                            return true;
+                        }
+                    }
+                    continue;
+                }
+                let Some(cells) = self
+                    .decode_block_cells_async(&table, &root, &meta, &types, id, Some(&wanted))
+                    .await
+                else {
+                    continue;
+                };
+                for (seq, cell) in cells {
+                    if dead.contains(seq as u64) {
+                        continue;
+                    }
+                    let text = cell.get(col).map(String::as_str).unwrap_or("");
+                    if seen < skip {
+                        // Counting only: a skipped row costs a string peek, not a
+                        // tensor parse.
+                        if !text.trim().is_empty() {
+                            seen += 1;
+                        }
+                        continue;
+                    }
+                    if let Some(doc) = crate::parse_multivector_doc(text, dims) {
+                        seen += 1;
+                        let rows: Vec<&[f32]> = doc.iter().map(Vec::as_slice).collect();
+                        if !each(seq as u64, &rows) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            for (seq, values) in self.pending_rows_of(&table) {
                 if dead.contains(seq as u64) {
                     continue;
                 }
-                let text = cell.get(col).map(String::as_str).unwrap_or("");
+                let text = match values.get(col) {
+                    Some(Value::Str(s)) => s.clone(),
+                    Some(other) => other.to_slt_string(),
+                    None => continue,
+                };
                 if seen < skip {
-                    // Counting only: a skipped row costs a string peek, not a
-                    // tensor parse.
                     if !text.trim().is_empty() {
                         seen += 1;
                     }
                     continue;
                 }
-                if let Some(doc) = crate::parse_multivector_doc(text, dims) {
+                if let Some(doc) = crate::parse_multivector_doc(&text, dims) {
                     seen += 1;
                     let rows: Vec<&[f32]> = doc.iter().map(Vec::as_slice).collect();
                     if !each(seq as u64, &rows) {
@@ -9030,31 +9134,8 @@ impl Engine {
                     }
                 }
             }
-        }
-        for (seq, values) in self.pending_rows_of(&table) {
-            if dead.contains(seq as u64) {
-                continue;
-            }
-            let text = match values.get(col) {
-                Some(Value::Str(s)) => s.clone(),
-                Some(other) => other.to_slt_string(),
-                None => continue,
-            };
-            if seen < skip {
-                if !text.trim().is_empty() {
-                    seen += 1;
-                }
-                continue;
-            }
-            if let Some(doc) = crate::parse_multivector_doc(&text, dims) {
-                seen += 1;
-                let rows: Vec<&[f32]> = doc.iter().map(Vec::as_slice).collect();
-                if !each(seq as u64, &rows) {
-                    return true;
-                }
-            }
-        }
-        false
+            false
+        })
     }
 
     /// Builds one PLAID index over the tensor documents of `table.column` from
@@ -9072,7 +9153,12 @@ impl Engine {
     /// for training - so the build costs `index + one batch` instead of four
     /// copies of the table.
     #[allow(clippy::too_many_arguments)]
-    fn build_plaid_chunk(
+    /// Async because the document walk awaits its block fetches: a PLAID build
+    /// reads every block of the column, and each map is a file open. The CPU
+    /// half - decoding, encoding, the index add - stays on this thread, which
+    /// is what the caller wants: one worker doing steady compute, with only the
+    /// I/O waits given back.
+    async fn build_plaid_chunk(
         &self,
         table: &str,
         col: usize,
@@ -9113,7 +9199,8 @@ impl Engine {
                     }
                 }
                 true
-            });
+            })
+            .await;
         }
         let mut index = match reuse {
             Some(first_chunk) => {
@@ -9244,7 +9331,8 @@ impl Engine {
             lens.push(doc.len() as u32);
             batch_tokens += doc.len();
             true
-        });
+        })
+        .await;
         if let Some(error) = failure {
             return Err(error);
         }
@@ -9938,15 +10026,17 @@ impl Engine {
                 .iter()
                 .position(|c| c == &mirror.column)
                 .ok_or_else(|| Error::NotFound(format!("column '{}'", mirror.column)))?;
-            let Some((docs_len, count, index, rows)) = self.build_plaid_chunk(
-                &table,
-                col,
-                mirror.dims as usize,
-                &options,
-                0,
-                None,
-                Some(&mirror.dir),
-            )?
+            let Some((docs_len, count, index, rows)) = self
+                .build_plaid_chunk(
+                    &table,
+                    col,
+                    mirror.dims as usize,
+                    &options,
+                    0,
+                    None,
+                    Some(&mirror.dir),
+                )
+                .await?
             else {
                 return Err(Error::Invalid(format!(
                     "no tensors to index in '{table}.{}'",
@@ -10072,15 +10162,17 @@ impl Engine {
                 }
             }
         }
-        let Some((docs, total, index, rows)) = self.build_plaid_chunk(
-            &table,
-            col,
-            mirror.dims as usize,
-            &options,
-            skip,
-            Some(codec),
-            Some(&mirror.dir),
-        )?
+        let Some((docs, total, index, rows)) = self
+            .build_plaid_chunk(
+                &table,
+                col,
+                mirror.dims as usize,
+                &options,
+                skip,
+                Some(codec),
+                Some(&mirror.dir),
+            )
+            .await?
         else {
             return Ok(indexed as usize);
         };
