@@ -31,6 +31,94 @@ pub enum Metric {
     Cos,
 }
 
+/// Where a record's `i8` code lives.
+///
+/// `Owned` while a store is being built (compressed one vector at a time);
+/// `Mapped` once it is loaded, where the codes are already `i8` bytes inside the
+/// chunk mapping and copying them out means one `Vec` per vector - 8.34M
+/// allocations on the L scenario, for data that never changes.
+///
+/// The `Arc` is the same device `vector::MappedFloats` uses: an index is shared
+/// by `Arc<Store>` across build tasks and held for a segment's lifetime, so a
+/// borrowed slice would need a lifetime parameter on every type that mentions
+/// an index, while the `Arc` states "the file outlives me" and costs a refcount.
+#[derive(Clone, Debug)]
+pub enum Code {
+    Owned(Vec<i8>),
+    Mapped(CodeMapper),
+}
+
+impl Default for Code {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl PartialEq for Code {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Code {
+    pub fn as_slice(&self) -> &[i8] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(m) => m.as_slice(),
+        }
+    }
+}
+
+/// An `i8` window into a mapping that outlives the store.
+///
+/// SAFETY note: `_owner` keeps the pages mapped for as long as `ptr` is
+/// reachable, and a chunk file is published by rename rather than written in
+/// place, so the bytes behind `ptr` never change under a reader. `ptr`/`len`
+/// came from `bytemuck` in `CodeMapper::new`.
+#[derive(Clone)]
+pub struct CodeMapper {
+    _owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ptr: *const i8,
+    len: usize,
+}
+
+impl std::fmt::Debug for CodeMapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodeMapper")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CodeMapper {
+    /// A window over `bytes`, which must be the mapping `owner` holds.
+    ///
+    /// # Panics
+    ///
+    /// Never: `bytemuck` rejects only a misaligned pointer, and `i8` accepts
+    /// every alignment, so the cast cannot fail.
+    fn new(owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>, bytes: &[i8]) -> Self {
+        let (ptr, len) = (bytes.as_ptr(), bytes.len());
+        Self {
+            _owner: owner,
+            ptr,
+            len,
+        }
+    }
+
+    #[allow(unsafe_code)]
+    pub fn as_slice(&self) -> &[i8] {
+        // SAFETY: see the type's note - `_owner` is alive for `&self` and the
+        // bytes are immutable.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for CodeMapper {}
+#[allow(unsafe_code)]
+unsafe impl Sync for CodeMapper {}
+
 /// One compressed vector: the C++ `LVQData<f32, pair<f32,f32>, i8>` record.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LvqData {
@@ -39,7 +127,7 @@ pub struct LvqData {
     /// `(norm1 * scale, norm2 * scale^2)` for L2, `(norm1 * scale,
     /// <mean, code> * scale)` for cosine/inner product.
     pub local: (f32, f32),
-    pub code: Vec<i8>,
+    pub code: Code,
 }
 
 /// A compressed query: the reference's `LVQQuery`.
@@ -162,7 +250,7 @@ impl LvqStore {
             scale,
             bias,
             local,
-            code,
+            code: Code::Owned(code),
         };
         self.data.push(data);
         self.data.last().unwrap()
@@ -259,7 +347,7 @@ impl LvqStore {
                 scale,
                 bias,
                 local,
-                code,
+                code: Code::Owned(code),
             },
         }
     }
@@ -269,6 +357,7 @@ impl LvqStore {
         let d = self.data.get(index)?;
         Some(
             d.code
+                .as_slice()
                 .iter()
                 .enumerate()
                 .map(|(j, c)| f64::from(d.scale) * f64::from(*c) + f64::from(d.bias) + self.mean[j])
@@ -295,7 +384,7 @@ impl LvqStore {
         // dot product, exact in `i32`. This is the build's hottest function -
         // 706 of 1127 thread samples sat here on a SIFT 1M build - so it runs
         // the vectorized kernel rather than a scalar `map().sum()`.
-        let ip = i8_ip_residual(&q.code, &v.code);
+        let ip = i8_ip_residual(q.code.as_slice(), v.code.as_slice());
         match self.metric {
             Metric::L2 => {
                 let beta = q.bias - v.bias;
@@ -350,7 +439,7 @@ impl LvqStore {
             out.extend_from_slice(&d.bias.to_le_bytes());
             out.extend_from_slice(&d.local.0.to_le_bytes());
             out.extend_from_slice(&d.local.1.to_le_bytes());
-            for c in &d.code {
+            for c in d.code.as_slice() {
                 out.push(*c as u8);
             }
         }
@@ -417,23 +506,41 @@ impl LvqStore {
     }
 
     /// Loads the per-vector records into an existing meta.
-    pub fn load_records(&mut self, records: &[u8], n: usize) -> Option<()> {
+    /// Loads `n` records, borrowing their codes from `backing` when one is
+    /// given.
+    ///
+    /// Each record is `16` bytes of `scale`/`bias`/`local` followed by `dim`
+    /// `i8` codes. Only the 16 bytes are decoded; with `backing` the codes are a
+    /// window into the mapping, which is what keeps a load from allocating one
+    /// `Vec<i8>` per vector - 8.34M of them on the L scenario, for bytes that
+    /// are already `i8` and never change. Without it (an owned buffer, which is
+    /// what the tests and the builder pass) the codes are copied.
+    pub fn load_records(
+        &mut self,
+        records: &[u8],
+        backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
+        n: usize,
+    ) -> Option<()> {
         let record = self.record_size();
         if records.len() < n * record {
             return None;
         }
         let mut at = 0;
         self.data.clear();
+        self.data.reserve(n);
         for _ in 0..n {
             let scale = f32::from_le_bytes(records[at..at + 4].try_into().ok()?);
             let bias = f32::from_le_bytes(records[at + 4..at + 8].try_into().ok()?);
             let l0 = f32::from_le_bytes(records[at + 8..at + 12].try_into().ok()?);
             let l1 = f32::from_le_bytes(records[at + 12..at + 16].try_into().ok()?);
             at += 16;
-            let code = records[at..at + self.dim]
-                .iter()
-                .map(|b| *b as i8)
-                .collect();
+            let raw = &records[at..at + self.dim];
+            // `i8` accepts every alignment, so this cast cannot fail.
+            let codes: &[i8] = bytemuck::cast_slice(raw);
+            let code = match &backing {
+                Some(owner) => Code::Mapped(CodeMapper::new(std::sync::Arc::clone(owner), codes)),
+                None => Code::Owned(codes.to_vec()),
+            };
             at += self.dim;
             self.data.push(LvqData {
                 scale,
@@ -451,10 +558,13 @@ impl LvqStore {
         normalize: bool,
         meta: &[u8],
         records: &[u8],
+        // The mapping `records` points into, when there is one; see
+        // `load_records` for what passing it avoids.
+        backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
         n: usize,
     ) -> Option<Self> {
         let (mut store, _) = Self::from_meta(metric, normalize, meta)?;
-        store.load_records(records, n)?;
+        store.load_records(records, backing, n)?;
         Some(store)
     }
 
@@ -467,7 +577,7 @@ impl LvqStore {
     ) -> Option<(Self, usize)> {
         let (mut store, at) = Self::from_meta(metric, normalize, bytes)?;
         let record = store.record_size();
-        store.load_records(&bytes[at..], n)?;
+        store.load_records(&bytes[at..], None, n)?;
         Some((store, at + n * record))
     }
 }
@@ -655,9 +765,64 @@ mod tests {
         }
     }
 
+    /// Loading with a backing mapping must produce the same distances as
+    /// loading without one.
+    ///
+    /// The mapped path is what a loaded index takes and the copying path is what
+    /// the builder and every existing test take, so a divergence between them
+    /// would mean the codes read out of a chunk are not the codes written into
+    /// it - silently, since a distance is still a number.
+    #[test]
+    fn mapped_codes_match_the_copied_ones() {
+        let dim = 64;
+        let vec_n = 256;
+        let mut rng = Rng(7);
+        let stored: Vec<Vec<f32>> = (0..vec_n).map(|_| rng.vector(dim, 0.0, 1.0)).collect();
+        let mut built = LvqStore::new(dim, Metric::L2, false);
+        for v in &stored {
+            built.compress(v);
+        }
+        let meta = built.meta_bytes();
+        let records = built.records_bytes();
+
+        let copied =
+            LvqStore::from_parts(Metric::L2, false, &meta, &records, None, vec_n).expect("copied");
+        let owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> =
+            std::sync::Arc::new(records.clone());
+        // The window must point into the same bytes the mapping holds, so the
+        // test hands `from_parts` the `Arc`'s own buffer.
+        let mapped = LvqStore::from_parts(
+            Metric::L2,
+            false,
+            &meta,
+            owner.as_ref().as_ref(),
+            Some(std::sync::Arc::clone(&owner)),
+            vec_n,
+        )
+        .expect("mapped");
+
+        assert_eq!(copied.len(), mapped.len());
+        for i in 0..vec_n {
+            assert_eq!(
+                copied.data[i].code.as_slice(),
+                mapped.data[i].code.as_slice(),
+                "vector {i} codes differ"
+            );
+            assert_eq!(copied.data[i].scale, mapped.data[i].scale);
+            assert_eq!(copied.data[i].bias, mapped.data[i].bias);
+            let q = mapped.make_query(&stored[i]);
+            assert_eq!(
+                copied.distance(&q, i).unwrap(),
+                mapped.distance(&q, i).unwrap(),
+                "vector {i} distance differs"
+            );
+        }
+    }
+
     /// Reconstructs the LVQ vector a compressed record represents.
     fn decode(data: &LvqData, mean: &[f64]) -> Vec<f32> {
         data.code
+            .as_slice()
             .iter()
             .enumerate()
             .map(|(j, c)| data.scale * f32::from(*c) + data.bias + mean[j] as f32)

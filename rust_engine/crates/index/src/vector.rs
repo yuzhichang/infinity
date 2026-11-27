@@ -1529,11 +1529,14 @@ impl HnswIndex {
                     Metric::Ip => crate::lvq::Metric::Ip,
                     Metric::Cos => crate::lvq::Metric::Cos,
                 };
+                // `backing` is moved in: the codes borrow the mapping, so the
+                // store has to keep it alive.
                 Store::Lvq(crate::lvq::LvqStore::from_parts(
                     lvq_metric,
                     metric == Metric::Cos,
                     meta,
                     records,
+                    backing,
                     n,
                 )?)
             }
