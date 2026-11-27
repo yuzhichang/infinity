@@ -509,6 +509,109 @@ pub fn decode_graph_region(
     Ok(out)
 }
 
+/// The graph region as three flat arrays: `offsets[layer][node]` indexes into
+/// `neighbors[layer]`.
+///
+/// This is the shape a loaded index actually searches with - the CSR the
+/// `HnswIndex` keeps - so decoding straight into it avoids the two conversions
+/// the nested form needs: bytes to `Vec<Vec<u32>>` per vertex, then that to
+/// `Vec<Vec<usize>>`, then that to the flat arrays again. On the L scenario the
+/// nested form was 8.34M vertices x (one `Vec` for level 0 + one per upper
+/// layer), about 17M allocations, and two full copies of the adjacency data.
+///
+/// `neighbors` stays `u32` because that is what the file holds and what a node
+/// id is; widening to `usize` doubles the bytes for no gain.
+pub struct FlatGraphRegion {
+    /// `offsets[layer]` has `vertex_count + 1` entries, the last being the
+    /// layer's total neighbor count.
+    pub offsets: Vec<Vec<u32>>,
+    /// Neighbor ids, one array per layer.
+    pub neighbors: Vec<Vec<u32>>,
+}
+
+/// Decodes a `GraphStoreInner` region into CSR form, in one pass.
+///
+/// The same layout [`decode_graph_region`] reads, but without building a
+/// `Vec`-of-`Vec` per vertex: every layer's neighbor block is filled into one
+/// contiguous array as the vertices are walked.
+pub fn decode_graph_region_flat(
+    bytes: &[u8],
+    vertex_count: usize,
+    mmax0: u64,
+    mmax: u64,
+) -> Result<FlatGraphRegion, FormatError> {
+    let l0 = level0_stride(VERTEX_L0_SIZE, mmax0);
+    let lx = levelx_stride(VERTEX_LX_SIZE, mmax);
+    if bytes.len() < 8 {
+        return Err(FormatError::Truncated {
+            need: 8,
+            got: bytes.len(),
+        });
+    }
+    let layer_sum = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let upper_at = 8 + vertex_count * l0;
+    if bytes.len() != upper_at + layer_sum as usize * lx {
+        return Err(FormatError::Truncated {
+            need: upper_at + layer_sum as usize * lx,
+            got: bytes.len(),
+        });
+    }
+
+    // Level 0 first: its stride is fixed, so the offsets are one sequential
+    // pass and the neighbor block is its exact total.
+    let mut level0_offsets = Vec::with_capacity(vertex_count + 1);
+    level0_offsets.push(0u32);
+    let mut level0_neighbors: Vec<u32> = Vec::new();
+    for v in 0..vertex_count {
+        let at = 8 + v * l0;
+        let n = i32::from_le_bytes(bytes[at + 16..at + 20].try_into().unwrap()).max(0) as usize;
+        for k in 0..n {
+            let s = at + 20 + k * 4;
+            level0_neighbors.push(u32::from_le_bytes(bytes[s..s + 4].try_into().unwrap()));
+        }
+        level0_offsets.push(level0_neighbors.len() as u32);
+    }
+
+    // Upper layers are interleaved by vertex (`upper_at + layers_p + l * lx`),
+    // so they are collected per vertex and then laid out a layer at a time.
+    let max_layer = (0..vertex_count)
+        .map(|v| {
+            let at = 8 + v * l0;
+            i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).max(0) as usize
+        })
+        .max()
+        .unwrap_or(0);
+    let mut offsets = Vec::with_capacity(max_layer + 1);
+    let mut neighbors = Vec::with_capacity(max_layer + 1);
+    offsets.push(level0_offsets);
+    neighbors.push(level0_neighbors);
+    for layer in 0..max_layer {
+        let mut layer_offsets = Vec::with_capacity(vertex_count + 1);
+        layer_offsets.push(0u32);
+        let mut layer_neighbors: Vec<u32> = Vec::new();
+        for v in 0..vertex_count {
+            let at = 8 + v * l0;
+            let layer_count =
+                i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).max(0) as usize;
+            if layer < layer_count {
+                let layers_p =
+                    u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+                let s = upper_at + layers_p + layer * lx;
+                let n = i32::from_le_bytes(bytes[s..s + 4].try_into().unwrap()).max(0) as usize;
+                for k in 0..n {
+                    let e = s + 4 + k * 4;
+                    layer_neighbors.push(u32::from_le_bytes(bytes[e..e + 4].try_into().unwrap()));
+                }
+            }
+            layer_offsets.push(layer_neighbors.len() as u32);
+        }
+        offsets.push(layer_offsets);
+        neighbors.push(layer_neighbors);
+    }
+
+    Ok(FlatGraphRegion { offsets, neighbors })
+}
+
 // ---------------------------------------------------------------------------
 // IVF chunk (plain storage) — spec §9.2
 // ---------------------------------------------------------------------------
@@ -1552,6 +1655,58 @@ mod tests {
 
         let decoded = decode_graph_region(&bytes, vertices.len(), mmax0, mmax).unwrap();
         assert_eq!(decoded, vertices);
+    }
+
+    /// The flat decoder must produce exactly what the nested one produces -
+    /// it is the path a loaded index takes, and a mismatch would silently
+    /// search the wrong neighbours.
+    #[test]
+    fn graph_region_flat_matches_the_nested_decoder() {
+        let mmax0 = 4u64;
+        let mmax = 2u64;
+        let vertices = vec![
+            HnswGraphVertex {
+                layer_count: 1,
+                neighbors_l0: vec![1, 2],
+                upper: vec![vec![3]],
+            },
+            HnswGraphVertex {
+                layer_count: 0,
+                neighbors_l0: vec![0],
+                upper: vec![],
+            },
+            HnswGraphVertex {
+                layer_count: 2,
+                neighbors_l0: vec![0, 1],
+                upper: vec![vec![1], vec![2]],
+            },
+            HnswGraphVertex {
+                layer_count: 0,
+                neighbors_l0: vec![],
+                upper: vec![],
+            },
+        ];
+        let bytes = encode_graph_region(&vertices, mmax0, mmax);
+        let nested = decode_graph_region(&bytes, vertices.len(), mmax0, mmax).unwrap();
+        let flat = decode_graph_region_flat(&bytes, vertices.len(), mmax0, mmax).unwrap();
+
+        assert_eq!(
+            flat.offsets.len(),
+            3,
+            "three layers: level 0 plus two upper"
+        );
+        for (layer, (offsets, neighbors)) in flat.offsets.iter().zip(&flat.neighbors).enumerate() {
+            assert_eq!(offsets.len(), vertices.len() + 1);
+            for node in 0..vertices.len() {
+                let expect: &[u32] = if layer == 0 {
+                    &nested[node].neighbors_l0
+                } else {
+                    nested[node].upper.get(layer - 1).map_or(&[], |v| v)
+                };
+                let got = &neighbors[offsets[node] as usize..offsets[node + 1] as usize];
+                assert_eq!(got, expect, "layer {layer} node {node}");
+            }
+        }
     }
 
     #[test]

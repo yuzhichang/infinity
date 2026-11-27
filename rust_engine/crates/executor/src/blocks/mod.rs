@@ -67,7 +67,9 @@ pub(crate) struct HnswChunkParts<'a> {
     /// its vectors, graph and labels where the publisher left them.
     pub(crate) store_meta: &'a [u8],
     pub(crate) records: &'a [u8],
-    pub(crate) vertices: Vec<knn_format::HnswGraphVertex>,
+    /// CSR adjacency, decoded in one pass. The nested `Vec<Vec<u32>>` form
+    /// was one allocation per vertex; this is two vectors per layer.
+    pub(crate) graph: knn_format::FlatGraphRegion,
     pub(crate) labels: &'a [u32],
     pub(crate) options: HnswOptions,
 }

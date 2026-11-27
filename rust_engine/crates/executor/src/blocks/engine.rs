@@ -7934,8 +7934,8 @@ impl Engine {
             knn_format::VERTEX_LX_SIZE,
         )
         .ok()?;
-        let vertices = knn_format::decode_graph_region(
-            &chunk.graph,
+        let graph = knn_format::decode_graph_region_flat(
+            chunk.graph,
             chunk.cur_vec_num as usize,
             chunk.mmax0,
             chunk.mmax,
@@ -7950,7 +7950,7 @@ impl Engine {
             enterpoint: (chunk.enterpoint >= 0).then_some(chunk.enterpoint as usize),
             store_meta: chunk.store_meta,
             records: chunk.vectors,
-            vertices,
+            graph,
             labels: chunk.labels,
             options,
         })
@@ -7967,28 +7967,37 @@ impl Engine {
         if parts.n == 0 {
             return None;
         }
-        let levels: Vec<usize> = parts
-            .vertices
-            .iter()
-            .map(|v| v.layer_count.max(0) as usize)
+        // Each vertex's level is how many upper layers it appears in: the CSR
+        // offsets for layer 0 count every vertex, so the level is one less than
+        // the number of layers whose offset grew at this node.
+        let levels: Vec<usize> = (0..parts.n)
+            .map(|node| {
+                (1..parts.graph.offsets.len())
+                    .filter(|&l| parts.graph.offsets[l][node + 1] > parts.graph.offsets[l][node])
+                    .count()
+            })
             .collect();
-        let mut links: Vec<Vec<Vec<usize>>> = vec![Vec::new()];
-        for (node, v) in parts.vertices.iter().enumerate() {
-            while links[0].len() <= node {
-                links[0].push(Vec::new());
-            }
-            links[0][node] = v.neighbors_l0.iter().map(|&x| x as usize).collect();
-            for (l, nbrs) in v.upper.iter().enumerate() {
-                let layer = l + 1;
-                while links.len() <= layer {
-                    links.push(Vec::new());
-                }
-                while links[layer].len() <= node {
-                    links[layer].push(Vec::new());
-                }
-                links[layer][node] = nbrs.iter().map(|&x| x as usize).collect();
-            }
-        }
+        // The flat region is already the CSR the index searches with, so it is
+        // moved through rather than rebuilt: the previous shape allocated one
+        // `Vec` per vertex here and copied every neighbor twice (u32 -> usize ->
+        // flat).
+        let links: Vec<Vec<Vec<usize>>> = parts
+            .graph
+            .offsets
+            .iter()
+            .zip(&parts.graph.neighbors)
+            .map(|(offsets, neighbors)| {
+                offsets
+                    .windows(2)
+                    .map(|w| {
+                        neighbors[w[0] as usize..w[1] as usize]
+                            .iter()
+                            .map(|&n| n as usize)
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
         let entry = parts.enterpoint.map(|e| e.min(parts.n.saturating_sub(1)));
         let graph_bytes: usize = links
             .iter()
