@@ -323,28 +323,17 @@ async fn configure_server(
     // for the one setting that is read here rather than from the map.
     let wal_flush = txn::WalFlush::parse(resolved.wal_flush()).unwrap_or(txn::DEFAULT_WAL_FLUSH);
     engine.set_wal_flush(wal_flush);
-    let explicit_buffer_size = configured_size(text, "buffer_manager_size")?.unwrap_or_default();
-    let (buffer_size, govern_rss) = executor::scheduler()
-        .spawn_blocking(move || {
-            if explicit_buffer_size > 0 {
-                return (explicit_buffer_size, true);
-            }
-            let cgroup_memory = executor::memory::cgroup_memory_limit_bytes();
-            (
-                config::default_buffer_manager_size(cgroup_memory),
-                cgroup_memory.is_none(),
-            )
-        })
-        .await;
+    // `[buffer] buffer_manager_size`, already resolved by `Config`: the file's
+    // value, or 90% of physical memory when it names none. Always a number -
+    // the reclaimer compares the process's resident size against it, so a
+    // config-less server must still be governed (that is what the shipped
+    // configs pinning 4GB on a 30 GiB host used to prevent).
+    let buffer_size = resolved.buffer_manager_size();
     engine.set_buffer_budget(usize::try_from(buffer_size).unwrap_or(usize::MAX));
-    if govern_rss {
-        engine.set_memory_limit(buffer_size);
-    }
-    let unsealed_quota = match configured_size(text, "unsealed_memory_quota")? {
-        Some(bytes) => bytes,
-        None => configured_size(text, "memindex_memory_quota")?.unwrap_or(buffer_size / 2),
-    };
-    engine.set_unsealed_memory_quota(unsealed_quota);
+    engine.set_memory_limit(buffer_size as u64);
+    // Half of the resolved buffer unless the file names its own value; the
+    // getter derives both from the same figure, so they cannot disagree.
+    engine.set_unsealed_memory_quota(resolved.mem_index_memory_quota() as u64);
     // `[storage] mem_index_capacity` — rows an in-memory index holds before it
     // is dumped into a sealed chunk (the reference defaults to 65536 rows).
     let capacity = toml_value(text, "mem_index_capacity")
@@ -405,7 +394,36 @@ async fn configure_server(
             )
             .await;
     }
+    // The settings in force, once, at info level. Everything above has been
+    // applied by now, so these are the numbers the process will act on - not
+    // the file's text. It matters most for the two that are derived when the
+    // file omits them: a deployment that inherits a memory ceiling it did not
+    // ask for can see that here instead of inferring it from an OOM kill.
+    //
+    // `maintenance` skips the background loops above, so its line says so.
+    let mode = if maintenance {
+        "maintenance"
+    } else {
+        "serving"
+    };
+    // One line. The dump is something an operator greps out of a log or pastes
+    // into a bug report, and 34 lines of prose is neither: a single JSON object
+    // survives a copy-paste intact and a reader can pick a key out of it.
+    log_info(&format!(
+        "starting in {mode} mode; configuration in effect: {}",
+        config::settings_json(&resolved.resolved_settings())
+    ));
     Ok(())
+}
+
+/// One `info` line on stderr.
+///
+/// The CLI has no logging crate: the engine's own `[log]` settings are not
+/// wired to a subscriber, so every message it emits is an `eprintln!`. This
+/// keeps that shape and prefixes the level, so a line can be grepped like the
+/// warnings `configure_server` already prints.
+fn log_info(message: &str) {
+    eprintln!("info: {message}");
 }
 
 /// `SELECT ROW_ID() FROM <table> SEARCH MATCH VECTOR (...)` — the statement
@@ -502,55 +520,6 @@ fn parse_interval_secs(text: &str) -> Option<u64> {
         return None;
     }
     Some(secs)
-}
-
-/// Parses a size like `1KB`, `512MB`, `8GB`, `2B` or a bare byte count.
-///
-/// `None` is an unparseable or negative value. The `B` suffix is a factor of
-/// one - the engine's end-to-end tests set a two-byte quota to force a drain -
-/// and an empty string means zero (no bytes given, no bytes configured).
-fn parse_size_bytes(text: &str) -> Option<u64> {
-    let t = text.trim();
-    if t.is_empty() {
-        return Some(0);
-    }
-    let upper = t.to_ascii_uppercase();
-    let (num, scale) = if let Some(v) = upper.strip_suffix("KB") {
-        (v, 1024.0)
-    } else if let Some(v) = upper.strip_suffix("MB") {
-        (v, 1024.0 * 1024.0)
-    } else if let Some(v) = upper.strip_suffix("GB") {
-        (v, 1024.0 * 1024.0 * 1024.0)
-    } else if let Some(v) = upper.strip_suffix('B') {
-        (v, 1.0)
-    } else if upper.ends_with("TB") || upper.ends_with("PB") {
-        return None;
-    } else {
-        (upper.as_str(), 1.0)
-    };
-    let value: f64 = num.trim().parse().ok()?;
-    if !value.is_finite() || value < 0.0 {
-        return None;
-    }
-    Some((value * scale) as u64)
-}
-
-/// Reads a `[buffer]`/`[storage]` byte setting, reporting the key on a bad value.
-///
-/// An absent key keeps the caller's default; an unparseable one stops startup
-/// with a message naming the field. Silently reading it as zero would disable a
-/// quota (or pick an arbitrary default), which is the opposite of what an
-/// operator who wrote `"512MiB"` asked for.
-fn configured_size(text: &str, key: &str) -> common::Result<Option<u64>> {
-    match toml_value(text, key) {
-        None => Ok(None),
-        Some(raw) if raw.trim().is_empty() => Ok(None),
-        Some(raw) => parse_size_bytes(&raw).map(Some).ok_or_else(|| {
-            common::Error::Invalid(format!(
-                "[buffer] {key}: '{raw}' is not a byte size (expected e.g. \"512MB\", \"2B\" or a bare byte count)"
-            ))
-        }),
-    }
 }
 
 /// The same for a duration setting.
@@ -1259,41 +1228,17 @@ mod config_parse_tests {
         assert_eq!(parse_interval_secs("-5s"), None);
     }
 
-    /// `B` is a factor of one, and an unparseable size is `None` - never `0`,
-    /// which would disable the quota it configures.
-    #[test]
-    fn a_byte_size_is_parsed_or_refused() {
-        assert_eq!(parse_size_bytes("2B"), Some(2));
-        assert_eq!(parse_size_bytes("4096"), Some(4096));
-        assert_eq!(parse_size_bytes("512MB"), Some(512 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("1GB"), Some(1024 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("512MiB"), None);
-        assert_eq!(parse_size_bytes("-1"), None);
-        assert_eq!(parse_size_bytes("1TB"), None);
-    }
-
     /// The error names the field, so an operator can find it in the file.
+    ///
+    /// The byte-size settings go through `config::Config`, which reports a bad
+    /// value by name; this covers the duration one still read here.
     #[test]
-    fn an_invalid_quota_names_its_field() {
-        let text = "unsealed_memory_quota = \"512MiB\"\n";
-        let err = configured_size(text, "unsealed_memory_quota")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unsealed_memory_quota"), "{err}");
-        assert!(err.contains("512MiB"), "{err}");
-
+    fn an_invalid_interval_names_its_field() {
         let text = "unsealed_reclaim_interval = \"250ms\"\n";
         let err = configured_interval(text, "unsealed_reclaim_interval")
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsealed_reclaim_interval"), "{err}");
-
-        // An absent key keeps the caller's default; an explicit zero is kept.
-        assert_eq!(configured_size("", "unsealed_memory_quota").unwrap(), None);
-        assert_eq!(
-            configured_size("unsealed_memory_quota = \"0\"\n", "unsealed_memory_quota").unwrap(),
-            Some(0)
-        );
     }
 
     /// An inline comment after a quoted value is not part of the value.
@@ -1306,10 +1251,6 @@ mod config_parse_tests {
         assert_eq!(
             toml_value(text, "unsealed_memory_quota").as_deref(),
             Some("512MB")
-        );
-        assert_eq!(
-            configured_size(text, "unsealed_memory_quota").unwrap(),
-            Some(512 * 1024 * 1024)
         );
         // A `#` inside the quotes is part of the value.
         let text = "temp_dir = \"/var/inf#inity/tmp\"\n";

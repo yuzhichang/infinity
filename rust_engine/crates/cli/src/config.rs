@@ -116,6 +116,16 @@ pub enum StorageType {
     Minio,
 }
 
+impl StorageType {
+    /// The spelling `[storage] storage_type` accepts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageType::Local => "local",
+            StorageType::Minio => "minio",
+        }
+    }
+}
+
 /// C++: `Config`.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -161,7 +171,17 @@ pub struct Config {
 
     lru_num: usize,
     temp_dir: String,
-    buffer_manager_size: i64,
+    /// `[buffer] buffer_manager_size`, or `None` when the file does not name it.
+    ///
+    /// `None` is not "unlimited": it means the ceiling is 90% of this machine's
+    /// physical memory (`default_buffer_manager_size`), which is what a server
+    /// started without a config gets. A shipped file that pinned `4GB` made
+    /// that default unreachable, and on a 30 GiB host it capped ingest at an
+    /// eighth of the RAM nobody asked it to cap.
+    buffer_manager_size: Option<i64>,
+    /// `[buffer] unsealed_memory_quota`. `None` derives it from
+    /// `buffer_manager_size` (half), so the two cannot be configured out of
+    /// step by a file that only sets one.
     mem_index_memory_quota: Option<i64>,
     /// `[buffer] unsealed_reclaim_interval` in seconds: the sweep's period.
     unsealed_reclaim_interval: u64,
@@ -230,9 +250,7 @@ impl Default for Config {
             snapshot_dir: "/var/infinity/snapshot".into(),
             lru_num: 7,
             temp_dir: "/var/infinity/tmp".into(),
-            buffer_manager_size: default_buffer_manager_size(
-                executor::memory::cgroup_memory_limit_bytes(),
-            ) as i64,
+            buffer_manager_size: None,
             mem_index_memory_quota: None,
             unsealed_reclaim_interval: 30,
             unsealed_max_tables_per_round: 100,
@@ -438,7 +456,7 @@ impl Config {
             ("buffer", "buffer_manager_size") => {
                 let bytes = parse_byte_size(&string())?;
                 if bytes > 0 {
-                    self.buffer_manager_size = bytes;
+                    self.buffer_manager_size = Some(bytes);
                 }
             }
             ("buffer", "lru_num") => self.lru_num = integer()? as usize,
@@ -658,9 +676,15 @@ impl Config {
     pub fn temp_dir(&self) -> &str {
         &self.temp_dir
     }
+    /// `[buffer] unsealed_memory_quota`.
+    ///
+    /// Half of whatever `buffer_manager_size` resolved to - including the
+    /// machine-derived default - so a file that names only the buffer still
+    /// gets a quota in proportion to it, instead of a hardcoded 1 GiB that
+    /// could be a fiftieth of the buffer on a large host.
     pub fn mem_index_memory_quota(&self) -> i64 {
         self.mem_index_memory_quota
-            .unwrap_or(self.buffer_manager_size / 2)
+            .unwrap_or(self.buffer_manager_size() / 2)
     }
     /// `[buffer] unsealed_reclaim_interval` in seconds; `0` stops the sweep.
     pub fn unsealed_reclaim_interval(&self) -> u64 {
@@ -671,8 +695,17 @@ impl Config {
         self.unsealed_max_tables_per_round
     }
     /// `[buffer] buffer_manager_size` in bytes.
+    /// `[buffer] buffer_manager_size` in bytes.
+    ///
+    /// When the file does not name it the ceiling is 90% of this machine's
+    /// physical memory, the same figure a config-less start uses. That is a
+    /// value, not "unlimited": the memory governance compares the process's
+    /// resident size against it, so leaving it unset must still produce a
+    /// number the reclaimer can act on.
     pub fn buffer_manager_size(&self) -> i64 {
-        self.buffer_manager_size
+        self.buffer_manager_size.unwrap_or_else(|| {
+            default_buffer_manager_size(executor::memory::cgroup_memory_limit_bytes()) as i64
+        })
     }
     pub fn checkpoint_interval(&self) -> u64 {
         self.checkpoint_interval
@@ -723,6 +756,143 @@ impl Config {
                 Some((*key, value))
             })
             .collect()
+    }
+
+    /// Every setting this engine acts on, with the value in force.
+    ///
+    /// `config_values` is the `SHOW CONFIGS` contract (what a client may read
+    /// and `SET CONFIG` may write); this is the diagnostics list, printed once
+    /// at startup. The two differ on purpose: this one includes the settings
+    /// that only a file can set (`buffer_manager_size`, the WAL directory, the
+    /// derived quota) and the ones a deployment most often gets wrong, so an
+    /// operator can see what the process actually decided instead of
+    /// reconstructing it from a file whose defaults may have changed.
+    ///
+    /// Values are rendered with their unit where they have one
+    /// (`buffer_manager_size = 27GiB`), because the point of the line is to be
+    /// comparable against `ps` and `free`.
+    pub fn resolved_settings(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("version", self.version.clone()),
+            (
+                "time_zone",
+                format!("{} (bias {})", self.time_zone, self.time_zone_bias),
+            ),
+            ("cpu_limit", self.cpu_limit.to_string()),
+            ("server_address", self.server_address.clone()),
+            ("postgres_port", self.postgres_port.to_string()),
+            ("http_port", self.http_port.to_string()),
+            ("client_port", self.client_port.to_string()),
+            (
+                "connection_pool_size",
+                self.connection_pool_size.to_string(),
+            ),
+            ("data_dir", self.data_dir.clone()),
+            ("catalog_dir", self.catalog_dir().to_string()),
+            ("wal_dir", self.wal_dir.clone()),
+            ("snapshot_dir", self.snapshot_dir.clone()),
+            ("persistence_dir", self.persistence_dir.clone()),
+            ("storage_type", self.storage_type.as_str().to_string()),
+            (
+                "buffer_manager_size",
+                bytes_human(self.buffer_manager_size()),
+            ),
+            (
+                "unsealed_memory_quota",
+                bytes_human(self.mem_index_memory_quota()),
+            ),
+            (
+                "unsealed_reclaim_interval",
+                format!("{}s", self.unsealed_reclaim_interval),
+            ),
+            (
+                "unsealed_max_tables_per_round",
+                self.unsealed_max_tables_per_round.to_string(),
+            ),
+            ("mem_index_capacity", self.mem_index_capacity.to_string()),
+            ("lru_num", self.lru_num.to_string()),
+            ("temp_dir", self.temp_dir.clone()),
+            ("log_level", self.log_level.as_str().to_string()),
+            ("log_dir", self.log_dir.clone()),
+            ("log_filename", self.log_filename.clone()),
+            ("log_to_stdout", self.log_to_stdout.to_string()),
+            (
+                "optimize_interval",
+                format!("{}s", self.optimize_index_interval()),
+            ),
+            ("cleanup_interval", format!("{}s", self.cleanup_interval)),
+            ("compact_interval", format!("{}s", self.compact_interval)),
+            (
+                "checkpoint_interval",
+                format!("{}s", self.checkpoint_interval),
+            ),
+            (
+                "wal_compact_threshold",
+                bytes_human(self.wal_compact_threshold),
+            ),
+            ("wal_flush", self.wal_flush.clone()),
+            ("result_cache", self.result_cache.clone()),
+            (
+                "cache_result_capacity",
+                self.cache_result_capacity.to_string(),
+            ),
+            ("resource_dir", self.resource_dir.clone()),
+        ]
+    }
+}
+
+/// The settings in the startup dump as one JSON object.
+///
+/// One line, not one per entry: the dump is meant to be grepped out of a log or
+/// pasted into a bug report as a single value, and a 34-line block is neither.
+/// Values stay strings (`"27GiB"`) even where they are numeric, because they
+/// carry their unit and `free`/`ps` show the same scale - a client that wants
+/// the number can parse it, and one that wants the line does not have to know
+/// which keys are numeric.
+pub fn settings_json(settings: &[(&'static str, String)]) -> String {
+    let body = settings
+        .iter()
+        .map(|(key, value)| format!("\"{}\":\"{}\"", json_escape(key), json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+/// RFC 8259 string escaping for the dump.
+///
+/// A path can carry a quote or a backslash (`temp_dir = "/var/a\\b"`), and a
+/// bare `"` in the middle of the object makes it unparseable. The server has
+/// its own copy for the HTTP body; this is the same rule, kept local because
+/// `cli` does not depend on `server`'s private helpers.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// A byte count as an operator reads it (`27GiB`, `512MiB`, `0B`).
+///
+/// Binary units with one decimal below a GiB, none above: the numbers this
+/// prints are compared against `ps`/`free`, which report the same scale.
+fn bytes_human(bytes: i64) -> String {
+    const GIB: i64 = 1024 * 1024 * 1024;
+    const MIB: i64 = 1024 * 1024;
+    if bytes >= GIB {
+        format!("{}GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{}MiB", bytes / MIB)
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -1133,6 +1303,118 @@ wal_flush = "only_write"
         );
         assert_eq!(c.wal_flush(), "only_write");
         assert_eq!(c.log_level(), LogLevel::Debug);
+    }
+
+    /// An absent `buffer_manager_size` resolves to 90% of physical memory, and
+    /// an absent `unsealed_memory_quota` to half of whatever that is.
+    ///
+    /// Both used to be reachable only through a config file, and every shipped
+    /// file pinned `4GB` - so a 30 GiB host ran with an eighth of its memory and
+    /// the derived quota never applied. The two are now computed from one
+    /// figure, which is what this pins.
+    #[test]
+    fn memory_budgets_are_derived_when_the_file_names_none() {
+        let config = Config::default();
+        assert_eq!(
+            config.buffer_manager_size(),
+            default_buffer_manager_size(executor::memory::cgroup_memory_limit_bytes()) as i64,
+            "no entry means the machine-derived ceiling"
+        );
+        assert_eq!(
+            config.mem_index_memory_quota(),
+            config.buffer_manager_size() / 2,
+            "the quota follows the buffer"
+        );
+
+        // A file that pins only the buffer still gets a proportional quota.
+        let mut config = Config::default();
+        config
+            .apply_text("[buffer]\nbuffer_manager_size = \"8GB\"\n")
+            .unwrap();
+        assert_eq!(config.buffer_manager_size(), 8 * 1024 * 1024 * 1024);
+        assert_eq!(
+            config.mem_index_memory_quota(),
+            4 * 1024 * 1024 * 1024,
+            "half of the configured buffer, not a hardcoded value"
+        );
+
+        // A file that pins only the quota keeps it, whatever the buffer resolves to.
+        let mut config = Config::default();
+        config
+            .apply_text("[buffer]\nunsealed_memory_quota = \"2GB\"\n")
+            .unwrap();
+        assert_eq!(config.mem_index_memory_quota(), 2 * 1024 * 1024 * 1024);
+    }
+
+    /// The startup dump names every setting the engine acts on, derived values
+    /// included.
+    #[test]
+    fn the_startup_dump_covers_the_settings_that_are_derived() {
+        let config = Config::default();
+        let dump: std::collections::HashMap<_, _> =
+            config.resolved_settings().into_iter().collect();
+
+        for key in [
+            "buffer_manager_size",
+            "unsealed_memory_quota",
+            "wal_flush",
+            "catalog_dir",
+            "storage_type",
+            "log_level",
+        ] {
+            assert!(dump.contains_key(key), "{key} is missing from the dump");
+        }
+        // Rendered with a unit, so it can be compared against `free` directly.
+        assert!(
+            dump["buffer_manager_size"].ends_with("GiB")
+                || dump["buffer_manager_size"].ends_with("MiB"),
+            "{}",
+            dump["buffer_manager_size"]
+        );
+        assert_eq!(
+            dump["storage_type"], "local",
+            "spelled as the config takes it"
+        );
+        assert_eq!(dump["log_level"], "info", "spelled as the config takes it");
+    }
+
+    /// The dump is one JSON object on one line, and it parses.
+    ///
+    /// One line per entry read as 34 unrelated log lines; a single object is
+    /// what an operator can paste into a report. A path with a quote in it must
+    /// not break the object, which is why the escaping is not optional.
+    #[test]
+    fn the_startup_dump_is_one_parseable_json_line() {
+        let config = Config::default();
+        let line = settings_json(&config.resolved_settings());
+
+        assert!(!line.contains('\n'), "one line: {line:?}");
+        assert!(line.starts_with('{') && line.ends_with('}'), "{line}");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).expect("the dump must be valid JSON");
+        let object = parsed.as_object().expect("a JSON object");
+        assert_eq!(
+            object.len(),
+            config.resolved_settings().len(),
+            "every setting is serialised once"
+        );
+        // The derived values are the reason the dump exists; they have to be in it.
+        assert!(
+            object["buffer_manager_size"]
+                .as_str()
+                .expect("a string")
+                .contains("iB"),
+            "the ceiling carries its unit"
+        );
+        assert!(object.contains_key("unsealed_memory_quota"));
+        assert_eq!(object["wal_flush"], "flush_per_second");
+
+        // A value containing a quote and a backslash still yields valid JSON.
+        let awkward = vec![("temp_dir", r#"/var/a"b\c"#.to_string())];
+        let line = settings_json(&awkward);
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["temp_dir"], r#"/var/a"b\c"#);
     }
 
     /// Every shipped config must load, not just the one the round-trip test

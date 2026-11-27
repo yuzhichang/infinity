@@ -541,6 +541,7 @@ dependencies = [
  "executor",
  "mimalloc",
  "parser",
+ "serde_json",
  "server",
  "sqllogictest",
  "storage",

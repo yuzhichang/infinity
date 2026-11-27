@@ -33,5 +33,10 @@ server.workspace = true
 mimalloc.workspace = true
 sqllogictest = "0.29.1"
 
+[dev-dependencies]
+# The startup dump is JSON; parsing it in the test is what proves it is one
+# object on one line rather than 34 lines that merely look like JSON.
+serde_json.workspace = true
+
 [lints]
 workspace = true

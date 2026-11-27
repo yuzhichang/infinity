@@ -47,11 +47,14 @@ mem_index_capacity       = 65536
 snapshot_dir            = "/var/infinity/snapshots"
 
 [buffer]
-buffer_manager_size      = "4GB"
+# Left unset on purpose: 90% of this machine's physical memory, or the cgroup
+# limit when the process runs under one. Pin a value only to cap below that.
+# buffer_manager_size    = "4GB"
 lru_num                  = 7
 temp_dir                 = "/var/infinity/tmp"
 result_cache             = "off"
-unsealed_memory_quota    = "1GB"
+# Half of buffer_manager_size (including the derived default) when omitted.
+# unsealed_memory_quota  = "1GB"
 # Periodic reclaim of memory that is not on disk yet (buffer + index tails):
 # tables nobody writes any more would otherwise hold it until the process ends.
 # A round sorts every such table by fused size/age ranks and dumps until the
