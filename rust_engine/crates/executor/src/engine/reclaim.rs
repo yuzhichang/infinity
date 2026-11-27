@@ -477,6 +477,29 @@ impl Engine {
         // net for drift.
         self.refresh_memindex_charge(key);
 
+        // Hand the released buffers back to the OS. Without this the dump's
+        // effect is invisible: the rows and index tails leave `unsealed_live`,
+        // but mimalloc keeps their arenas, so RSS does not move and
+        // `reclaim_memory` - which reports `before - after` on resident size -
+        // counts the pass as having released nothing. That is what let a round
+        // which had drained eight tables still log "nothing left to release"
+        // while the process sat above its critical watermark.
+        //
+        // The arenas are the ones this dump filled: encoding a block and
+        // sealing an index tail both build their output before writing it, and
+        // it is those temporaries RSS was still holding. `index_build` makes the
+        // same call after every seal, for the same reason; `trim_allocator`
+        // itself explains why nothing else reaches them.
+        //
+        // Measured on a 34 MiB unsealed table: RSS 149 -> 113 MiB with this
+        // line, 149 -> 239 MiB without it. It costs ~1.6 ms there and ~6 ms on a
+        // 139 MiB one, against a dump of 174 ms / 681 ms - the walk scales with
+        // the heap, not with what was freed, so it stays a small bounded stop on
+        // a path that just wrote blocks and sealed a graph. `seal_index_tail`
+        // makes the same blocking call inline in an async fn for the same
+        // reason.
+        storage::trim_allocator();
+
         let after = self.unsealed_live_of(key);
         let released = after < before;
         let still_unsealed = self.table_has_unsealed(key);

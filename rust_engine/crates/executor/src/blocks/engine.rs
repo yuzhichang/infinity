@@ -7882,8 +7882,8 @@ impl Engine {
             (parts.ef as usize).max(64),
             parts.options.metric,
             parts.options.encoding,
-            &parts.store_meta,
-            &parts.records,
+            parts.store_meta,
+            parts.records,
             Some(backing.clone()),
             parts.n,
             Vec::new(),
@@ -8005,8 +8005,8 @@ impl Engine {
             (parts.ef as usize).max(64),
             parts.options.metric,
             parts.options.encoding,
-            &parts.store_meta,
-            &parts.records,
+            parts.store_meta,
+            parts.records,
             Some(backing.clone()),
             parts.n,
             levels,
@@ -9308,9 +9308,7 @@ impl Engine {
         // hand the job to", not the engine itself. An engine built without an
         // `Arc` (a unit test) has neither a pool nor a worker to protect.
         if self.engine_handle().is_none() {
-            index
-                .add_multiple_docs_embeddings(&flat, &lens)
-                .map_err(Into::into)?;
+            index.add_multiple_docs_embeddings(&flat, &lens)?;
             return Ok((index, count));
         }
         crate::scheduler::scheduler()
