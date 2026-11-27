@@ -19707,12 +19707,17 @@ mod tests {
         e.execute("CREATE TABLE ri (id INT);").await.unwrap();
         e.execute("INSERT INTO ri VALUES (1);").await.unwrap();
         let key = e.table_key("default_db.ri");
-        e.tables.lock().unwrap().get_mut(&key).unwrap().importing = 1;
+        e.tables
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .writes_in_flight = 1;
 
         let dumped = e.reclaim_unsealed().await;
         assert_eq!(
             dumped, 0,
-            "an importing table is excluded from the candidates"
+            "an writes_in_flight table is excluded from the candidates"
         );
         assert!(
             e.tables
@@ -19725,7 +19730,7 @@ mod tests {
         );
     }
 
-    /// Under pressure an importing table *is* a candidate, and the dump takes
+    /// Under pressure an writes_in_flight table *is* a candidate, and the dump takes
     /// only its committed rows.
     ///
     /// The marker means "these rows are not settled yet", not "uncommitted" - an
@@ -19751,7 +19756,12 @@ mod tests {
             .map(|entry| entry.unsealed_bytes())
             .unwrap_or(0);
         assert!(before > 0, "the insert left unsealed rows");
-        e.tables.lock().unwrap().get_mut(&key).unwrap().importing = 1;
+        e.tables
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .writes_in_flight = 1;
 
         // A ceiling of zero makes every pass "over the watermark", so the
         // pressure path runs with `ignore_backoff = true`.
@@ -19761,7 +19771,7 @@ mod tests {
         let dumped = e.reclaim_unsealed_under_pressure(1).await;
         assert!(
             dumped > 0,
-            "the importing table must be a candidate under pressure"
+            "the writes_in_flight table must be a candidate under pressure"
         );
         let after = e
             .tables
@@ -20396,13 +20406,13 @@ mod tests {
         e.execute("CREATE TABLE ok_t (id INT);").await.unwrap();
         e.execute("INSERT INTO ip VALUES (1);").await.unwrap();
         e.execute("INSERT INTO ok_t VALUES (1);").await.unwrap();
-        let importing = e.table_key("default_db.ip");
+        let writes_in_flight = e.table_key("default_db.ip");
         e.tables
             .lock()
             .unwrap()
-            .get_mut(&importing)
+            .get_mut(&writes_in_flight)
             .unwrap()
-            .importing = 1;
+            .writes_in_flight = 1;
 
         let dumped = e.reclaim_unsealed().await;
         assert_eq!(dumped, 1, "the healthy table is still reclaimed");
@@ -20410,11 +20420,11 @@ mod tests {
             e.tables
                 .lock()
                 .unwrap()
-                .get(&importing)
+                .get(&writes_in_flight)
                 .map(|entry| entry.unsealed_bytes())
                 .unwrap_or(0)
                 > 0,
-            "and the importing table keeps its buffer"
+            "and the writes_in_flight table keeps its buffer"
         );
     }
 

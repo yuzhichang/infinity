@@ -5489,7 +5489,7 @@ impl Default for TableEntry {
     fn default() -> Self {
         Self {
             write_batches: 0,
-            importing: 0,
+            writes_in_flight: 0,
             block_rows: None,
             pending_rows: Default::default(),
             staged_import_blocks: Default::default(),
@@ -5540,10 +5540,14 @@ impl Default for TableEntry {
 }
 
 impl TableEntry {
-    /// An `IMPORT` holds this table's indexes: the append-path dump triggers
-    /// are suppressed until it commits (see [`TableEntry::importing`]).
-    pub(crate) fn import_in_flight(&self) -> bool {
-        self.importing > 0
+    /// A write holds this table's indexes: the append-path dump triggers are
+    /// suppressed until it commits (see [`TableEntry::writes_in_flight`]).
+    ///
+    /// Named for the state, not for its current user. An `IMPORT` is the only
+    /// caller today, but the flag suppresses *any* write batch's index dump -
+    /// it is raised around the batch, not around the `IMPORT` statement.
+    pub(crate) fn write_in_flight(&self) -> bool {
+        self.writes_in_flight > 0
     }
 
     /// Appends rows to the append buffer, keeping it **ordered by row id**.
@@ -5787,7 +5791,7 @@ impl TableEntry {
 pub(crate) struct TableEntry {
     /// Number of write batches (`COPY`/`INSERT`) seen by this process.
     pub(crate) write_batches: usize,
-    /// Set while an `IMPORT` transaction is staging rows and has not committed.
+    /// Set while a write is staging rows and has not committed.
     ///
     /// `NewTxn::Import` never consults the memory-index tracer: the rows go into
     /// the segment's blocks and `PopulateIndex` writes one chunk per index per
@@ -5801,7 +5805,10 @@ pub(crate) struct TableEntry {
     ///
     /// Only the **append** triggers are suppressed; the rows are still fed to
     /// every index tail, so `populate_import_indexes` sees them.
-    pub(crate) importing: usize,
+    ///
+    /// A count, not a flag: an `IMPORT` and an `INSERT` can overlap on one
+    /// table, and the first to finish must not clear the other's marker.
+    pub(crate) writes_in_flight: usize,
     /// Row ids the C++ block mirror was written from, in block order.
     ///
     /// The mirror is a snapshot: rows appended after it was written are read

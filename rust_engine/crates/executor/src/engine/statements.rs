@@ -817,12 +817,12 @@ impl Engine {
         if quota == 0 {
             return;
         }
-        // An `IMPORT` in flight owns its indexes until it commits: the
+        // A write in flight owns its indexes until it commits: the
         // reference's `NewTxn::Import` never reaches the tracer (`PopulateIndex`
         // is the only thing that dumps, once per index per segment, at the
         // end). Firing the waterlines from the staging loop split the chunks at
-        // batch boundaries - see `TableEntry::importing`.
-        if table.is_some_and(|table| self.import_in_flight(table)) {
+        // batch boundaries - see `TableEntry::writes_in_flight`.
+        if table.is_some_and(|table| self.write_in_flight(table)) {
             return;
         }
         // Fold in what changed: one table when the caller names it (O(that
@@ -859,12 +859,12 @@ impl Engine {
     /// them, and letting them fire cut an index's chunks at whatever batch
     /// boundary the reader had reached. `populate_import_indexes` writes the
     /// chunks once, inside the transaction, as `PopulateIndex` does.
-    pub(crate) fn import_in_flight(&self, table: &str) -> bool {
+    pub(crate) fn write_in_flight(&self, table: &str) -> bool {
         self.tables
             .lock()
             .unwrap()
             .get(&self.table_key(table))
-            .is_some_and(|entry| entry.import_in_flight())
+            .is_some_and(|entry| entry.write_in_flight())
     }
 
     /// Records one sampled query's recall (`SPANN_DESIGN.md` §11.3 item 4).

@@ -292,7 +292,7 @@ impl Engine {
         // A table an `IMPORT` is still staging into is not reclaimable: its rows
         // are not committed, so a dump would publish a chunk over rows the table
         // may never have.
-        if self.import_in_flight(&stat.key) {
+        if self.write_in_flight(&stat.key) {
             return false;
         }
         if !self.table_has_unsealed(&stat.key) {
