@@ -247,7 +247,96 @@ pub struct LvqStore {
     mean: Vec<f64>,
     /// `(sum(mean), sum(mean^2))`, used by cosine/inner product.
     global: Option<(f64, f64)>,
-    data: Vec<LvqData>,
+    data: Records,
+}
+
+/// The compressed records of a store.
+///
+/// `Owned` while building. `Mapped` once loaded: every record is
+/// `16 + dim` bytes, so record `i` starts at `i * record_size` and can be read
+/// out of the mapping on demand. Holding a `Vec<LvqData>` instead meant 509 MB
+/// of descriptors for 8.34M records - two `Arc` pointers and two length fields
+/// per record, describing data that is already laid out in the file.
+#[derive(Clone, Debug, PartialEq)]
+enum Records {
+    Owned(Vec<LvqData>),
+    Mapped(MappedRecords),
+}
+
+/// A loaded store's records: the mapping, plus what is needed to address one.
+#[derive(Clone)]
+struct MappedRecords {
+    owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    /// Byte offset of record 0 within the mapping.
+    at: usize,
+    record_size: usize,
+    dim: usize,
+    n: usize,
+}
+
+impl MappedRecords {
+    fn owner(&self) -> std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> {
+        std::sync::Arc::clone(&self.owner)
+    }
+
+    /// The record at `index`, with both halves pointing into the mapping.
+    fn record(&self, index: usize) -> Option<LvqData> {
+        if index >= self.n {
+            return None;
+        }
+        let bytes = self.owner.as_ref().as_ref();
+        let start = self.at + index * self.record_size;
+        let prefix = bytes.get(start..start + 16)?;
+        let codes = bytes.get(start + 16..start + 16 + self.dim)?;
+        let header = HeaderMapper::new(self.owner(), prefix)?;
+        let code = CodeMapper::new(self.owner(), bytemuck::cast_slice(codes));
+        Some(LvqData {
+            header: Header::Mapped(header),
+            code: Code::Mapped(code),
+        })
+    }
+}
+
+impl std::fmt::Debug for MappedRecords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedRecords")
+            .field("n", &self.n)
+            .field("record_size", &self.record_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for MappedRecords {
+    fn eq(&self, other: &Self) -> bool {
+        self.n == other.n && self.record_size == other.record_size && self.dim == other.dim
+    }
+}
+
+impl Records {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(v) => v.len(),
+            Self::Mapped(m) => m.n,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, index: usize) -> Option<LvqData> {
+        match self {
+            Self::Owned(v) => v.get(index).cloned(),
+            Self::Mapped(m) => m.record(index),
+        }
+    }
+
+    fn as_owned(&self) -> Option<&[LvqData]> {
+        match self {
+            Self::Owned(v) => Some(v),
+            Self::Mapped(_) => None,
+        }
+    }
 }
 
 impl LvqStore {
@@ -265,7 +354,7 @@ impl LvqStore {
             normalize,
             mean,
             global,
-            data: Vec::new(),
+            data: Records::Owned(Vec::new()),
         }
     }
 
@@ -289,13 +378,15 @@ impl LvqStore {
         &self.mean
     }
 
-    pub fn data(&self) -> &[LvqData] {
-        &self.data
+    /// The records, when they are owned. A mapped store has no slice to hand
+    /// out, so callers that need one go through [`Self::record`].
+    pub fn data(&self) -> Option<&[LvqData]> {
+        self.data.as_owned()
     }
 
     /// The record of one stored vector, borrowed (C++ `GetVec` hands out a
     /// `const LVQData *`). `None` when `index` is out of range.
-    pub fn record(&self, index: usize) -> Option<&LvqData> {
+    pub fn record(&self, index: usize) -> Option<LvqData> {
         self.data.get(index)
     }
 
@@ -350,8 +441,17 @@ impl LvqStore {
             }),
             code: Code::Owned(code),
         };
-        self.data.push(data);
-        self.data.last().unwrap()
+        match &mut self.data {
+            Records::Owned(v) => {
+                v.push(data);
+                v.last().unwrap()
+            }
+            Records::Mapped(_) => {
+                // A mapped store is read-only; compressing into it is a caller
+                // bug (the loaded form is never appended to).
+                unreachable!("compress into a mapped LVQ store")
+            }
+        }
     }
 
     fn local_cache(&self, code: &[i8], scale: f32) -> (f32, f32) {
@@ -406,7 +506,7 @@ impl LvqStore {
     /// recompress every vector.
     pub fn build(&mut self, vectors: &[Vec<f32>]) {
         self.train(vectors);
-        self.data.clear();
+        self.data = Records::Owned(Vec::new());
         for v in vectors {
             self.compress(v);
         }
@@ -474,7 +574,7 @@ impl LvqStore {
     /// squared L2, or the negated cosine/inner product.
     pub fn distance(&self, query: &LvqQuery, index: usize) -> Option<f32> {
         let v = self.data.get(index)?;
-        Some(self.distance_between(&query.data, v))
+        Some(self.distance_between(&query.data, &v))
     }
 
     /// The distance between two records already in the store, borrowing both.
@@ -539,7 +639,7 @@ impl LvqStore {
     /// C++ `LVQVecStoreInner::Save`: the per-vector records.
     pub fn records_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len() * self.record_size());
-        for d in &self.data {
+        for d in self.data.as_owned().unwrap_or(&[]) {
             out.extend_from_slice(&d.header.scale.to_le_bytes());
             out.extend_from_slice(&d.header.bias.to_le_bytes());
             out.extend_from_slice(&d.header.local_0.to_le_bytes());
@@ -604,7 +704,7 @@ impl LvqStore {
                 normalize,
                 mean,
                 global,
-                data: Vec::new(),
+                data: Records::Owned(Vec::new()),
             },
             at,
         ))
@@ -630,33 +730,39 @@ impl LvqStore {
         if records.len() < n * record {
             return None;
         }
+        // With a mapping, nothing is read here at all: `Records::Mapped` keeps
+        // the offset and the stride, and `record(i)` builds the two windows when
+        // someone asks for record `i`. That is what a loaded store holds - a few
+        // numbers per store instead of 64 bytes per record.
+        if let Some(owner) = backing {
+            let base = owner.as_ref().as_ref().as_ptr() as usize;
+            let at = records.as_ptr() as usize - base;
+            self.data = Records::Mapped(MappedRecords {
+                owner,
+                at,
+                record_size: record,
+                dim: self.dim,
+                n,
+            });
+            return Some(());
+        }
         let mut at = 0;
-        self.data.clear();
-        self.data.reserve(n);
+        self.data = Records::Owned(Vec::with_capacity(n));
         for _ in 0..n {
             let prefix = &records[at..at + 16];
             at += 16;
             let raw = &records[at..at + self.dim];
-            // `i8` accepts every alignment, so this cast cannot fail.
-            let codes: &[i8] = bytemuck::cast_slice(raw);
             at += self.dim;
-            // Both halves are windows onto the same record when a mapping is
-            // supplied: the 16-byte prefix is `repr(C)` over four `f32`, which
-            // is the layout the file writes, so reading it in place costs
-            // nothing and a store of 8.34M records holds no numeric fields of
-            // its own.
-            let (header, code) = match &backing {
-                Some(owner) => {
-                    let h = HeaderMapper::new(std::sync::Arc::clone(owner), prefix)?;
-                    let c = CodeMapper::new(std::sync::Arc::clone(owner), codes);
-                    (Header::Mapped(h), Code::Mapped(c))
-                }
-                None => {
-                    let h: LvqHeader = bytemuck::pod_read_unaligned(prefix);
-                    (Header::Owned(h), Code::Owned(codes.to_vec()))
-                }
+            let header: LvqHeader = bytemuck::pod_read_unaligned(prefix);
+            let codes: &[i8] = bytemuck::cast_slice(raw);
+            let owned = match &mut self.data {
+                Records::Owned(v) => v,
+                Records::Mapped(_) => unreachable!("just assigned"),
             };
-            self.data.push(LvqData { header, code });
+            owned.push(LvqData {
+                header: Header::Owned(header),
+                code: Code::Owned(codes.to_vec()),
+            });
         }
         Some(())
     }
@@ -821,7 +927,7 @@ mod tests {
                 let q = store.query_at(a).expect("record a");
                 for b in 0..store.len() {
                     let via_query = store.distance(&q, b).expect("record b");
-                    let borrowed = store.distance_between(&q.data, store.record(b).unwrap());
+                    let borrowed = store.distance_between(&q.data, &store.record(b).unwrap());
                     assert_eq!(via_query, borrowed, "{metric:?} a={a} b={b}");
                 }
             }
@@ -913,15 +1019,16 @@ mod tests {
         assert_eq!(copied.len(), mapped.len());
         for i in 0..vec_n {
             assert_eq!(
-                copied.data[i].code.as_slice(),
-                mapped.data[i].code.as_slice(),
+                copied.record(i).unwrap().code.as_slice(),
+                mapped.record(i).unwrap().code.as_slice(),
                 "vector {i} codes differ"
             );
             // All four fields, not just the two that happen to be compared by
             // the distance: `local_0`/`local_1` are at offsets 8 and 12, which
             // is exactly where a wrong record stride would show up.
             assert_eq!(
-                *copied.data[i].header, *mapped.data[i].header,
+                *copied.record(i).unwrap().header,
+                *mapped.record(i).unwrap().header,
                 "vector {i} header differs"
             );
             let q = mapped.make_query(&stored[i]);
@@ -961,7 +1068,7 @@ mod tests {
             let q = store.make_query(query);
             let dist1 = store.distance(&q, i).unwrap();
             let qv1 = decode(q.data(), &store.mean);
-            let qv2 = decode(&store.data[i], &store.mean);
+            let qv2 = decode(&store.record(i).unwrap(), &store.mean);
             let dist2 = plain_l2(&qv1, &qv2);
             let err = ((dist1 - dist2) / dist1).abs();
             assert!(
@@ -988,7 +1095,7 @@ mod tests {
             let q = store.make_query(query);
             let dist1 = store.distance(&q, i).unwrap();
             let qv1 = decode(q.data(), &store.mean);
-            let qv2 = decode(&store.data[i], &store.mean);
+            let qv2 = decode(&store.record(i).unwrap(), &store.mean);
             let dist2: f32 = -qv1.iter().zip(&qv2).map(|(a, b)| a * b).sum::<f32>();
             let err = ((dist1 - dist2) / dist1).abs();
             assert!(

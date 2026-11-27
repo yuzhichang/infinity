@@ -682,7 +682,7 @@ impl Store {
             Store::Lvq(store) => match (store.record(a), store.record(b)) {
                 // Borrow both records: `query_at` clones the whole i8 code, and
                 // this runs once per candidate comparison.
-                (Some(q), Some(v)) => store.distance_between(q, v),
+                (Some(q), Some(v)) => store.distance_between(&q, &v),
                 _ => f32::MAX,
             },
             Store::Rabitq(store) => store
