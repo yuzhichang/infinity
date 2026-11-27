@@ -65,6 +65,11 @@ warnings = "deny"
 
 [workspace.dependencies]
 rust-stemmers = "1.2"
+# Checked, zero-copy casts between byte slices and `f32`/`i8` slices. The
+# alternative is `#[allow(unsafe_code)]` + `from_raw_parts` in every module that
+# needs one (see `storage::definition::fixed_f32`), and each of those has to
+# re-derive the alignment and length arguments correctly.
+bytemuck = { version = "1", features = ["derive"] }
 tokio = { version = "1", default-features = false, features = [
     "rt",
     "rt-multi-thread",

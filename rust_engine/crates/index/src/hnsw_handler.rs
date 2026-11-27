@@ -280,6 +280,7 @@ mod reference_suite {
             encoding,
             &index.store_meta_bytes(),
             &index.store_records_bytes(),
+            None,
             n,
             levels,
             links,

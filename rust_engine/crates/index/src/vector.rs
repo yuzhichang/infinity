@@ -303,18 +303,153 @@ thread_local! {
 /// `GetVec(i) = ptr + i * dim`; a `Vec<Vec<f32>>` costs a pointer chase and a
 /// separate allocation per vertex, and the distance kernels walk two of them
 /// per comparison.
+/// A `f32` window into a mapping that outlives the index.
+///
+/// ## Why this is not a borrowed slice
+///
+/// The obvious shape is `&'a [f32]`, and it does not work here for a structural
+/// reason: an index is shared by `Arc<Store>` across build tasks
+/// (`parallel_build::SharedBuild`) and held for the segment's lifetime by
+/// `HnswIndexInMem`. Every one of those would need the lifetime, and so would
+/// every function that names an index - roughly seventy sites - to express "this
+/// index reads out of a file it does not own".
+///
+/// `Arc` states the same thing without the parameter: the owner keeps the pages
+/// mapped for exactly as long as the pointer is reachable, and a refcount is the
+/// whole cost. It is the standard answer for a self-referential struct whose
+/// referent is heap-shared.
+///
+/// ## Safety
+///
+/// Established at construction (`PlainVecs::from_borrowed`), preserved here:
+///
+/// * `owner` outlives every use of `ptr`, because `ptr` is only read through
+///   `&self` and dropping `self` drops `owner` in the same step.
+/// * The bytes behind `ptr` are immutable: a publisher renames a new chunk file
+///   over the old one rather than writing in place, so a reader never sees a
+///   mutation. This is the same guarantee `storage::buffer::MappedFile` relies
+///   on for every block it serves.
+/// * `ptr`/`len` came from `bytemuck::try_cast_slice`, so the alignment and the
+///   element count were checked; `len` is how many `f32` the cast produced.
+#[derive(Clone)]
+#[allow(unsafe_code)]
+struct MappedFloats {
+    /// Holds the mapping open. Never read, and that is the point: dropping it
+    /// would unmap the pages `ptr` points at, so it exists purely for its Drop.
+    _owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ptr: *const f32,
+    len: usize,
+}
+
+impl std::fmt::Debug for MappedFloats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The owner is a type-erased mapping; what a reader wants here is the
+        // shape, not the bytes.
+        f.debug_struct("MappedFloats")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(unsafe_code)]
+impl MappedFloats {
+    fn as_slice(&self) -> &[f32] {
+        // SAFETY: see the type's note - `owner` is alive for `&self`, the bytes
+        // are immutable, and `ptr`/`len` were validated by `bytemuck` when this
+        // value was built.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+// SAFETY: the only shared state is `owner` (already `Send + Sync`) and the
+// pointer, whose referent is immutable and kept alive by that owner. Sending or
+// sharing the window cannot invalidate it.
+#[allow(unsafe_code)]
+unsafe impl Send for MappedFloats {}
+#[allow(unsafe_code)]
+unsafe impl Sync for MappedFloats {}
+
+/// Owned or mapped storage for a plain index's vectors.
+///
+/// The mapped variant is the point: a chunk stores the `f32`s as their
+/// little-endian bytes, and `bytemuck` can hand back the same memory as `&[f32]`
+/// when the offset is aligned (it is - `header + store_meta` is 40). Decoding
+/// them into a `Vec<f32>` instead duplicated the whole vector region in the
+/// heap on every load.
+#[derive(Clone, Debug)]
+enum PlainData {
+    Owned(Vec<f32>),
+    /// `owner` keeps the mapping alive; `ptr`/`len` are the same bytes as
+    /// `f32`, checked once by `bytemuck` at construction.
+    Mapped(MappedFloats),
+}
+
+impl Default for PlainData {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl PlainData {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(v) => v.as_slice(),
+        }
+    }
+
+    fn to_mut(&mut self) -> &mut Vec<f32> {
+        match self {
+            Self::Owned(v) => v,
+            // A mapped buffer is never pushed to (it is loaded read-only), and
+            // copying it on the way to being mutable is the only correct
+            // answer if that ever changes.
+            Self::Mapped(v) => {
+                *self = Self::Owned(v.as_slice().to_vec());
+                match self {
+                    Self::Owned(owned) => owned,
+                    Self::Mapped(_) => unreachable!("just replaced"),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PlainVecs {
     dims: usize,
-    data: Vec<f32>,
+    data: PlainData,
 }
 
 impl PlainVecs {
     fn new(dims: usize) -> Self {
         Self {
             dims,
-            data: Vec::new(),
+            data: PlainData::default(),
         }
+    }
+
+    /// The vectors of a chunk, taken from the mapping itself when one is
+    /// supplied.
+    ///
+    /// With `backing`, `flat` points into bytes that `backing` keeps alive, so
+    /// the store holds a pointer and a refcount instead of a copy. Without it
+    /// (the unit-test entry points, which pass a `&[u8]` with no owner) the
+    /// floats are copied - correctness first, and those callers are small.
+    fn from_borrowed(
+        dims: usize,
+        flat: &[f32],
+        backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    ) -> Self {
+        let data = match backing {
+            Some(owner) => PlainData::Mapped(MappedFloats {
+                _owner: owner,
+                ptr: flat.as_ptr(),
+                len: flat.len(),
+            }),
+            None => PlainData::Owned(flat.to_vec()),
+        };
+        Self { dims, data }
     }
 
     fn from_rows(dims: usize, rows: Vec<Vec<f32>>) -> Self {
@@ -322,20 +457,27 @@ impl PlainVecs {
         for row in rows {
             data.extend_from_slice(&row);
         }
-        Self { dims, data }
+        Self {
+            dims,
+            data: PlainData::Owned(data),
+        }
     }
 
     fn len(&self) -> usize {
         if self.dims == 0 {
             0
         } else {
-            self.data.len().checked_div(self.dims).unwrap_or(0)
+            self.data
+                .as_slice()
+                .len()
+                .checked_div(self.dims)
+                .unwrap_or(0)
         }
     }
 
     fn push(&mut self, v: &[f32]) {
         debug_assert_eq!(v.len(), self.dims);
-        self.data.extend_from_slice(v);
+        self.data.to_mut().extend_from_slice(v);
     }
 
     /// `GetVec`: the `dims` floats of vertex `i`, or `None` past the end.
@@ -348,7 +490,7 @@ impl PlainVecs {
     fn get(&self, i: usize) -> Option<&[f32]> {
         let start = i.checked_mul(self.dims)?;
         let end = start.checked_add(self.dims)?;
-        self.data.get(start..end)
+        self.data.as_slice().get(start..end)
     }
 }
 
@@ -574,7 +716,7 @@ impl Store {
 
     fn mem_bytes(&self) -> usize {
         match self {
-            Store::Plain { data, .. } => data.data.capacity() * 4,
+            Store::Plain { data, .. } => data.data.as_slice().len() * 4,
             Store::Lvq(store) => store.len() * store.record_size() + store.mean().len() * 8 + 64,
             Store::Rabitq(store) => {
                 store.len() * store.record_size() + store.dim() * store.dim() * 4 + 4 * store.dim()
@@ -1268,11 +1410,12 @@ impl HnswIndex {
                 // The buffer is already `dims` little-endian `f32`s per vertex,
                 // so the chunk's vector region is its bytes verbatim (C++
                 // `PlainVecStoreInner::Save` is one `Append` of the same span).
-                let mut out = Vec::with_capacity(data.data.len() * 4);
-                for x in &data.data {
-                    out.extend_from_slice(&x.to_le_bytes());
-                }
-                out
+                // The buffer is already `dims` little-endian `f32`s per vertex,
+                // so its bytes *are* the chunk's vector region (C++
+                // `PlainVecStoreInner::Save` is one `Append` of the same span).
+                // `bytemuck` does that reinterpretation without a per-float
+                // round trip through `to_le_bytes`.
+                bytemuck::cast_slice(data.data.as_slice()).to_vec()
             }
             Store::Lvq(store) => store.records_bytes(),
             Store::Rabitq(store) => store.records_bytes(),
@@ -1351,6 +1494,10 @@ impl HnswIndex {
         encoding: HnswEncoding,
         meta: &[u8],
         records: &[u8],
+        // The mapping `records` points into, when there is one. Passing it lets
+        // a `Plain` store take the floats from it; `None` is the unit-test
+        // entry points, which hand over owned buffers.
+        backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
         n: usize,
         levels: Vec<usize>,
         links: Vec<Vec<Vec<usize>>>,
@@ -1362,13 +1509,18 @@ impl HnswIndex {
                 if records.len() < n * dims * 4 {
                     return None;
                 }
-                let mut flat: Vec<f32> = Vec::with_capacity(dims * n);
-                for c in records.chunks_exact(dims * 4).take(n) {
-                    flat.extend(c.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)));
-                }
+                // Zero copy. The chunk lays the vectors out as the raw
+                // little-endian bytes of the `f32`s that were inserted, and
+                // `records` starts at `header + store_meta` = 32 + 8 = 40, which
+                // is 4-byte aligned - so the mapped bytes *are* the slice.
+                // Decoding them into a `Vec<f32>` (what this used to do)
+                // duplicated the whole vector region in the heap on every load:
+                // a 32 GiB index became 32 GiB of mapping plus 32 GiB of heap.
+                let bytes = &records[..n * dims * 4];
+                let floats: &[f32] = bytemuck::try_cast_slice(bytes).ok()?;
                 Store::Plain {
                     metric,
-                    data: PlainVecs { dims, data: flat },
+                    data: PlainVecs::from_borrowed(dims, floats, backing),
                 }
             }
             HnswEncoding::Lvq => {
@@ -2217,7 +2369,7 @@ pub(crate) mod chunk_file {
         }
         assert_eq!(reader.pos, reader.bytes.len(), "trailing HNSW bytes");
         HnswIndex::from_chunk_parts(
-            dims, m, ef_search, metric, encoding, &meta, &records, n, levels, links, entry,
+            dims, m, ef_search, metric, encoding, &meta, &records, None, n, levels, links, entry,
             max_level,
         )
         .expect("chunk parts")
@@ -2580,6 +2732,7 @@ mod reference_suite {
             encoding,
             &meta,
             &records,
+            None,
             index.len(),
             levels,
             links,

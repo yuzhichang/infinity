@@ -28,19 +28,14 @@
 /// ([`copy_f32_slot`]). A block's column body is section-aligned in practice,
 /// so the borrow is the normal path; the check exists because a misaligned read
 /// would be undefined behaviour rather than a slow one.
-#[allow(unsafe_code)]
 pub fn fixed_f32_slot(body_data: &[u8], slot: usize, dim: usize) -> Option<&[f32]> {
     let width = dim.checked_mul(std::mem::size_of::<f32>())?;
     let at = slot.checked_mul(width)?;
     let bytes = body_data.get(at..at.checked_add(width)?)?;
-    if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
-        return None;
-    }
-    // SAFETY: the pointer is aligned for `f32` (checked immediately above), the
-    // slice is exactly `dim * 4` bytes (its bounds were checked above), it
-    // borrows `body_data` for the returned lifetime, and every bit pattern is a
-    // valid `f32`.
-    Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), dim) })
+    // `bytemuck` does the alignment and size checks the hand-written version
+    // did, and returns `None` for either rather than relying on the caller to
+    // have established them.
+    bytemuck::try_cast_slice(bytes).ok()
 }
 
 /// One `TENSOR`/`MULTIVECTOR` row's tokens, borrowed from the column's outline
@@ -54,7 +49,6 @@ pub fn fixed_f32_slot(body_data: &[u8], slot: usize, dim: usize) -> Option<&[f32
 ///
 /// `None` when the range is out of bounds or does not start on an `f32`
 /// boundary; the caller then falls back to [`copy_tensor_rows`].
-#[allow(unsafe_code)]
 pub fn tensor_rows_f32(
     outline: &[u8],
     offset: usize,
@@ -64,15 +58,9 @@ pub fn tensor_rows_f32(
     let width = dim.checked_mul(std::mem::size_of::<f32>())?;
     let end = offset.checked_add(count.checked_mul(width)?)?;
     let bytes = outline.get(offset..end)?;
-    if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
-        return None;
-    }
-    // SAFETY: the pointer is aligned for `f32` (checked immediately above), the
-    // slice is `count * dim * 4` bytes long (its bounds were checked above), it
-    // borrows `outline` for the returned lifetime, and every bit pattern is a
-    // valid `f32`. Each row is a sub-slice of that region, so the same argument
-    // repeats per row without a second check.
-    let flat = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), count * dim) };
+    // One cast for the whole region; each row is then a sub-slice of it, so the
+    // alignment that `bytemuck` checked covers every row too.
+    let flat: &[f32] = bytemuck::try_cast_slice(bytes).ok()?;
     Some(flat.chunks_exact(dim).collect())
 }
 

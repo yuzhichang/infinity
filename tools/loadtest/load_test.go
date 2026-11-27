@@ -598,7 +598,12 @@ func (r *Run) phaseIngest() {
 	close(jobs)
 
 	var inserted atomic.Int64
-	batchSize := getenvInt("LT_BATCH_SIZE", 1024)
+	// 64, not 1024: a smaller batch is what makes the per-commit cost visible.
+	// The index build work per row is unchanged (`ef_construction` fixes it),
+	// so the difference this exposes is everything around it - one RPC, one
+	// admission check, one WAL frame and one commit per 64 rows instead of per
+	// 1024.
+	batchSize := getenvInt("LT_BATCH_SIZE", 64)
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(r.alloc.Names))
 
@@ -666,10 +671,59 @@ func (r *Run) phaseIngest() {
 		t.Errorf("ingested %d rows, want %d", got, totalRows)
 	}
 	r.record("P1 ingest", dur, got, fmt.Sprintf("%d rows into %d tables, %.0f rows/s, batch %d",
-		got, len(r.alloc.Names), float64(got)/dur.Seconds(), getenvInt("LT_BATCH_SIZE", 1024)))
+		got, len(r.alloc.Names), float64(got)/dur.Seconds(), getenvInt("LT_BATCH_SIZE", 64)))
 }
 
 // ingestTable fills one table.
+// ingestWithBackpressure inserts one batch, waiting out the memory governor's
+// refusal instead of failing the run.
+//
+// The engine refuses a write at its critical watermark (`admit_statement`, 90%
+// of `buffer_manager_size`). That is the governor working, not an ingest
+// failure: it is the mechanism that keeps the process from being killed by the
+// kernel, and it clears itself once the reclaim pass has drained enough. A test
+// that treated it as fatal could never run a scenario large enough to reach the
+// ceiling, which on L (5884 tables, 64 connections) is exactly what happens.
+//
+// The retry is unbounded on purpose. A bounded one would turn "the machine is
+// slower than the run assumed" into a failure, and the caller has a wall-clock
+// timeout anyway; what it must not do is spin, so each attempt waits.
+func ingestWithBackpressure(eng *Engine, tbl *infinity.Table, rows []Row, vectors []float32, table string) error {
+	const maxWait = 30 * time.Second
+	wait := 250 * time.Millisecond
+	refusals := 0
+	for {
+		err := eng.IngestBatch(tbl, rows, vectors)
+		if err == nil {
+			if refusals > 0 {
+				fmt.Printf("  %s: admitted after %d refusal(s)\n", table, refusals)
+			}
+			return nil
+		}
+		if !isMemoryRefusal(err) {
+			return err
+		}
+		refusals++
+		time.Sleep(wait)
+		if wait < maxWait {
+			wait *= 2
+			if wait > maxWait {
+				wait = maxWait
+			}
+		}
+	}
+}
+
+// isMemoryRefusal reports whether `err` is the governor's admission refusal.
+//
+// The message is the server's (`ADMISSION_REFUSED` in the executor's memory
+// module, surfaced through the Thrift error text), and it is the only signal a
+// client gets: the RPC has no distinct status code for "over the ceiling, try
+// again".
+func isMemoryRefusal(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "memory limit exceeded")
+}
+
 func (r *Run) ingestTable(eng *Engine, tbl *infinity.Table, idx, batchSize int, inserted *atomic.Int64) error {
 	rows := r.alloc.Rows[idx]
 	docs := r.alloc.Docs[idx]
@@ -693,7 +747,7 @@ func (r *Run) ingestTable(eng *Engine, tbl *infinity.Table, idx, batchSize int, 
 		if err != nil {
 			return fmt.Errorf("embed table %s: %w", r.alloc.Names[idx], err)
 		}
-		if err := eng.IngestBatch(tbl, rowBatch, vectors); err != nil {
+		if err := ingestWithBackpressure(eng, tbl, rowBatch, vectors, r.alloc.Names[idx]); err != nil {
 			return err
 		}
 		inserted.Add(int64(len(rowBatch)))

@@ -19,7 +19,13 @@
 //! (the engine encodes typed values to bytes), matching Infinity's byte-key
 //! design. Indexes are pluggable behind the [`Index`] trait.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: one module needs `unsafe`, and `forbid` cannot be lifted
+// by an inner attribute. The single exemption is `vector::MappedFloats`, which
+// keeps a mapped chunk alive with an `Arc` and hands its bytes back as `&[f32]`
+// - a self-referential window that cannot be expressed as a lifetime parameter
+// without threading one through every type that holds an index. It carries its
+// own SAFETY argument; everything else in this crate stays safe.
+#![deny(unsafe_code)]
 // The distance kernels use portable SIMD (`std::simd`, still nightly-only) to
 // mirror the reference's `F32L2*` / `F32IP*` / `F32Cos*` intrinsics; see
 // `simd.rs` for why that is `std::simd` and not `std::arch`.

@@ -114,10 +114,18 @@ func (e *Engine) CreateIndexes(table *infinity.Table, sparsegram bool) error {
 	if _, err := table.CreateIndex("vec_idx",
 		infinity.NewIndexInfo(vecCol, infinity.IndexTypeHnsw, map[string]string{
 			"M":               "16",
-			"ef_construction": "50",
+			// 100 is Elasticsearch's default `ef_construction`, and RAGFlow's ES
+			// mappings set no `index_options` at all - so 100 is the value the
+			// production path actually runs with. The earlier 50 made every
+			// insert compare half as many candidates and was not the workload
+			// being compared against.
+			"ef_construction": "100",
 			"metric":          "cosine",
-			// lvq needs a float column, which is what ColumnTypes emits.
-			"encode": "lvq",
+			// No `encode`: the default is `Plain`, which stores the f32 vectors
+			// as inserted and computes an f32 dot product. `lvq` compresses to
+			// i8 (4x less memory, 4x fewer instructions) but it is a lossy
+			// approximation that ES does not use, so leaving it on compared
+			// Infinity's quantized path against ES's exact one.
 		}),
 		infinity.ConflictTypeError, ""); err != nil {
 		return fmt.Errorf("create hnsw index: %w", err)
