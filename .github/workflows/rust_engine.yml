@@ -110,6 +110,18 @@ jobs:
           # rust_engine/rust-toolchain.toml is the single source of truth.
           rustup toolchain install --profile minimal
           rustup component add rustfmt clippy
+      # The workspace sets `[build] rustc-wrapper = "sccache"` in
+      # `rust_engine/.cargo/config.toml`, and cargo has no fallback: with the
+      # binary missing from PATH every crate fails to compile with "could not
+      # execute process `sccache`". This step installs it and points the cache
+      # at the GitHub Actions backend, so a rebuild after a cache miss is not
+      # paid twice.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Install clang, mold and libclang
         # rust_engine/.cargo/config.toml builds RocksDB with clang and links
         # with mold (`-fuse-ld=mold`), and librocksdb-sys runs bindgen, which
@@ -281,6 +293,18 @@ jobs:
           submodules: recursive
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal
+      # The workspace sets `[build] rustc-wrapper = "sccache"` in
+      # `rust_engine/.cargo/config.toml`, and cargo has no fallback: with the
+      # binary missing from PATH every crate fails to compile with "could not
+      # execute process `sccache`". This step installs it and points the cache
+      # at the GitHub Actions backend, so a rebuild after a cache miss is not
+      # paid twice.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Install clang, mold and libclang
         # rust_engine/.cargo/config.toml builds RocksDB with clang and links
         # with mold (`-fuse-ld=mold`), and librocksdb-sys runs bindgen, which
@@ -367,6 +391,18 @@ jobs:
         # `rust-toolchain.toml` lives in `rust_engine`; from the repository root
         # rustup would pick the runner's default toolchain instead.
         run: rustup toolchain install --profile minimal
+      # The workspace sets `[build] rustc-wrapper = "sccache"` in
+      # `rust_engine/.cargo/config.toml`, and cargo has no fallback: with the
+      # binary missing from PATH every crate fails to compile with "could not
+      # execute process `sccache`". This step installs it and points the cache
+      # at the GitHub Actions backend, so a rebuild after a cache miss is not
+      # paid twice.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Provide the SDK's libclang to dyld
         # `clang-sys` links the build scripts (`librocksdb-sys` -> bindgen)
         # against `@rpath/libclang.dylib`. On a developer machine the rpath to
@@ -430,6 +466,18 @@ jobs:
           submodules: recursive
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal
+      # The workspace sets `[build] rustc-wrapper = "sccache"` in
+      # `rust_engine/.cargo/config.toml`, and cargo has no fallback: with the
+      # binary missing from PATH every crate fails to compile with "could not
+      # execute process `sccache`". This step installs it and points the cache
+      # at the GitHub Actions backend, so a rebuild after a cache miss is not
+      # paid twice.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Install clang, mold and libclang
         run: |
           for attempt in 1 2 3; do
@@ -491,6 +539,18 @@ jobs:
           submodules: recursive
       - name: Install the pinned toolchain
         run: rustup toolchain install --profile minimal
+      # The workspace sets `[build] rustc-wrapper = "sccache"` in
+      # `rust_engine/.cargo/config.toml`, and cargo has no fallback: with the
+      # binary missing from PATH every crate fails to compile with "could not
+      # execute process `sccache`". This step installs it and points the cache
+      # at the GitHub Actions backend, so a rebuild after a cache miss is not
+      # paid twice.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Install clang, mold and libclang
         # rust_engine/.cargo/config.toml builds RocksDB with clang and links
         # with mold (`-fuse-ld=mold`), and librocksdb-sys runs bindgen, which
@@ -954,6 +1014,18 @@ jobs:
         run: |
           rustup toolchain install --profile minimal
           rustup component add miri
+      # The workspace sets `[build] rustc-wrapper = "sccache"` in
+      # `rust_engine/.cargo/config.toml`, and cargo has no fallback: with the
+      # binary missing from PATH every crate fails to compile with "could not
+      # execute process `sccache`". This step installs it and points the cache
+      # at the GitHub Actions backend, so a rebuild after a cache miss is not
+      # paid twice.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Install clang, mold and libclang
         run: |
           # The runner's package mirror is occasionally unreachable ("Temporary

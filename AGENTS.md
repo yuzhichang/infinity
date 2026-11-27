@@ -39,6 +39,40 @@ The project uses **CMake** with **Ninja** generator and requires **Clang 20+**.
 - **Developer Shortcut** (if `ymake` is available):
   - `ymake 1 d infinity`: Build infinity target in debug mode.
 
+### Rust Engine (rust_engine/)
+**`sccache` is required.** Every Rust workspace here (`rust_engine/`,
+`rust_poc/`, `tools/loadtest/m2v/`) sets `rustc-wrapper = "sccache"` in its
+`.cargo/config.toml`, and cargo has no fallback for a missing wrapper: a build
+without the binary fails with `could not execute process 'sccache'`.
+
+```bash
+cargo install sccache        # once per machine
+sccache --start-server       # or run it as a service (see below)
+```
+
+The cache is keyed by compiler version, crate source, features and target
+triple, so a rebuild after `cargo clean`, or a second checkout of this repo,
+reuses the results instead of recompiling (`rust_engine/target` reaches ~143 GB
+and a full rebuild takes ~5 minutes). To build without it for one command,
+cancel the wrapper with an empty variable:
+
+```bash
+RUSTC_WRAPPER= cargo build
+```
+
+A systemd user unit keeps the daemon running without a manual start:
+
+```ini
+# ~/.config/systemd/user/sccache.service
+[Service]
+Type=forking
+ExecStart=%h/.cargo/bin/sccache --start-server
+RemainAfterExit=yes
+ExecStop=%h/.cargo/bin/sccache --stop-server
+[Install]
+WantedBy=default.target
+```
+
 ### Python SDK
 Use `uv` for package management.
 ```bash

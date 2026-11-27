@@ -1,3 +1,17 @@
+# `sccache` wraps rustc and keys each compilation on the compiler version, the
+# crate source, its features and the target triple, so a crate built after a
+# `cargo clean`, or by another checkout of this repo, is a cache hit instead of
+# a recompile. `rust_engine/target` reaches ~143 GB of build output, and a full
+# rebuild of the workspace and its dependencies takes ~5 minutes.
+#
+# This requires `sccache` on PATH (`cargo install sccache`, or the CI's
+# `mozilla-actions/sccache-action`). Cargo has no fallback: with the binary
+# missing, every build fails with "could not execute process `sccache`". To
+# build without it, override the setting for one command - `RUSTC_WRAPPER=`
+# (empty) cancels the wrapper.
+[build]
+rustc-wrapper = "sccache"
+
 # The bundled RocksDB in `librocksdb-sys` is old enough that the local GCC 16
 # cannot compile it, so build it with clang (23), which can.
 # (`ROCKSDB_LIB_DIR`/`ROCKSDB_INCLUDE_DIR` would link the system RocksDB 10.2
