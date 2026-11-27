@@ -556,35 +556,73 @@ impl super::Engine {
         }
     }
 
-    /// Gives back up to `want` bytes, cheapest lever first: allocator arenas,
-    /// the resident pages of the live mappings, then the block mappings
-    /// themselves - and, when `forced`, the SPANN page bookkeeping and the
-    /// caches that are pure copies. Returns what it released.
+    /// One pass of the governor's levers, cheapest first, until `want` bytes are
+    /// given back.
     ///
-    /// Dropping a block mapping is the step that actually shrinks the process:
-    /// `madvise(DONTNEED)` only drops the resident pages and leaves the mapping
-    /// (and the decoded `version`'s heap) in place, so a table larger than the
-    /// budget would still hold one mapping per block ever read. Readers already
-    /// inside a scan keep their `Arc`; the next one remaps from the (still warm)
-    /// page cache.
+    /// The ladder, in the order it may be stopped at:
     ///
-    /// `forced` is the critical watermark: it adds the two steps that cost the
-    /// most to redo - the SPANN handles' own page bookkeeping and the caches
-    /// that are pure copies (results, plans, the whole-column vector cache an
-    /// exact scan builds when it has no index).
-    /// The synchronous half of [`Self::reclaim_memory`]: allocator arenas,
-    /// resident mapped pages, SPANN bookkeeping, pure-copy caches, and unmapping
-    /// idle block mappings.
+    /// 1. **Allocator arenas** (`mi_collect`) - free pages the allocator is
+    ///    holding. No I/O, no lock.
+    /// 2. **Resident pages of the live mappings** (`madvise(DONTNEED)`) - the
+    ///    file stays mapped, only its pages go. A later scan faults them back
+    ///    in from a page cache that is usually still warm.
+    /// 3. **Pure copies**, when `forced`: SPANN's page bookkeeping, the result
+    ///    and plan caches. Recomputable by definition, and the two steps that
+    ///    cost the most to redo, which is why they wait for the critical
+    ///    watermark.
+    /// 4. **The block mappings themselves** - `madvise` leaves the mapping and
+    ///    its address space in place, so a table larger than the budget would
+    ///    keep one mapping per block ever read. Dropping the entry unmaps it; a
+    ///    reader already inside a scan keeps its `Arc`, and the next one remaps.
+    /// 5. **Reloadable table caches** (`[`Self::evict_table_caches`]`).
+    /// 6. **Unsealed tables** - buffered rows and index tails, drained by
+    ///    writing a block and sealing the tail. This is the only step that
+    ///    awaits, and it is also the one that holds the most: a bulk insert
+    ///    accumulates rows in the append buffer and vectors in the index tail,
+    ///    neither of which any of the levers above can touch.
     ///
-    /// It is not a complete pass, and it is not offered as one: the unsealed
-    /// drain (buffered rows and index tails) lives in the async caller, because
-    /// writing a block and sealing an index tail await. Anything that needs the
-    /// whole ladder must go through [`Self::reclaim_memory`].
+    /// Steps 1-5 are synchronous and step 6 is not, but they are one ladder, not
+    /// two passes: the async step runs before the ladder escalates a second
+    /// time, because draining unsealed tables frees more than unmapping and
+    /// evicting could, and re-running the cheap steps afterwards is cheaper than
+    /// having escalated past them.
     ///
-    /// Private since the admission gate moved to the statement entry: no caller
-    /// outside this module runs a partial pass any more, and a single call site
-    /// keeps that visible.
-    fn reclaim_memory_sync(&self, want: u64, forced: bool) -> u64 {
+    /// `want` is the target for the whole pass; `forced` turns on the steps that
+    /// are expensive to redo and is the critical watermark.
+    pub(crate) async fn reclaim_memory(&self, want: u64, forced: bool) -> u64 {
+        let mut released = self.reclaim_cheap_levers(want, forced);
+
+        // The one step that has to await. Guarded on the same condition the
+        // cheap steps escalate under: a pass that already met `want` while still
+        // under `high` has nothing to gain from writing blocks to disk.
+        let (_, cgroup) = cgroup_snapshot();
+        let over = forced || self.measure_pressure(cgroup.as_ref()) != Pressure::Ok;
+        if over && self.budget_bytes() > 0 {
+            let before = self.memory_usage();
+            let dumped = self
+                .reclaim_unsealed_under_pressure(self.memory_low())
+                .await;
+            if dumped > 0 {
+                // The drain freed rows and index tails; what is left is now
+                // memory the earlier steps can reach, so escalate once more from
+                // scratch rather than reusing the pre-drain figures.
+                released += self.reclaim_cheap_levers(0, forced);
+                let after = self.memory_usage();
+                released = released.saturating_add(before.saturating_sub(after));
+            }
+        }
+        released
+    }
+
+    /// Steps 1-5 of [`Self::reclaim_memory`]: everything that releases memory
+    /// without awaiting.
+    ///
+    /// Separate because the ladder is called twice - once up front, once after
+    /// the unsealed drain - and because a caller holding a borrow that cannot
+    /// cross an `await` (a `Mutex` guard, a synchronous build loop) may still
+    /// want these. It is deliberately *not* named or shaped as a complete pass:
+    /// the unsealed drain is the step that frees the most, and it is not here.
+    fn reclaim_cheap_levers(&self, want: u64, forced: bool) -> u64 {
         storage::trim_allocator();
         let mut released = storage::mapped::release_mapped_pages(want as usize) as u64;
         if forced {
@@ -598,52 +636,36 @@ impl super::Engine {
         // cache it has not reclaimed yet), so the decision to escalate is the
         // process's own figure - not the sum above. Escalate when the cheap
         // pass did not meet the target, or when the process is still over.
-        let (_, cgroup) = cgroup_snapshot();
-        let pressure = self.measure_pressure(cgroup.as_ref());
-        if forced || pressure != Pressure::Ok || released < want {
-            let over = self.memory_usage().saturating_sub(self.memory_low());
-            let remaining = want.saturating_sub(released).max(over);
-            released += self.shrink_block_maps(remaining as usize) as u64;
-            if forced || pressure != Pressure::Ok {
-                let over = self.memory_usage().saturating_sub(self.memory_low());
-                let remaining = want.saturating_sub(released).max(over);
-                if remaining > 0 {
-                    let evicted = self.evict_table_caches(remaining as usize, forced) as u64;
-                    if evicted > 0 {
-                        released += evicted;
-                        storage::trim_allocator();
-                    }
-                }
-            }
-        }
+        released += self.escalate(released, want, forced);
         released
     }
 
-    pub(crate) async fn reclaim_memory(&self, want: u64, forced: bool) -> u64 {
-        let mut released = self.reclaim_memory_sync(want, forced);
+    /// Steps 4-5: unmapping idle block mappings, then evicting reloadable table
+    /// caches. Shared by both calls of [`Self::reclaim_cheap_levers`].
+    ///
+    /// `already` is what the steps above released; the target is "meet `want`,
+    /// or get under the low watermark, whichever asks for more".
+    fn escalate(&self, already: u64, want: u64, forced: bool) -> u64 {
         let (_, cgroup) = cgroup_snapshot();
         let pressure = self.measure_pressure(cgroup.as_ref());
-        if (forced || pressure != Pressure::Ok) && self.budget_bytes() > 0 {
-            let before = self.memory_usage();
-            let dumped = self
-                .reclaim_unsealed_under_pressure(self.memory_low())
-                .await;
-            if dumped > 0 {
-                storage::trim_allocator();
-                let over = self.memory_usage().saturating_sub(self.memory_low());
-                if over > 0 {
-                    released += self.shrink_block_maps(over as usize) as u64;
-                    let over = self.memory_usage().saturating_sub(self.memory_low());
-                    if over > 0 {
-                        let evicted = self.evict_table_caches(over as usize, forced) as u64;
-                        if evicted > 0 {
-                            released += evicted;
-                            storage::trim_allocator();
-                        }
-                    }
+        if !(forced || pressure != Pressure::Ok || already < want) {
+            return 0;
+        }
+        let mut released = 0u64;
+        let over = self.memory_usage().saturating_sub(self.memory_low());
+        let remaining = want.saturating_sub(already).max(over);
+        released += self.shrink_block_maps(remaining as usize) as u64;
+        if forced || pressure != Pressure::Ok {
+            let over = self.memory_usage().saturating_sub(self.memory_low());
+            let remaining = want
+                .saturating_sub(already.saturating_add(released))
+                .max(over);
+            if remaining > 0 {
+                let evicted = self.evict_table_caches(remaining as usize, forced) as u64;
+                if evicted > 0 {
+                    released += evicted;
+                    storage::trim_allocator();
                 }
-                let after = self.memory_usage();
-                released = released.saturating_add(before.saturating_sub(after));
             }
         }
         released
