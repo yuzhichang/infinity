@@ -111,11 +111,11 @@ pub(crate) async fn trigger_loop(
                 // A periodic checkpoint is not the operator's `FLUSH DATA`:
                 // it never dumps the memory indexes, even with
                 // `flush_dumps_mem_index` on.
-                if engine.checkpoint().await.is_ok() {
-                    crate::scheduler::scheduler()
-                        .spawn_blocking(storage::trim_allocator)
-                        .await;
-                }
+                //
+                // No allocator trim after it: `mi_collect` reclaims the calling
+                // thread's heap, and a blocking-pool thread holds none of the
+                // checkpoint's memory. The index dumps trim where they allocate.
+                let _ = engine.checkpoint().await;
             }
             // The memory ceiling is checked on the tick, **not** behind
             // `needs_cleanup`: a read-only server grows its page cache without a

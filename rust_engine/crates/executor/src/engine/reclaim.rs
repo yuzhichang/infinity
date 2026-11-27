@@ -120,11 +120,11 @@ impl Engine {
             .reclaim_unsealed_until(false, || self.reclaim_target_met(target))
             .await;
         drop(guard);
-        if dumped > 0 {
-            crate::scheduler::scheduler()
-                .spawn_blocking(storage::trim_allocator)
-                .await;
-        }
+        // No allocator trim here. `mi_collect` reclaims the *calling thread's*
+        // heap, and this call used to run on a blocking-pool thread, which
+        // allocates almost nothing - it freed the wrong heap and cost a thread
+        // switch. The dump itself trims on the thread that did the work (see
+        // `dump_table`'s callers).
         dumped
     }
 
