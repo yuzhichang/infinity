@@ -227,17 +227,32 @@ impl<'a> BlockCursor<'a> {
     /// cursor's snapshot and this call leaves them in a block the snapshot does
     /// not name, and the buffered copy is already retired.
     pub(crate) fn rows(&mut self, ids: &[u64]) -> Result<Vec<(usize, Vec<Value>)>> {
+        self.rows_wanted_cols(ids, None)
+    }
+
+    /// [`Self::rows`] decoding only `wanted_cols` (leaving other slots as
+    /// `Value::Null` so column indices stay aligned with the table schema).
+    pub(crate) fn rows_wanted_cols(
+        &mut self,
+        ids: &[u64],
+        wanted_cols: Option<&[usize]>,
+    ) -> Result<Vec<(usize, Vec<Value>)>> {
         let mut complete = true;
-        let mut out = self.rows_of(ids, &mut complete)?;
+        let mut out = self.rows_of(ids, wanted_cols, &mut complete)?;
         if !complete && self.refresh_visible() {
-            out = self.rows_of(ids, &mut complete)?;
+            out = self.rows_of(ids, wanted_cols, &mut complete)?;
         }
         Ok(out)
     }
 
     /// [`Self::rows`] against the snapshot the cursor holds. `complete` says every
     /// id was accounted for (decoded, buffered, or deleted).
-    fn rows_of(&mut self, ids: &[u64], complete: &mut bool) -> Result<Vec<(usize, Vec<Value>)>> {
+    fn rows_of(
+        &mut self,
+        ids: &[u64],
+        wanted_cols: Option<&[usize]>,
+        complete: &mut bool,
+    ) -> Result<Vec<(usize, Vec<Value>)>> {
         let mut sorted: Vec<usize> = ids.iter().map(|id| *id as usize).collect();
         sorted.sort_unstable();
         sorted.dedup();
@@ -265,7 +280,14 @@ impl<'a> BlockCursor<'a> {
             let mut pending = self.engine.buffered_rows_for(&self.table, &live);
             let mut wanted: std::collections::HashSet<usize> = Default::default();
             for seq in &live {
-                if let Some(values) = pending.remove(seq) {
+                if let Some(mut values) = pending.remove(seq) {
+                    if let Some(cols) = wanted_cols {
+                        for (i, cell) in values.iter_mut().enumerate() {
+                            if !cols.contains(&i) {
+                                *cell = Value::Null;
+                            }
+                        }
+                    }
                     out.push((*seq, values));
                     continue;
                 }
@@ -313,7 +335,7 @@ impl<'a> BlockCursor<'a> {
                 id,
                 version,
                 block.as_ref(),
-                None,
+                wanted_cols,
                 None,
                 Some(&wanted),
             ) else {

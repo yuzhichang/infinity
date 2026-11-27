@@ -38,6 +38,57 @@ async fn open(dir: &std::path::Path) -> Engine {
         .unwrap()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_table_creation_preserves_ids_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ids = std::collections::HashSet::new();
+    {
+        let engine = Arc::new(open(dir.path()).await);
+        let mut tasks = Vec::new();
+        for index in 0..64 {
+            let engine = Arc::clone(&engine);
+            tasks.push(tokio::spawn(async move {
+                engine
+                    .execute(&format!("CREATE TABLE tab_{index} (id INT)"))
+                    .await
+                    .unwrap()
+            }));
+        }
+        for task in tasks {
+            let results = task.await.unwrap();
+            let QueryResult::CreatedTable { id, .. } = &results[0] else {
+                panic!("expected a created table");
+            };
+            assert!(ids.insert(*id), "duplicate table id {id}");
+        }
+        let mut duplicates = Vec::new();
+        for _ in 0..8 {
+            let engine = Arc::clone(&engine);
+            duplicates.push(tokio::spawn(async move {
+                engine.execute("CREATE TABLE shared (id INT)").await
+            }));
+        }
+        let mut succeeded = 0;
+        for task in duplicates {
+            succeeded += usize::from(task.await.unwrap().is_ok());
+        }
+        assert_eq!(succeeded, 1);
+        engine.flush().await.unwrap();
+    }
+    let engine = open(dir.path()).await;
+    for index in 0..64 {
+        assert!(engine.table_exists(&format!("tab_{index}")));
+    }
+    let results = engine
+        .execute("CREATE TABLE after_restart (id INT)")
+        .await
+        .unwrap();
+    let QueryResult::CreatedTable { id, .. } = &results[0] else {
+        panic!("expected a created table");
+    };
+    assert!(!ids.contains(id), "table id {id} was reused after restart");
+}
+
 #[tokio::test]
 async fn state_survives_restart_after_wal_truncation() {
     let dir = tempfile::tempdir().unwrap();

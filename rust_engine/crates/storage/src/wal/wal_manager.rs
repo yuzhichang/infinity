@@ -43,13 +43,14 @@
 //! writer), matching the engine's serial `WriteWAL` stage.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 use ::common::{Error, Result, TxnTimeStamp};
 
-use crate::wal_entry::{WalEntry, WAL_ENTRY_HEADER_LEN};
+use crate::wal_entry::{WalCmd, WalEntry, WAL_ENTRY_HEADER_LEN};
 
 // Port of the reference's `storage/wal` subsystem, one module per source
 // unit. `log_file` and `bottom_executor` are done; `wal_manager` and
@@ -65,10 +66,11 @@ use crate::wal_entry::{WalEntry, WAL_ENTRY_HEADER_LEN};
 /// `append`/`sync` directly on a thread of its own and must keep doing so.
 pub struct WalManager {
     path: PathBuf,
-    file: File,
+    file: Arc<std::fs::File>,
     /// `NewFlush` appends a batch of entries and then fsyncs once, so the
     /// commit ts of the newest entry in the file is what that `Sync()` covers.
     appended_ts: TxnTimeStamp,
+    filesystem_sync_ts: TxnTimeStamp,
     /// Tracked byte length of the active WAL file to avoid an async `fstat`
     /// (`metadata().await`) on every `append`.
     file_size: u64,
@@ -78,21 +80,25 @@ impl WalManager {
     /// Opens (creating if needed) the WAL at `path` for appending.
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        let open_path = path.clone();
+        let (file, file_size) =
+            tokio::task::spawn_blocking(move || -> std::io::Result<(std::fs::File, u64)> {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&open_path)?;
+                let len = file.metadata()?.len();
+                Ok((file, len))
+            })
             .await
+            .map_err(|e| Error::Wal(format!("WAL open join: {e}")))?
             .map_err(|e| Error::io(&path, e))?;
-        let file_size = file
-            .metadata()
-            .await
-            .map_err(|e| Error::io(&path, e))?
-            .len();
+        sync_wal_parent(&path).await?;
         Ok(Self {
             path,
-            file,
+            file: Arc::new(file),
             appended_ts: 0,
+            filesystem_sync_ts: 0,
             file_size,
         })
     }
@@ -106,24 +112,35 @@ impl WalManager {
         let mut buf = Vec::with_capacity(entry.size_in_bytes());
         entry.write_adv(&mut buf);
         let offset = self.file_size;
-        if let Err(e) = self.file.write_all(&buf).await {
-            if let Ok(meta) = self.file.metadata().await {
+        let len = buf.len() as u64;
+        let file = self.file.clone();
+        let write_res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            (&*file).write_all(&buf)
+        })
+        .await
+        .map_err(|e| Error::Wal(format!("WAL append join: {e}")))?;
+        if let Err(e) = write_res {
+            if let Ok(meta) = self.file.metadata() {
                 self.file_size = meta.len();
             }
             return Err(Error::io(&self.path, e));
         }
-        self.file_size += buf.len() as u64;
-        // Hand the bytes to the kernel before returning. `write_all` on a
-        // `tokio::fs::File` completes the write, but the handle's own buffer is
-        // only drained on `flush`, and a reader that opens the path straight
-        // afterwards (`std::fs::read` in the golden-bytes test, or a restart
-        // that reopens the log) could otherwise see a short file. This is not
-        // an fsync - durability stays with `sync`, one per commit batch.
-        self.file
-            .flush()
-            .await
-            .map_err(|e| Error::io(&self.path, e))?;
+        self.file_size += len;
         self.appended_ts = self.appended_ts.max(entry.commit_ts);
+        if entry.cmds.iter().any(|cmd| match cmd {
+            WalCmd::CreateDatabase { .. }
+            | WalCmd::CreateTable { .. }
+            | WalCmd::Append { .. }
+            | WalCmd::Delete { .. } => false,
+            WalCmd::CreateIndex {
+                segment_index_infos,
+                ..
+            } => !segment_index_infos.is_empty(),
+            _ => true,
+        }) {
+            self.filesystem_sync_ts = self.filesystem_sync_ts.max(entry.commit_ts);
+        }
         // The write itself is not synced: `WalManager::NewFlush` owns that
         // decision. Upstream ends every flush batch with
         // `wal_handle_->Sync()` (#3534, replacing the old userspace
@@ -138,64 +155,52 @@ impl WalManager {
         self.appended_ts
     }
 
+    /// Whether this WAL batch still has commands that may depend on files
+    /// outside the WAL, such as an import or a dump of index chunks.
+    pub fn needs_filesystem_sync(&self, synced_ts: TxnTimeStamp) -> bool {
+        self.filesystem_sync_ts > synced_ts
+    }
+
     /// Makes everything appended so far durable (fsync).
     ///
     /// Called after every commit batch and after the checkpoint frame: the
     /// reference's WAL is the durability boundary for everything the catalog
     /// store does not flush, because the store keeps RocksDB's log off.
     pub async fn sync(&mut self) -> Result<()> {
-        self.file
-            .sync_all()
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.sync_all())
             .await
+            .map_err(|e| Error::Wal(format!("WAL sync join: {e}")))?
             .map_err(|e| Error::io(&self.path, e))
     }
 
     /// A second handle on the same file, for a caller that wants to fsync off
     /// the thread holding the write lock.
     ///
-    /// `sync_all` on a clone is an fsync of the same inode, so the bytes it
-    /// covers are exactly the ones the writer has handed to the kernel up to
-    /// that point - the ordering guarantee the single flush thread used to
-    /// give.
-    pub async fn sync_handle(&self) -> Result<File> {
-        self.file
-            .try_clone()
-            .await
-            .map_err(|e| Error::io(&self.path, e))
+    /// `sync_all` on a shared `Arc<std::fs::File>` is an fsync of the same
+    /// inode, so the bytes it covers are exactly the ones the writer has handed
+    /// to the kernel up to that point - the ordering guarantee the single flush
+    /// thread used to give, without `try_clone`'s blocking round-trip.
+    pub fn sync_handle(&self) -> Arc<std::fs::File> {
+        self.file.clone()
     }
 
-    /// Flushes all dirty data and metadata on the filesystem containing the WAL
-    /// (WAL and all open/closed process files) on the blocking pool.
-    pub async fn sync_fs(handle: File) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let std_file = handle.into_std().await;
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                use std::os::fd::AsRawFd;
-                extern "C" {
-                    fn syncfs(fd: std::os::raw::c_int) -> std::os::raw::c_int;
-                }
-                #[allow(unsafe_code)]
-                // SAFETY: `std_file` is a valid open fd; `syncfs` flushes all
-                // dirty data and metadata on its filesystem.
-                let rc = unsafe { syncfs(std_file.as_raw_fd()) };
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|e| Error::Wal(format!("WAL syncfs join: {e}")))?
-            .map_err(|e| Error::Wal(format!("WAL syncfs: {e}")))?;
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            handle
-                .sync_all()
-                .await
-                .map_err(|e| Error::Wal(format!("WAL syncfs fallback: {e}")))?;
-        }
-        Ok(())
+    /// Flushes the WAL and any data files on its filesystem referenced by the
+    /// batch. A transaction that can be replayed from its frame needs only a
+    /// WAL file sync.
+    pub async fn sync_handle_to_disk(handle: Arc<std::fs::File>, filesystem: bool) -> Result<()> {
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            #[cfg(target_os = "linux")]
+            if filesystem {
+                return sync_filesystem(&handle);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = filesystem;
+            handle.sync_all()
+        })
+        .await
+        .map_err(|e| Error::Wal(format!("WAL sync join: {e}")))?
+        .map_err(|e| Error::Wal(format!("WAL sync: {e}")))
     }
 
     /// Flushes all dirty data and metadata on the filesystem containing `dir`
@@ -210,19 +215,7 @@ impl WalManager {
                 Err(e) => return Err(e),
             };
             #[cfg(target_os = "linux")]
-            {
-                use std::os::fd::AsRawFd;
-                extern "C" {
-                    fn syncfs(fd: std::os::raw::c_int) -> std::os::raw::c_int;
-                }
-                #[allow(unsafe_code)]
-                // SAFETY: `file` is a valid open fd; `syncfs` flushes all
-                // dirty data and metadata on its filesystem.
-                let rc = unsafe { syncfs(file.as_raw_fd()) };
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
+            sync_filesystem(&file)?;
             #[cfg(not(target_os = "linux"))]
             {
                 fn sync_tree_recursive(path: &Path) -> std::io::Result<()> {
@@ -260,35 +253,28 @@ impl WalManager {
         // durable, so the contents have to be on disk first. Commit entries are
         // synced one by one, but the checkpoint frame is appended unsynced and
         // `rotate_wal_if_large` can run before `sync_wal`.
-        self.file
-            .sync_all()
-            .await
-            .map_err(|e| Error::io(&self.path, e))?;
+        self.sync().await?;
         let sealed = self.path.with_extension(format!("log.{seal_ts}"));
         tokio::fs::rename(&self.path, &sealed)
             .await
             .map_err(|e| Error::io(&sealed, e))?;
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await
-            .map_err(|e| Error::io(&self.path, e))?;
+        let open_path = self.path.clone();
+        let file = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&open_path)
+        })
+        .await
+        .map_err(|e| Error::Wal(format!("WAL rotate open join: {e}")))?
+        .map_err(|e| Error::io(&self.path, e))?;
+        self.file = Arc::new(file);
         self.file_size = 0;
         // A directory is synced through a plain `File`: `tokio::fs::File`
         // cannot open one portably, and the fsync is the whole point (the
         // rename is only durable once the directory entry is). It is still a
         // real fsync, so it stays on the blocking pool instead of a worker.
-        if let Some(dir) = self.path.parent() {
-            let dir = dir.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                let handle = std::fs::File::open(&dir).map_err(|e| Error::io(&dir, e))?;
-                handle.sync_all().map_err(|e| Error::io(&dir, e))
-            })
-            .await
-            .map_err(|e| Error::Wal(format!("WAL directory sync: {e}")))??;
-        }
-        Ok(())
+        sync_wal_parent(&self.path).await
     }
 
     /// Current size of the WAL in bytes.
@@ -302,16 +288,6 @@ impl WalManager {
     /// the new inode.
     pub async fn truncate_up_to_streaming(&mut self, ts: TxnTimeStamp) -> Result<usize> {
         let tmp = self.path.with_extension("log.compact");
-        // The size below bounds how far the reader walks, and it comes from the
-        // file's metadata. A `write_all` that has not been flushed can still be
-        // queued in the file object, so the length read here would be short and
-        // the reader would stop at a frame boundary that is not the end of the
-        // log - `streaming_truncate_keeps_only_newer_records` saw that as four
-        // records retained instead of five, one run in five.
-        self.file
-            .flush()
-            .await
-            .map_err(|e| Error::io(&self.path, e))?;
         let file_len = self.file_size().await?;
         let mut consumed = 0u64;
         let mut kept = 0usize;
@@ -422,6 +398,30 @@ impl WalManager {
     }
 }
 
+async fn sync_wal_parent(path: &Path) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::definition::format::sync_parent(&path).map_err(|e| Error::io(&path, e))
+    })
+    .await
+    .map_err(|e| Error::Wal(format!("WAL directory sync: {e}")))?
+}
+
+#[cfg(target_os = "linux")]
+fn sync_filesystem(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn syncfs(fd: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: `file` owns a live file descriptor for the duration of the call.
+    let rc = unsafe { syncfs(file.as_raw_fd()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Walks a byte buffer as a stream of `WalEntry` records.
 ///
 /// Each iteration hands [`WalEntry::read_adv`] the rest of the buffer, which is
@@ -441,6 +441,7 @@ mod tests {
     use super::*;
     use crate::wal_entry::{WalCmd, WalRowId};
     use tempfile::tempdir;
+    use tokio::fs::OpenOptions;
 
     fn entry(txn_id: i64, commit_ts: u64) -> WalEntry {
         WalEntry::new(txn_id, commit_ts, vec![])
@@ -496,6 +497,35 @@ mod tests {
                 WalCmd::Checkpoint { max_commit_ts: 9 },
             ],
         )
+    }
+
+    #[tokio::test]
+    async fn a_wal_batch_retains_the_filesystem_barrier_until_synced() {
+        let dir = tempdir().unwrap();
+        let mut wal = WalManager::open(dir.path().join("wal.log")).await.unwrap();
+        let create = WalCmd::CreateDatabase {
+            db_name: "db".into(),
+            db_id: "1".into(),
+            db_comment: String::new(),
+        };
+        wal.append(&WalEntry::new(1, 2, vec![create.clone()]))
+            .await
+            .unwrap();
+        assert!(!wal.needs_filesystem_sync(0));
+
+        wal.append(&WalEntry::new(
+            2,
+            4,
+            vec![WalCmd::Checkpoint { max_commit_ts: 3 }],
+        ))
+        .await
+        .unwrap();
+        wal.rotate(4).await.unwrap();
+        wal.append(&WalEntry::new(3, 6, vec![create]))
+            .await
+            .unwrap();
+        assert!(wal.needs_filesystem_sync(2));
+        assert!(!wal.needs_filesystem_sync(4));
     }
 
     /// The writer must produce the reference's bytes, not merely something the

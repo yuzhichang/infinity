@@ -243,17 +243,18 @@ impl Engine {
     /// and never from a decode, so a partly covered index costs a version pass
     /// where it used to cost the whole table.
     fn uncovered_rows(&self, q: &KnnCandidateScan<'_>, covered: &HashSet<usize>) -> Vec<usize> {
+        let allowed = |seq: usize| q.allowed.is_none_or(|mask| mask.contains(seq as u64));
         if let Some(live) = q.live_rows {
             return live
                 .iter()
                 .copied()
-                .filter(|seq| !covered.contains(seq))
+                .filter(|seq| !covered.contains(seq) && allowed(*seq))
                 .collect();
         }
         let mut out: Vec<usize> = self
             .live_row_ids(q.table)
             .into_iter()
-            .filter(|seq| !covered.contains(seq))
+            .filter(|seq| !covered.contains(seq) && allowed(*seq))
             .collect();
         out.sort_unstable();
         out

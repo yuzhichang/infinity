@@ -921,3 +921,112 @@ async fn replay_commands_stops_on_the_first_error() {
     assert!(result.is_err(), "the handler's error is propagated");
     assert_eq!(calls, 1, "nothing runs after the first failure");
 }
+
+/// `[wal] wal_flush` accepts exactly its three spellings and rejects anything
+/// else. The fallback used to be `FlushAtOnce`, so a typo silently bought the
+/// most expensive mode; a caller now hears about it instead.
+#[test]
+fn wal_flush_parses_only_its_three_spellings() {
+    assert_eq!(WalFlush::parse("only_write"), Ok(WalFlush::OnlyWrite));
+    assert_eq!(WalFlush::parse("flush_at_once"), Ok(WalFlush::FlushAtOnce));
+    assert_eq!(
+        WalFlush::parse("flush_per_second"),
+        Ok(WalFlush::FlushPerSecond)
+    );
+    // Case and surrounding space are not a spelling difference.
+    assert_eq!(
+        WalFlush::parse("  Flush_Per_Second  "),
+        Ok(WalFlush::FlushPerSecond)
+    );
+    for bad in ["only-write", "flush", "append", "", "flush_every_second"] {
+        assert!(
+            WalFlush::parse(bad).is_err(),
+            "{bad:?} is not a wal_flush mode and must not be accepted"
+        );
+    }
+    // The default has to be one the parser accepts, or a config written from
+    // `as_str` would fail validation.
+    assert_eq!(
+        WalFlush::parse(DEFAULT_WAL_FLUSH.as_str()),
+        Ok(DEFAULT_WAL_FLUSH)
+    );
+}
+
+/// One spelling for every direction: the config file, `SET CONFIG` and the
+/// value `SHOW CONFIGS` reports are the same string.
+///
+/// `ShownName` used to be CamelCase (`FlushPerSecond`) because the C++ engine
+/// renders the enum through `FlushOptionTypeToString`. That made the reported
+/// value the one form an operator could not paste back into `wal_flush`, and
+/// disagreed with every other knob (`log_level` reports `info`). The response
+/// now uses the config spelling, so a value read back is a value that can be
+/// written again.
+#[test]
+fn wal_flush_reports_the_spelling_it_accepts() {
+    for mode in [
+        WalFlush::OnlyWrite,
+        WalFlush::FlushAtOnce,
+        WalFlush::FlushPerSecond,
+    ] {
+        let shown = mode.as_str();
+        assert_eq!(
+            WalFlush::parse(shown),
+            Ok(mode),
+            "the reported spelling must parse back to the same mode"
+        );
+        // And it is the snake_case form, not the removed CamelCase one.
+        assert_eq!(shown, shown.to_ascii_lowercase(), "{shown} is snake_case");
+        assert!(!shown.contains("Flush"), "{shown} has no interior capitals");
+    }
+}
+
+/// `TxnManager` reports the mode it is actually using.
+#[tokio::test]
+async fn wal_flush_getter_reflects_the_setter() {
+    let dir = tempdir().unwrap();
+    let m = manager(dir.path()).await;
+    assert_eq!(m.wal_flush(), DEFAULT_WAL_FLUSH);
+    for mode in [
+        WalFlush::OnlyWrite,
+        WalFlush::FlushAtOnce,
+        WalFlush::FlushPerSecond,
+    ] {
+        m.set_wal_flush(mode);
+        assert_eq!(m.wal_flush(), mode);
+    }
+}
+
+/// `flush_per_second` lets every commit inside its window return un-synced, so
+/// the *last* commit before a quiet period would never reach the disk without
+/// the timer half. `flush_wal_if_due` is that half.
+#[tokio::test]
+async fn flush_per_second_timer_syncs_the_commit_the_window_skipped() {
+    let dir = tempdir().unwrap();
+    let m = manager(dir.path()).await;
+    m.set_wal_flush(WalFlush::FlushPerSecond);
+
+    // The first commit opens the window and syncs; the second lands inside it
+    // and leaves its entry appended but not synced.
+    for i in 0..2u64 {
+        let mut t = m.begin();
+        t.put(row("default_db.t", i), format!("v{i}").into_bytes());
+        m.commit(t).await.unwrap();
+    }
+    let appended = m.last_appended.load(Ordering::SeqCst);
+    assert!(
+        m.wal_synced.load(Ordering::SeqCst) < appended,
+        "the commit inside the window must leave its entry un-synced"
+    );
+
+    // Nothing else will commit, so only the timer can close the gap. The window
+    // is moved into the past rather than slept through.
+    m.last_wal_sync_ms.store(0, Ordering::Relaxed);
+    m.flush_wal_if_due().await.unwrap();
+    assert!(
+        m.wal_synced.load(Ordering::SeqCst) >= appended,
+        "the timer must sync everything the window skipped"
+    );
+
+    // A second call with the window already synced is a no-op, not an error.
+    m.flush_wal_if_due().await.unwrap();
+}

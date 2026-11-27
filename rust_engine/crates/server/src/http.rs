@@ -794,15 +794,14 @@ fn not_supported(route: &str, needs: &str) -> (u16, String) {
     )
 }
 
-/// The configuration knobs `SHOW CONFIGS` reports before anything is set
-/// (`Engine::config_get`'s defaults), in the reference's alphabetical order.
-const CONFIG_KEYS: [&str; 5] = [
-    "cache_result_capacity",
-    "checkpoint_interval",
-    "cleanup_interval",
-    "log_level",
-    "result_cache",
-];
+/// The configuration knobs `SHOW CONFIGS` reports when nothing has set them.
+///
+/// `Engine::seed_config` fills the map from the resolved config file at startup,
+/// so in a served process these are already present; the list stays because a
+/// query front end may also be used on a bare engine (`cargo test`, the
+/// embedded FFI), where no file was read. It is the executor's own list rather
+/// than a copy here, so a knob cannot be queryable in one front end only.
+const CONFIG_KEYS: [&str; 6] = executor::QUERYABLE_CONFIG_KEYS;
 
 /// `ShowConfigsHandler`: `{"<config>": "<value>", …, "error_code": 0}`.
 /// The reference's `IntegerOption`s are rendered as JSON numbers (the SDK
@@ -812,6 +811,7 @@ pub(crate) fn config_is_numeric(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "cleanup_interval"
             | "checkpoint_interval"
+            | "optimize_interval"
             | "cache_result_capacity"
             | "mem_index_capacity"
             | "buffer_manager_size"

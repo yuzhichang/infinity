@@ -223,18 +223,22 @@ impl WalLog {
         f(&mut wal).await
     }
 
-    /// Syncs everything appended so far plus all process files on the
-    /// filesystem (via `syncfs` on Linux) in one batch.
+    /// Syncs everything appended so far, including files needed by a WAL batch
+    /// that cannot be replayed from the log alone.
     ///
     /// The handle is cloned under the guard, so it covers at least the bytes
-    /// this point in the commit order has written. The `syncfs` runs on the
+    /// this point in the commit order has written. The sync runs on the
     /// blocking pool after the guard is released (`AGENTS.md` §7.10).
-    async fn sync(&self) -> Result<TxnTimeStamp> {
-        let (handle, appended) = {
+    async fn sync(&self, synced_ts: TxnTimeStamp) -> Result<TxnTimeStamp> {
+        let (handle, appended, filesystem) = {
             let wal = self.wal.lock().await;
-            (wal.sync_handle().await?, wal.appended_ts())
+            (
+                wal.sync_handle(),
+                wal.appended_ts(),
+                wal.needs_filesystem_sync(synced_ts),
+            )
         };
-        WalManager::sync_fs(handle).await?;
+        WalManager::sync_handle_to_disk(handle, filesystem).await?;
         Ok(appended)
     }
 }
@@ -307,9 +311,10 @@ pub struct TxnManager {
     /// once (#3534), so this is the batch high-water mark, not one commit's.
     /// It is not [`Self::synced`]: that one tracks the store's flush.
     wal_synced: Arc<AtomicU64>,
-    /// Serialises the batch sync so commits that arrive together share one
-    /// `Sync()` instead of each taking its own.
-    sync_lock: tokio::sync::Mutex<()>,
+    /// Coordinates the batch sync so commits that arrive together share one
+    /// `Sync()` and all waiters wake in parallel when it finishes.
+    sync_in_flight: std::sync::atomic::AtomicBool,
+    sync_notify: tokio::sync::Notify,
     /// `total_commit_count`: successful commits since open (the reference's
     /// `NewTxnManager::total_committed_txn_count`).
     total_committed: AtomicU64,
@@ -488,8 +493,9 @@ impl TxnManager {
             synced: AtomicU64::new(applied_ts),
             last_frame: AtomicU64::new(applied_ts),
             wal_synced: Arc::new(AtomicU64::new(start_ts)),
-            sync_lock: tokio::sync::Mutex::new(()),
-            wal_flush: AtomicU64::new(WalFlush::FlushAtOnce as u64),
+            sync_in_flight: std::sync::atomic::AtomicBool::new(false),
+            sync_notify: tokio::sync::Notify::new(),
+            wal_flush: AtomicU64::new(DEFAULT_WAL_FLUSH as u64),
             last_wal_sync_ms: AtomicU64::new(0),
             total_committed: AtomicU64::new(0),
             total_rolled_back: AtomicU64::new(0),
@@ -1025,7 +1031,7 @@ impl TxnManager {
         // crash - but the barrier moves on, and the entry is on disk before the
         // error returns in the common case (`try_clone` is what fails, not the
         // write).
-        if let Err(err) = self.flush_after_commit().await {
+        if let Err(err) = self.flush_after_commit(ts).await {
             self.finish_bottom(ts);
             return Err(err);
         }
@@ -1674,7 +1680,7 @@ impl TxnManager {
             .run(async move |wal| wal.append(&entry).await.map(|_| ()))
             .await?;
         self.last_appended.fetch_max(commit_ts, Ordering::SeqCst);
-        self.sync_wal_grouped().await?;
+        self.sync_wal_grouped(commit_ts).await?;
         self.note_standalone(TxnOp::Cleanup, commit_ts);
         // Published in commit-ts order, like any other commit: see
         // [`Self::write_checkpoint`].
@@ -1808,7 +1814,10 @@ impl TxnManager {
     pub async fn sync_wal(&self) -> Result<()> {
         // The ts is read under the same guard the fsync was taken from, so it
         // names exactly the entries that fsync covers.
-        let covered = self.wal.sync().await?;
+        let covered = self
+            .wal
+            .sync(self.wal_synced.load(Ordering::SeqCst))
+            .await?;
         self.wal_synced.fetch_max(covered, Ordering::SeqCst);
         Ok(())
     }
@@ -1820,35 +1829,76 @@ impl TxnManager {
     }
 
     /// The commit path's durability step, per `[wal] wal_flush`.
-    async fn flush_after_commit(&self) -> Result<()> {
+    async fn flush_after_commit(&self, target_ts: TxnTimeStamp) -> Result<()> {
         match self.wal_flush() {
             // `flush_at_once`: the entry is on disk when the commit returns.
-            WalFlush::FlushAtOnce => self.sync_wal_grouped().await,
-            // `only_write` (the reference's default): the append reaches the
-            // kernel and the OS flushes when it wants. A crash of this process
-            // does not lose it; the checkpoint is the durability boundary.
+            WalFlush::FlushAtOnce => self.sync_wal_grouped(target_ts).await,
+            // `only_write`: the append reaches the kernel and the OS flushes
+            // when it wants. A crash of this process does not lose it; the
+            // checkpoint is the durability boundary.
             WalFlush::OnlyWrite => Ok(()),
             // `flush_per_second`: at most one sync a second, shared by every
-            // commit in that window.
+            // commit in that window. The commit that finds the window still
+            // open returns immediately, so the *last* commit before a quiet
+            // period would otherwise never be synced - `flush_wal_if_due`, on
+            // the engine's one-second tick, is what closes that gap.
             WalFlush::FlushPerSecond => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let last = self
-                    .last_wal_sync_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if now.saturating_sub(last) < 1000 {
+                if !self.sync_window_is_open() {
                     return Ok(());
                 }
-                self.last_wal_sync_ms
-                    .store(now, std::sync::atomic::Ordering::Relaxed);
-                self.sync_wal_grouped().await
+                self.sync_wal_grouped(target_ts).await
             }
         }
     }
 
-    fn wal_flush(&self) -> WalFlush {
+    /// Whether this commit is the one that opens a new `flush_per_second`
+    /// window; a caller that gets `true` owes the fsync.
+    fn sync_window_is_open(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut last = self
+            .last_wal_sync_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if now.saturating_sub(last) < 1000 {
+                return false;
+            }
+            match self.last_wal_sync_ms.compare_exchange_weak(
+                last,
+                now,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => last = actual,
+            }
+        }
+    }
+
+    /// `flush_per_second`'s timer half: syncs whatever the commit path left
+    /// un-synced, so a quiet engine still reaches its one-second bound.
+    ///
+    /// Only the last append's timestamp matters: `sync_wal_grouped` fsyncs the
+    /// whole file, so one call covers every entry behind it. It is a no-op in
+    /// the other two modes, and when an earlier sync already covered the tail.
+    pub async fn flush_wal_if_due(&self) -> Result<()> {
+        if self.wal_flush() != WalFlush::FlushPerSecond {
+            return Ok(());
+        }
+        if !self.sync_window_is_open() {
+            return Ok(());
+        }
+        let target = self.last_appended.load(Ordering::SeqCst);
+        if target == 0 || self.wal_synced.load(Ordering::SeqCst) >= target {
+            return Ok(());
+        }
+        self.sync_wal_grouped(target).await
+    }
+
+    /// The mode in effect, for `SHOW CONFIGS` (`wal_flush`).
+    pub fn wal_flush(&self) -> WalFlush {
         match self.wal_flush.load(std::sync::atomic::Ordering::Relaxed) {
             1 => WalFlush::FlushAtOnce,
             2 => WalFlush::FlushPerSecond,
@@ -1857,22 +1907,47 @@ impl TxnManager {
     }
 
     /// The batch sync of the commit path: one fsync covers every entry
-    /// appended since the previous one (`WalManager::NewFlush`,
+    /// appended up to `target_ts` (`WalManager::NewFlush`,
     /// `wal_manager_impl.cpp:350`).
     ///
-    /// A committer bumps `last_appended` before asking, so "everything appended
-    /// is already durable" is exactly its own entry being covered. The first
-    /// caller takes the lock and syncs through the newest appended entry; the
-    /// others re-check after it and find theirs covered by that same `Sync()`.
-    async fn sync_wal_grouped(&self) -> Result<()> {
-        if self.wal_synced.load(Ordering::SeqCst) >= self.last_appended.load(Ordering::SeqCst) {
-            return Ok(());
+    /// A committer checks whether its own `target_ts` is already durable in
+    /// `wal_synced`. If not, it takes `sync_lock` and re-checks `wal_synced >=
+    /// target_ts` so waiters woken after an earlier leader's `Sync()` return
+    /// immediately without issuing redundant fsyncs for newer concurrent appends.
+    async fn sync_wal_grouped(&self, target_ts: TxnTimeStamp) -> Result<()> {
+        loop {
+            if self.wal_synced.load(Ordering::SeqCst) >= target_ts {
+                return Ok(());
+            }
+            let notified = self.sync_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.wal_synced.load(Ordering::SeqCst) >= target_ts {
+                return Ok(());
+            }
+            if self
+                .sync_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                struct LeaderGuard<'a>(&'a TxnManager);
+                impl Drop for LeaderGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.sync_in_flight.store(false, Ordering::Release);
+                        self.0.sync_notify.notify_waiters();
+                    }
+                }
+                let _guard = LeaderGuard(self);
+                if self.wal_synced.load(Ordering::SeqCst) >= target_ts {
+                    return Ok(());
+                }
+                return self.sync_wal().await;
+            }
+            notified.await;
+            if self.wal_synced.load(Ordering::SeqCst) >= target_ts {
+                return Ok(());
+            }
         }
-        let _one = self.sync_lock.lock().await;
-        if self.wal_synced.load(Ordering::SeqCst) >= self.last_appended.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        self.sync_wal().await
     }
 
     /// Highest commit timestamp the checkpoint has put into an SST.
@@ -2510,12 +2585,41 @@ pub enum WalFlush {
     FlushPerSecond = 2,
 }
 
+/// The value `[wal] wal_flush` takes when the config does not name one.
+///
+/// One second is the widest window that still bounds a power-loss loss to
+/// something an operator can reason about, while taking the per-commit fsync
+/// off the commit path: on btrfs a single `fsync` costs tens of milliseconds
+/// (`btrfs_sync_log` -> `write_all_supers`), which a bulk DDL run pays once per
+/// statement under `flush_at_once`. A process crash still loses nothing - the
+/// append reached the kernel, and only a power loss can drop the tail.
+pub const DEFAULT_WAL_FLUSH: WalFlush = WalFlush::FlushPerSecond;
+
 impl WalFlush {
-    pub fn parse(mode: &str) -> Self {
+    /// Parses `[wal] wal_flush`, rejecting anything it does not know.
+    ///
+    /// It used to fall back to `FlushAtOnce` on an unknown string, which turned
+    /// a typo (`only-write`, an old `flush_method_at_commit = "flush"`) into the
+    /// most expensive durability mode with no diagnostic. The reference rejects
+    /// an unsupported option too (`config_impl.cpp:2440`).
+    pub fn parse(mode: &str) -> std::result::Result<Self, String> {
         match mode.trim().to_ascii_lowercase().as_str() {
-            "only_write" => WalFlush::OnlyWrite,
-            "flush_per_second" => WalFlush::FlushPerSecond,
-            _ => WalFlush::FlushAtOnce,
+            "flush_at_once" => Ok(WalFlush::FlushAtOnce),
+            "only_write" => Ok(WalFlush::OnlyWrite),
+            "flush_per_second" => Ok(WalFlush::FlushPerSecond),
+            other => Err(format!(
+                "unsupported wal_flush '{other}': expected one of \
+                 flush_at_once, only_write, flush_per_second"
+            )),
+        }
+    }
+
+    /// The config spelling, for a diagnostic that echoes the effective value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WalFlush::OnlyWrite => "only_write",
+            WalFlush::FlushAtOnce => "flush_at_once",
+            WalFlush::FlushPerSecond => "flush_per_second",
         }
     }
 }

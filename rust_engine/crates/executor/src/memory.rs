@@ -404,6 +404,11 @@ fn usage_feed(from_cgroup: bool, cgroup: Option<u64>, rss: fn() -> u64) -> u64 {
     }
 }
 
+/// The process's cgroup memory limit, when the host imposes one.
+pub fn cgroup_memory_limit_bytes() -> Option<u64> {
+    cgroup_snapshot().1.map(|limit| limit.bytes)
+}
+
 impl super::Engine {
     /// The ceiling this engine runs under: the configuration's
     /// `buffer_manager_size` (`memory_limit`) when it is set, the cgroup's

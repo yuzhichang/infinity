@@ -12,7 +12,10 @@ One Go program with the embedder compiled in (cgo):
   (`tools/loadtest/m2v`), so there is no Python generator and no intermediate
   vector file (§4.2.4);
 - **load** — one goroutine per client, one SDK connection per goroutine, running
-  the Q1–Q7 mix plus a readers-and-writers phase (§3, §5).
+  the Q1–Q7 mix plus a readers-and-writers phase (§3, §5). Each connection
+  resolves a table's SDK handle once and reuses it (`Engine.Table`), so a timed
+  query is one round trip: `GetTable` is its own Thrift RPC, and asking per
+  query made every latency figure include a second one.
 
 ## Build
 
@@ -55,14 +58,15 @@ LT_SCENARIO=S \
 | `LT_SCENARIO` | `S`, `M`, `L`, `XL`, or `S:10x200` (tables × rows/table). A trailing `/N` scales a named scenario, e.g. `L/100`. |
 | `LT_TABLES`, `LT_ROWS` | override either dimension of the scenario. |
 | `LT_QUERIES` | query count per kind (default 200). |
-| `LT_BATCHES` | concurrent ingest workers (default 4). |
 | `LT_BATCH_SIZE` | rows per INSERT (default 1024). |
 | `LT_SPARSEGRAM` | add `content`'s third analyzer → 60 index objects/table. |
 | `LT_SKEW` | production-like Zipf over the top 42 tables (needs 200+ tables). |
 | `LT_INDEX_LAST` | load first, then index (P1b) instead of indexes first (P1a). |
 | `LT_KEEP_TABLES` | skip P8 teardown, to inspect the data afterwards. |
-| `LT_READERS` / `LT_WRITERS` / `LT_MIXED_SECONDS` | P7 shape. |
+| `LT_READERS` / `LT_WRITERS` / `LT_MIXED_SECONDS` | P7 shape; reader/writer counts are capped to the fixed client pool. |
 | `LT_SEED` | drives every sampled choice; recorded in the report. |
+
+The Thrift client pool is fixed from Go's `runtime.NumCPU()`: 2× for L (including scaled `L/N`), 5× for XL (including scaled `XL/N`), and 1× for other scenarios. All phases reuse this pool; `LT_BATCHES`, `LT_QUERY_WORKERS`, and `LT_DDL_WORKERS` no longer apply.
 
 ## Phases
 

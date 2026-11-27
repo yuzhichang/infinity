@@ -802,6 +802,41 @@ async fn sparse_index_scan_matches_with_bmp() {
     assert_first(&e, search, "1").await;
 }
 
+#[tokio::test]
+async fn sparse_index_scan_with_filter_pushes_down_allowed_rows() {
+    let dir = tempdir().unwrap();
+    let e = Engine::open_async(dir.path(), Default::default())
+        .await
+        .unwrap();
+
+    e.execute("CREATE TABLE t1(c1 INT, c2 SPARSE(FLOAT,100));")
+        .await
+        .unwrap();
+    // Row 1 scores 3.0, row 2 scores 2.0, row 3 scores 1.0 against [20:1, 30:1, 40:1].
+    e.execute(
+        "INSERT INTO t1 VALUES (1, [20:1.0, 30:1.0, 40:1.0]), \
+         (2, [20:1.0, 30:1.0]), \
+         (3, [20:1.0]);",
+    )
+    .await
+    .unwrap();
+    e.execute(
+        "CREATE INDEX idx2 ON t1 (c2) USING BMP \
+         WITH (block_size=8, compress_type=compress);",
+    )
+    .await
+    .unwrap();
+
+    let search = "SELECT c1 FROM t1 SEARCH MATCH SPARSE \
+                  (c2, [20:1.0,30:1.0,40:1.0], 'ip', 1) WHERE c1 > 1;";
+    // Before dump: memory tail (`SparseTailBmp`) excludes row 1 and returns row 2.
+    assert_first(&e, search, "2").await;
+
+    // After dump: sealed chunk (`BmpReader::search_filtered`) also excludes row 1.
+    e.dump_index_transaction("t1", "idx2").await.unwrap();
+    assert_first(&e, search, "2").await;
+}
+
 /// C++: `src/unit_test/storage/new_request/index_request_ut.cpp:226`
 /// (`tensor_index_scan`): `MATCH TENSOR` applies MaxSim over the 4-wide leaves
 /// of each row, with and without the EMVB index.

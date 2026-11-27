@@ -439,6 +439,22 @@ impl BmpReader {
         topk: usize,
         options: BmpSearchOptions,
     ) -> Vec<(usize, f32)> {
+        self.search_filtered(query, topk, options, |_| true)
+    }
+
+    /// [`Self::search`] with a per-document filter (`BMPAlgBase::SearchKnn`
+    /// with `Filter`): only document ids where `allow(doc_id)` is true are
+    /// scored into the result heap.
+    pub fn search_filtered<F>(
+        &self,
+        query: &[(i32, f32)],
+        topk: usize,
+        options: BmpSearchOptions,
+        mut allow: F,
+    ) -> Vec<(usize, f32)>
+    where
+        F: FnMut(usize) -> bool,
+    {
         let _ = self.widths;
         if topk == 0 || self.doc_ids.is_empty() {
             return Vec::new();
@@ -510,7 +526,10 @@ impl BmpReader {
             for (off, score) in scores.iter().enumerate() {
                 let doc = base + off;
                 if doc < self.doc_ids.len() {
-                    best.push((self.doc_ids[doc] as usize, *score));
+                    let doc_id = self.doc_ids[doc] as usize;
+                    if allow(doc_id) {
+                        best.push((doc_id, *score));
+                    }
                 }
             }
             best.sort_by(|a, b| {
@@ -728,6 +747,27 @@ mod tests {
         // The runner-up lives in the block whose bound (10.0) is below the
         // other block's term maximum (100.0).
         assert_eq!(hits[1].0, 0);
+        assert!((hits[1].1 - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_filtered_excludes_disallowed_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunk_filtered.bmp");
+        // Doc 0 has the highest score (100.0), doc 1 has 50.0, doc 2 has 10.0.
+        let docs: Vec<SparseDoc> = vec![
+            (0, vec![(1, 100.0)]),
+            (1, vec![(1, 50.0)]),
+            (2, vec![(1, 10.0)]),
+        ];
+        write_bmp_file(&path, 16, IdxWidth::I32, &docs, 4).unwrap();
+        let reader = BmpReader::open(&path, IdxWidth::I32).unwrap();
+
+        // Excluding doc 0 should still return top-2 from the remaining allowed docs.
+        let hits =
+            reader.search_filtered(&[(1, 1.0)], 2, BmpSearchOptions::default(), |doc| doc != 0);
+        assert_eq!(hits.iter().map(|(r, _)| *r).collect::<Vec<_>>(), vec![1, 2]);
+        assert!((hits[0].1 - 50.0).abs() < 1e-6);
         assert!((hits[1].1 - 10.0).abs() < 1e-6);
     }
 }

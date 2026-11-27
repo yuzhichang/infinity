@@ -3239,6 +3239,7 @@ dependencies = [
  "common",
  "hmac",
  "index",
+ "libc",
  "lz4_flex 0.13.1",
  "memmap2",
  "roaring",
@@ -3250,6 +3251,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

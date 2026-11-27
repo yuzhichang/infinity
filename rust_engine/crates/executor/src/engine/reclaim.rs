@@ -105,7 +105,7 @@ impl Engine {
         if self.context.unsealed_memory_quota.load(Ordering::Relaxed) == 0 {
             return 0;
         }
-        let _guard = self.context.unsealed_reclaim_lock.lock().await;
+        let guard = self.context.unsealed_reclaim_lock.lock().await;
         // The retry gate is a monotonic deadline, not a commit ts: ageing the
         // ranking on commit ts is right, but no commit has to happen for a
         // backed-off round to become due again.
@@ -116,8 +116,16 @@ impl Engine {
         if self.reclaim_target_met(target) {
             return 0;
         }
-        self.reclaim_unsealed_until(false, || self.reclaim_target_met(target))
-            .await
+        let dumped = self
+            .reclaim_unsealed_until(false, || self.reclaim_target_met(target))
+            .await;
+        drop(guard);
+        if dumped > 0 {
+            crate::scheduler::scheduler()
+                .spawn_blocking(storage::trim_allocator)
+                .await;
+        }
+        dumped
     }
 
     /// Reclaims unsealed tables (append buffers + in-memory index tails) under

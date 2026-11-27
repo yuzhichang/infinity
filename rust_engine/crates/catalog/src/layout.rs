@@ -1370,10 +1370,25 @@ fn read_columns(
     db_id: u64,
     table_id: u64,
 ) -> Result<(Vec<ColumnDefValue>, u64)> {
+    read_columns_filtered(store, db_id, table_id, None)
+}
+
+fn read_columns_filtered(
+    store: &dyn MetaStore,
+    db_id: u64,
+    table_id: u64,
+    only_column: Option<&str>,
+) -> Result<(Vec<ColumnDefValue>, u64)> {
     let col_prefix = key::table_column_prefix(&db_id.to_string(), &table_id.to_string());
     let mut newest_column: std::collections::HashMap<String, (u64, ColumnDefValue)> =
         std::collections::HashMap::new();
+    let needle = only_column.filter(|s| s.is_ascii()).map(str::as_bytes);
     for (k, cv) in store.scan_prefix(col_prefix.as_bytes())? {
+        if let Some(n) = needle {
+            if !cv.windows(n.len()).any(|w| w == n) {
+                continue;
+            }
+        }
         let key = String::from_utf8_lossy(&k).to_string();
         let ts = key
             .rsplit('|')
@@ -1383,6 +1398,11 @@ fn read_columns(
         let Some(col) = value_format::column_def_from_bytes(&cv) else {
             continue;
         };
+        if let Some(target) = only_column {
+            if col.column_name != target {
+                continue;
+            }
+        }
         match newest_column.entry(col.column_name.clone()) {
             std::collections::hash_map::Entry::Occupied(mut slot) if ts >= slot.get().0 => {
                 slot.insert((ts, col));
@@ -1400,6 +1420,9 @@ fn read_columns(
             continue;
         }
         columns.push(col);
+    }
+    if only_column.is_some() {
+        return Ok((columns, 0));
     }
     columns.sort_by_key(|c| c.column_id);
     let next_column_id = store
@@ -1607,12 +1630,18 @@ pub fn schema_at(
 /// instead made every statement that touches a table (`SELECT`, `INSERT`, a DDL
 /// on another table) decode every table and every column in the catalog - O(n)
 /// work per row on a directory with many tables.
+enum ColumnRead<'a> {
+    None,
+    All,
+    One(&'a str),
+}
+
 pub fn read_table(
     store: &dyn MetaStore,
     db_name: &str,
     table_name: &str,
 ) -> Result<Option<TableLayout>> {
-    read_table_impl(store, db_name, table_name, true)
+    read_table_impl(store, db_name, table_name, ColumnRead::All)
 }
 
 /// Like [`read_table`], but skips reading and decoding column records.
@@ -1623,14 +1652,25 @@ pub fn read_table_header_only(
     db_name: &str,
     table_name: &str,
 ) -> Result<Option<TableLayout>> {
-    read_table_impl(store, db_name, table_name, false)
+    read_table_impl(store, db_name, table_name, ColumnRead::None)
+}
+
+/// Like [`read_table`], but only decodes the single column named `column_name`.
+/// Used by `CreateIndex` for secondary indexes that only inspect one column's type.
+pub fn read_table_for_column(
+    store: &dyn MetaStore,
+    db_name: &str,
+    table_name: &str,
+    column_name: &str,
+) -> Result<Option<TableLayout>> {
+    read_table_impl(store, db_name, table_name, ColumnRead::One(column_name))
 }
 
 fn read_table_impl(
     store: &dyn MetaStore,
     db_name: &str,
     table_name: &str,
-    with_columns: bool,
+    col_read: ColumnRead<'_>,
 ) -> Result<Option<TableLayout>> {
     let Some((db_id, db_ts)) = db_record(store, db_name)? else {
         return Ok(None);
@@ -1664,10 +1704,10 @@ fn read_table_impl(
     )? {
         return Ok(None);
     }
-    let (columns, next_column_id) = if with_columns {
-        read_columns(store, db_id, table_id)?
-    } else {
-        (Vec::new(), 0)
+    let (columns, next_column_id) = match col_read {
+        ColumnRead::None => (Vec::new(), 0),
+        ColumnRead::All => read_columns(store, db_id, table_id)?,
+        ColumnRead::One(col) => read_columns_filtered(store, db_id, table_id, Some(col))?,
     };
     Ok(Some(TableLayout {
         db_name: db_name.to_string(),
@@ -3187,6 +3227,84 @@ fn json_string(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Fast path for [`index_def_for`] when the table's metadata is already cached
+/// in `Catalog::table_cache`: builds the [`IndexDefValue`] without scanning or
+/// JSON-parsing `catalog|tbl_col|` records. Returns `None` for variants that
+/// inspect the raw `ColumnDef` JSON (`IVF`, `FLAT`, `SECONDARYFUNCTIONAL`), so
+/// the caller falls back to `read_table_for_column`.
+pub(crate) fn index_def_for_cached(
+    im: &IndexMeta,
+    table_name: &str,
+    col_type: Option<&str>,
+) -> Option<IndexDefValue> {
+    let opt = |k: &str| -> Option<String> {
+        im.options
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(k))
+            .map(|(_, v)| v.clone())
+    };
+    let opt_word = |k: &str, default: &str| -> String {
+        opt(k)
+            .map(|v| v.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+            .unwrap_or_else(|| default.to_string())
+    };
+    let opt_num = |k: &str, default: i64| -> i64 {
+        opt(k)
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+    };
+    match im.index_type.as_str() {
+        "HNSW" => Some(IndexDefValue::hnsw(
+            &im.name,
+            table_name,
+            &im.column,
+            value_format::metric_name_of(&opt_word("METRIC", "l2")),
+            value_format::hnsw_encode_name_of(&opt_word("ENCODE", "plain")),
+            value_format::hnsw_build_name_of(&opt_word("BUILD_TYPE", "plain")),
+            opt_num("M", value_format::HNSW_M),
+            opt_num("EF_CONSTRUCTION", value_format::HNSW_EF_CONSTRUCTION),
+            opt_num("BLOCK_SIZE", value_format::HNSW_BLOCK_SIZE),
+            opt("LSG_CONFIG"),
+        )),
+        "SPANN" => Some(IndexDefValue::spann(
+            &im.name,
+            table_name,
+            &im.column,
+            &im.options,
+        )),
+        "FULLTEXT" => Some(IndexDefValue::full_text(
+            &im.name,
+            table_name,
+            &im.column,
+            &opt_word("ANALYZER", "standard"),
+        )),
+        "SECONDARY" | "" => {
+            let ty = col_type?;
+            let is_json = ty.trim().eq_ignore_ascii_case("JSON");
+            let low = is_json
+                || opt("CARDINALITY")
+                    .map(|v| v.eq_ignore_ascii_case("low"))
+                    .unwrap_or(false);
+            Some(IndexDefValue::secondary(
+                &im.name, table_name, &im.column, low, is_json,
+            ))
+        }
+        "BMP" | "SMVE" | "PLAID" | "EMVB" | "DISKANN" => {
+            // Fall through to index_def_for via empty TableLayout.
+            let empty = TableLayout {
+                db_name: String::new(),
+                db_id: 0,
+                table_name: table_name.to_string(),
+                table_id: 0,
+                columns: Vec::new(),
+                next_column_id: 0,
+            };
+            index_def_for(im, &empty)
+        }
+        _ => None,
+    }
 }
 
 /// Maps a C++ index record onto the engine's `IndexMeta`, resolving the owning

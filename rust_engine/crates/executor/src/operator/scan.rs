@@ -63,6 +63,53 @@ pub struct TableScan {
 }
 
 impl TableScan {
+    /// Schema column indices this scan actually needs (its pruned `columns`
+    /// plus any columns read by `candidate`). `None` means all schema columns
+    /// are needed (or a non-schema column is present).
+    fn wanted_schema_columns(&self, engine: &Engine) -> Option<Vec<usize>> {
+        if self.columns.iter().any(|c| crate::is_search_hidden(c)) {
+            return None;
+        }
+        let schema = engine.table_schema(&self.table).ok()?;
+        let mut wanted: Vec<usize> = self
+            .columns
+            .iter()
+            .map(|c| schema.iter().position(|s| s == c))
+            .collect::<Option<Vec<_>>>()?;
+        if let Some(candidate) = &self.candidate {
+            let mut expr_cols = std::collections::BTreeSet::new();
+            planner::column::collect_expr_columns(&candidate.index_filter, &mut expr_cols);
+            if let planner::index_scan::IndexFilterEvaluator::Secondary(sec) = &candidate.evaluator
+            {
+                expr_cols.insert(sec.column_id);
+            }
+            for ci in expr_cols {
+                let col_name = self
+                    .index_columns
+                    .as_deref()
+                    .and_then(|cols| cols.get(ci))
+                    .or_else(|| {
+                        self.index_positions
+                            .as_deref()
+                            .and_then(|pos| pos.get(ci))
+                            .and_then(|&p| self.source_columns.as_deref().and_then(|s| s.get(p)))
+                    })?;
+                let schema_idx = schema.iter().position(|s| s == col_name)?;
+                wanted.push(schema_idx);
+            }
+            if let Some(ft_col) = &self.fulltext_index_column {
+                let schema_idx = schema.iter().position(|s| s == ft_col)?;
+                wanted.push(schema_idx);
+            }
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.len() == schema.len() {
+            return None;
+        }
+        Some(wanted)
+    }
+
     /// Reads the relation. The index filter runs over the pre-`LazyLoad` layout
     /// and the rows are then aligned onto the pruned one.
     fn rows<'a>(&'a mut self, engine: &'a Engine) -> super::SourceFuture<'a, Vec<Vec<Value>>> {
@@ -78,15 +125,24 @@ impl TableScan {
             // Only a plain full scan of the node is cacheable: an override or an
             // index filter answers a *predicate*, not the node's rows.
             let cacheable = self.override_rows.is_none() && self.candidate.is_none();
+            let wanted = if self.override_rows.is_none() {
+                self.wanted_schema_columns(engine)
+            } else {
+                None
+            };
             let (mut rows, row_ids) = match self.override_rows.take() {
                 Some(rows) => (rows, None),
                 None if needs_ids => {
-                    let pairs = engine.fetch_rows_with_ids(&self.table).await?;
+                    let pairs = engine
+                        .fetch_rows_with_ids_wanted(&self.table, &[], wanted.as_deref())
+                        .await?;
                     let ids: Vec<usize> = pairs.iter().map(|(id, _)| *id).collect();
                     (pairs.into_iter().map(|(_, row)| row).collect(), Some(ids))
                 }
                 None => (
-                    engine.fetch_rows_pruned(&self.table, &self.prune).await?,
+                    engine
+                        .fetch_rows_pruned_wanted(&self.table, &self.prune, wanted.as_deref())
+                        .await?,
                     None,
                 ),
             };
@@ -212,17 +268,23 @@ impl<'a> PhysicalSource<'a> {
                         Some(source) => crate::align_rows(rows, &join.left_columns, source),
                         None => rows,
                     },
-                    None => crate::align_rows(
-                        self.engine.fetch_rows(&join.left).await?,
-                        &join.left_columns,
-                        &self.engine.table_schema(&join.left)?,
-                    ),
+                    None => {
+                        let schema = self.engine.table_schema(&join.left)?;
+                        let wanted = schema_subset(&schema, &join.left_columns);
+                        let rows = self
+                            .engine
+                            .fetch_rows_pruned_wanted(&join.left, &[], wanted.as_deref())
+                            .await?;
+                        crate::align_rows(rows, &join.left_columns, &schema)
+                    }
                 };
-                let rrows = crate::align_rows(
-                    self.engine.fetch_rows(&join.right).await?,
-                    &join.right_columns,
-                    &self.engine.table_schema(&join.right)?,
-                );
+                let rschema = self.engine.table_schema(&join.right)?;
+                let rwanted = schema_subset(&rschema, &join.right_columns);
+                let rraw = self
+                    .engine
+                    .fetch_rows_pruned_wanted(&join.right, &[], rwanted.as_deref())
+                    .await?;
+                let rrows = crate::align_rows(rraw, &join.right_columns, &rschema);
                 crate::nested_loop_join(
                     &lrows,
                     &rrows,
@@ -237,6 +299,19 @@ impl<'a> PhysicalSource<'a> {
         }
         Ok(rows)
     }
+}
+
+fn schema_subset(schema: &[String], columns: &[String]) -> Option<Vec<usize>> {
+    let mut wanted: Vec<usize> = columns
+        .iter()
+        .map(|c| schema.iter().position(|s| s == c))
+        .collect::<Option<Vec<_>>>()?;
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.len() == schema.len() {
+        return None;
+    }
+    Some(wanted)
 }
 
 impl ChunkSource for PhysicalSource<'_> {
@@ -405,5 +480,49 @@ mod tests {
             { source.collect() }.await.unwrap(),
             vec![vec![Value::Int(42)]]
         );
+    }
+
+    #[tokio::test]
+    async fn table_scan_wanted_schema_columns_excludes_unneeded_columns() {
+        let (_dir, engine) = engine().await;
+        engine
+            .execute("CREATE TABLE s (a INT, b INT, c VARCHAR);")
+            .await
+            .unwrap();
+        engine
+            .execute("INSERT INTO s VALUES (1, 10, 'x'), (2, 20, 'y');")
+            .await
+            .unwrap();
+        engine.execute("FLUSH DATA;").await.unwrap();
+        let scan = TableScan {
+            table: "default_db.s".into(),
+            columns: vec!["b".into()],
+            source_columns: Some(vec!["a".into(), "b".into(), "c".into()]),
+            override_rows: None,
+            candidate: None,
+            index_positions: None,
+            index_columns: None,
+            fulltext_index_column: None,
+            fulltext_substring: false,
+            prune: Vec::new(),
+        };
+        assert_eq!(scan.wanted_schema_columns(&engine), Some(vec![1]));
+        let mut source = PhysicalSource::new(&engine, SourceSpec::Table(Box::new(scan)), 8192);
+        assert_eq!(
+            { source.collect() }.await.unwrap(),
+            vec![vec![Value::Int(10)], vec![Value::Int(20)]]
+        );
+
+        let res = engine
+            .execute("SELECT b FROM s WHERE a > 1 ORDER BY b LIMIT 1;")
+            .await
+            .unwrap();
+        match &res[0] {
+            crate::QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns, &vec!["b".to_string()]);
+                assert_eq!(rows.rows(), vec![vec![Value::Int(20)]]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
     }
 }

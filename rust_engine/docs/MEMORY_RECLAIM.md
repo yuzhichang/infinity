@@ -589,9 +589,12 @@ unsealed_max_tables_per_round = 100
 
 | 项 | 默认 | `0` 的含义 |
 |---|---|---|
-| `unsealed_memory_quota` | 1GB（`conf/infinity_conf.toml:54`；代码默认 4 GiB，`config.rs:157`）。旧名 `memindex_memory_quota` 仍接受 | **关闭整个回收机制**（目标由它派生：`quota / 2`） |
+| `buffer_manager_size` | 系统总内存的 90%。存在更小的 cgroup 内存上限时按该上限计算 | 使用默认预算 |
+| `unsealed_memory_quota` | `buffer_manager_size / 2`。也接受 `memindex_memory_quota` | 关闭未封存数据的配额回收 |
 | `unsealed_reclaim_interval` | `30s`（新增） | 只关**周期**扫描；写路径置的 `unsealed_reclaim_requested` 仍会在 tick 上触发一次排水，直接调用 `reclaim_unsealed` 也仍会排水 |
 | `unsealed_max_tables_per_round` | `100`（新增） | 不限，一轮排到目标为止 |
+
+`infinity serve <dir>` 和 `infinity -f <config>` 使用相同的代码默认值。`checkpoint_interval`、`optimize_interval` 和 `cleanup_interval` 分别默认 `10s`、`30s` 和 `60s`，配置文件中的显式值优先。
 
 **`unsealed_memory_quota = 0` 是真正的总开关**，因为目标从它派生：`0 / 2 == 0` 会让每一轮都判"未达标"并试图排空一切，所以 `reclaim_unsealed` 的第一行显式早退。`unsealed_reclaim_interval = 0` 只停掉**周期**扫描：写路径置的标志仍在 tick 上排水，所以"写路径超配额自动回收"这一半不受影响。
 

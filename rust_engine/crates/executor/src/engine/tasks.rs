@@ -88,6 +88,20 @@ pub(crate) async fn trigger_loop(
             let Some(engine) = engine.upgrade() else {
                 return;
             };
+            let (checkpoint_interval, cleanup_interval, optimize_interval) = {
+                let config = engine.context.config.lock().unwrap();
+                let duration = |key: &str, default| {
+                    config
+                        .get(key)
+                        .and_then(|value| value.parse().ok())
+                        .map_or(default, std::time::Duration::from_secs)
+                };
+                (
+                    duration("checkpoint_interval", checkpoint_interval),
+                    duration("cleanup_interval", cleanup_interval),
+                    duration("optimize_interval", optimize_interval),
+                )
+            };
             // `PeriodicTriggerThread::Run`: the checkpoint trigger lives on the
             // same 1s tick as the other three; a checkpoint rotates the WAL and
             // folds the memory blocks into the block mirror.
@@ -97,7 +111,11 @@ pub(crate) async fn trigger_loop(
                 // A periodic checkpoint is not the operator's `FLUSH DATA`:
                 // it never dumps the memory indexes, even with
                 // `flush_dumps_mem_index` on.
-                let _ = engine.checkpoint().await;
+                if engine.checkpoint().await.is_ok() {
+                    crate::scheduler::scheduler()
+                        .spawn_blocking(storage::trim_allocator)
+                        .await;
+                }
             }
             // The memory ceiling is checked on the tick, **not** behind
             // `needs_cleanup`: a read-only server grows its page cache without a
@@ -105,6 +123,15 @@ pub(crate) async fn trigger_loop(
             // finds. Every lever here is `madvise`/`malloc_trim` - no I/O, no
             // lock on a hot path - so it is safe to run on the tick itself.
             engine.memory_tick().await;
+            // `flush_per_second`'s timer half: the commit path syncs the first
+            // commit of each one-second window and returns without syncing the
+            // rest, so without this the last commit before a quiet period would
+            // never reach the disk. A no-op in the other two modes, and it
+            // checks the window before touching the WAL, so a tick where the
+            // commit path already synced costs one atomic load.
+            if let Err(err) = engine.txn.flush_wal_if_due().await {
+                eprintln!("wal flush_per_second: {err}");
+            }
             if !optimize_interval.is_zero()
                 && last_optimize.elapsed() >= optimize_interval
                 && engine.memory_pressure() == crate::memory::Pressure::Ok

@@ -51,7 +51,7 @@ memindex_memory_quota = "1GB"
 wal_dir = "/var/infinity/leader/wal"
 checkpoint_interval = "86400s"
 wal_compact_threshold = "1GB"
-wal_flush = "only_write"
+wal_flush = "flush_per_second"
 
 [resource]
 resource_dir = "/var/infinity/leader/resource"

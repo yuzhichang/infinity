@@ -10,7 +10,6 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	infinity "github.com/infiniflow/infinity-go-sdk"
@@ -23,6 +22,15 @@ type Engine struct {
 	DBName  string
 	Mapping *Mapping
 	Dim     int
+
+	// tables memoises the SDK's Table handle per table name.
+	//
+	// GetTable is a Thrift RPC of its own, so asking once per query made every
+	// measured query two round trips: one GetTable and one SELECT. At ~1 ms of
+	// RPC that is a fixed tax on every number the harness reports, and it looks
+	// like engine latency. The handle carries only (db, name), so it stays valid
+	// for the life of the table; a dropped table fails at the query itself.
+	tables sync.Map // table name -> *infinity.Table
 }
 
 // Connect opens a connection and gets (or creates) the database.
@@ -155,6 +163,27 @@ type QuerySpec struct {
 	KBID  string
 }
 
+// Table resolves a name to its SDK handle, asking the server once per name.
+//
+// A per-connection cache, so no lock is shared between the goroutines that each
+// own one Engine: two readers never contend here, and no `GetTable` RPC sits
+// inside a timed query or inside an ingest step that already has its connection.
+//
+// Every phase goes through this: a phase that called `DB.GetTable` directly made
+// the measured work look slower than the engine (DML in P1/P7, DDL in P2), and
+// re-resolving the same table per row batch is a round trip per batch.
+func (e *Engine) Table(name string) (*infinity.Table, error) {
+	if v, ok := e.tables.Load(name); ok {
+		return v.(*infinity.Table), nil
+	}
+	t, err := e.DB.GetTable(name)
+	if err != nil {
+		return nil, err
+	}
+	e.tables.Store(name, t)
+	return t, nil
+}
+
 // RunQuery executes one query and returns the row count actually read, which is
 // what a latency number has to be conditioned on.
 func (e *Engine) RunQuery(ctx context.Context, spec QuerySpec) (int, error) {
@@ -169,7 +198,7 @@ func (e *Engine) RunQuery(ctx context.Context, spec QuerySpec) (int, error) {
 }
 
 func (e *Engine) runQuerySync(spec QuerySpec) (int, error) {
-	table, err := e.DB.GetTable(spec.Table)
+	table, err := e.Table(spec.Table)
 	if err != nil {
 		return 0, fmt.Errorf("get table %s: %w", spec.Table, err)
 	}
@@ -183,6 +212,21 @@ func (e *Engine) runQuerySync(spec QuerySpec) (int, error) {
 		// it through OptParams, which is why the map is the right place for it.
 		t := table.Output([]string{"id", "doc_id"}).
 			MatchDense(vecCol, spec.Vec, "float", "cosine", topN, map[string]string{"ef": "200"}).
+			Filter("available_int = 1").
+			Limit(10)
+		df, err = t.ToDataFrame()
+	case "denseidx":
+		// Q3 without the filter: the pure index path. Comparing it with "dense"
+		// separates the cost of the HNSW probe from the cost of the pre-filter,
+		// and comparing both with "scan" says whether the index is used at all.
+		t := table.Output([]string{"id", "doc_id"}).
+			MatchDense(vecCol, spec.Vec, "float", "cosine", topN, map[string]string{"ef": "200"}).
+			Limit(10)
+		df, err = t.ToDataFrame()
+	case "scan":
+		// The control: the same rows, no index. A query that should be answered
+		// by the graph but costs this much is not using it.
+		t := table.Output([]string{"id", "doc_id"}).
 			Filter("available_int = 1").
 			Limit(10)
 		df, err = t.ToDataFrame()
@@ -432,13 +476,20 @@ func (e *Engine) RunSequential(ctx context.Context, specs []QuerySpec) []Timed {
 	return out
 }
 
-// RunConcurrent distributes specs across N worker connections and times each.
-func RunConcurrent(ctx context.Context, host string, port int, dbName string, m *Mapping, dim int, specs []QuerySpec, workers int) []Timed {
+// RunConcurrent distributes specs across the fixed client pool and times each.
+func RunConcurrent(ctx context.Context, clients []*Engine, specs []QuerySpec) []Timed {
 	out := make([]Timed, len(specs))
 	if len(specs) == 0 {
 		return out
 	}
-	workers = min(max(1, workers), len(specs))
+	if len(clients) == 0 {
+		err := fmt.Errorf("no query clients")
+		for i := range out {
+			out[i] = Timed{Kind: specs[i].Kind, Err: err}
+		}
+		return out
+	}
+	workers := min(len(clients), len(specs))
 	jobs := make(chan int, len(specs))
 	for i := range specs {
 		jobs <- i
@@ -446,22 +497,11 @@ func RunConcurrent(ctx context.Context, host string, port int, dbName string, m 
 	close(jobs)
 
 	var wg sync.WaitGroup
-	var connected atomic.Int32
-	var connMu sync.Mutex
-	var connErrs []error
 	for w := 0; w < workers; w++ {
+		eng := clients[w]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			eng, err := Connect(host, port, dbName, m, dim)
-			if err != nil {
-				connMu.Lock()
-				connErrs = append(connErrs, err)
-				connMu.Unlock()
-				return
-			}
-			connected.Add(1)
-			defer eng.Close()
 			for idx := range jobs {
 				if ctx.Err() != nil {
 					out[idx] = Timed{Kind: specs[idx].Kind, Err: ctx.Err()}
@@ -474,12 +514,6 @@ func RunConcurrent(ctx context.Context, host string, port int, dbName string, m 
 		}()
 	}
 	wg.Wait()
-	if connected.Load() == 0 && len(connErrs) > 0 {
-		err := fmt.Errorf("all %d query workers failed to connect: %w", workers, connErrs[0])
-		for i := range out {
-			out[i] = Timed{Kind: specs[i].Kind, Err: err}
-		}
-	}
 	return out
 }
 

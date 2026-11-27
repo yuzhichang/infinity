@@ -225,9 +225,9 @@ impl RAGAnalyzer {
                 // NLTK word tokenizer: punctuation was already replaced, so
                 // the remaining tokens are whitespace-delimited runs (with
                 // `_` split out as its own token).
-                for word in nltk_word_tokenize(&segment) {
-                    res.push(self.normalize_token(&word));
-                }
+                for_each_nltk_word(&segment, |word| {
+                    res.push(self.normalize_token(word));
+                });
                 continue;
             }
             let length = char_len(&segment);
@@ -268,29 +268,28 @@ impl RAGAnalyzer {
         }
 
         let result = self.tokenize(text);
-        let tokens: Vec<String> = if self.fine_grained {
-            self.fine_grained_tokenize(&result)
-        } else {
-            result
-                .split(' ')
-                .filter(|token| !token.is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-        let mut offset = 0u32;
-        for token in tokens {
-            if token.is_empty() || is_stopword(&token) {
-                continue;
-            }
+        let mut push_term = |token| {
             terms.push(Term {
                 text: token,
-                word_offset: offset,
+                word_offset: terms.len() as u32,
                 char_offset: 0,
                 end_offset: 0,
                 is_index: false,
                 payload: 0,
             });
-            offset += 1;
+        };
+        if self.fine_grained {
+            for token in self.fine_grained_tokenize(&result) {
+                if !token.is_empty() && !is_stopword(&token) {
+                    push_term(token);
+                }
+            }
+        } else {
+            for token in result.split(' ') {
+                if !token.is_empty() && !is_stopword(token) {
+                    push_term(token.to_owned());
+                }
+            }
         }
         terms
     }
@@ -301,6 +300,9 @@ impl RAGAnalyzer {
     /// Positions survive diacritics folding, `\W+` replacement, `StrQ2B` and
     /// OpenCC (identity here) through the same mapping chain as the reference.
     pub fn tokenize_with_position(&self, line: &str) -> (Vec<String>, Vec<(u32, u32)>) {
+        if line.trim().is_empty() {
+            return (Vec::new(), Vec::new());
+        }
         let folded;
         let mut fold_map: Option<Vec<u32>> = None;
         let input = if self.fold_diacritics {
@@ -354,19 +356,18 @@ impl RAGAnalyzer {
             if !is_zh {
                 let mut sentence_start_pos = segment_start;
                 for sentence in sentence_split(&segment) {
-                    let terms = nltk_word_tokenize(&sentence);
                     let mut search_pos = 0usize;
-                    for term in terms {
-                        let Some(rel) = sentence[search_pos..].find(&term) else {
-                            continue;
+                    for_each_nltk_word(&sentence, |term| {
+                        let Some(rel) = sentence[search_pos..].find(term) else {
+                            return;
                         };
                         let pos_in_sentence = search_pos + rel;
                         let start_pos = sentence_start_pos + pos_in_sentence;
                         let end_pos = start_pos + term.len();
-                        tokens.push(self.normalize_token(&term));
+                        tokens.push(self.normalize_token(term));
                         positions.push((map_pos(start_pos), map_pos(end_pos)));
                         search_pos = pos_in_sentence + term.len();
-                    }
+                    });
                     sentence_start_pos += sentence.len();
                 }
                 continue;
@@ -785,40 +786,42 @@ impl RAGAnalyzer {
     /// C++: `RAGAnalyzer::Merge` — greedily re-joins adjacent tokens when the
     /// concatenation is a dictionary word.
     pub(crate) fn merge(&self, tks_str: &str) -> String {
-        let mut collapsed = String::with_capacity(tks_str.len());
-        let mut prev_space = false;
-        for c in tks_str.chars() {
-            if c == ' ' {
-                if !prev_space {
-                    collapsed.push(' ');
-                    prev_space = true;
-                }
-            } else {
-                collapsed.push(c);
-                prev_space = false;
-            }
-        }
-        let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
-        let mut res: Vec<String> = Vec::new();
-        let mut s = 0usize;
-        while s < tokens.len() {
-            let mut end = s + 1;
-            let stop = (tokens.len() + 1).min(s + 6);
-            for e in (s + 2)..stop {
-                let joined = tokens[s..e].concat();
-                if regex_split_partial(&joined) && self.freq(&joined) > 0 {
-                    end = e;
+        let tokens: Vec<&str> = tks_str
+            .split(' ')
+            .filter(|token| !token.is_empty())
+            .collect();
+        let mut merged = String::with_capacity(tks_str.len());
+        let mut candidate = String::new();
+        let mut start = 0;
+        while start < tokens.len() {
+            candidate.clear();
+            candidate.push_str(tokens[start]);
+            let mut end = start + 1;
+            let mut end_byte = candidate.len();
+            let mut can_merge = regex_split_partial(tokens[start]);
+            for (offset, token) in tokens[end..].iter().take(4).enumerate() {
+                candidate.push_str(token);
+                can_merge = can_merge || regex_split_partial(token);
+                if can_merge && self.freq(&candidate) > 0 {
+                    end = start + offset + 2;
+                    end_byte = candidate.len();
                 }
             }
-            res.push(tokens[s..end].concat());
-            s = end;
+            if !merged.is_empty() {
+                merged.push(' ');
+            }
+            merged.push_str(&candidate[..end_byte]);
+            start = end;
         }
-        res.join(" ")
+        merged
     }
 
     /// C++: `RAGAnalyzer::Freq`.
     pub fn freq(&self, key: &str) -> i32 {
         let value = self.trie.exact_match(key.as_bytes());
+        if value == -1 {
+            return 0;
+        }
         let freq = decode_freq(value);
         (freq as f64).exp().mul_add(DENOMINATOR, 0.5) as i32
     }
@@ -1338,28 +1341,26 @@ pub(crate) fn str_q2b_with_position(input: &str) -> (String, Vec<u32>) {
 
 /// C++: `NLTKWordTokenizer::Tokenize` after the `\W+` replacement removed all
 /// punctuation: whitespace-delimited runs, with `_` split into its own token.
-pub(crate) fn nltk_word_tokenize(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
+pub(crate) fn for_each_nltk_word(text: &str, mut f: impl FnMut(&str)) {
     for token in text.split_whitespace() {
         if token == "_" {
-            tokens.push("_".to_string());
+            f("_");
         } else if token.contains('_') {
             for (index, part) in token.split('_').enumerate() {
                 if index > 0 {
-                    tokens.push("_".to_string());
+                    f("_");
                 }
                 if !part.is_empty() {
-                    tokens.push(part.to_string());
+                    f(part);
                 }
             }
             if token.ends_with('_') {
-                tokens.push("_".to_string());
+                f("_");
             }
         } else {
-            tokens.push(token.to_string());
+            f(token);
         }
     }
-    tokens
 }
 
 /// C++: `SentenceSplitter` — split after a `.`/`?`/`!` plus closing quotes and

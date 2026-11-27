@@ -28,7 +28,7 @@ This document provides instructions for loading configuration file for Infinity 
 To load a configuration file when you start up Infinity using Docker:
 
 1. Mount the directory for the configuration file to inside the Docker container.
-2. When running Docker, specify the configuration file path using the `-f` option. For example: 
+2. When running Docker, specify the configuration file path using the `-f` option. For example:
 
    ```bash
    docker run -d --name infinity -v /var/infinity/:/var/infinity --ulimit nofile=500000:500000 --network=host infiniflow/infinity:nightly -f /var/infinity/infinity_conf.toml
@@ -98,7 +98,7 @@ log_filename             = "infinity.log"
 # Directory for the log files.
 log_dir                  = "/var/infinity/log"
 # Controls whether to print the log to the standard output. Defaults to true
-# Range: {true|false} 
+# Range: {true|false}
 log_to_stdout            = true
 # The maximum size of each log file. Defaults to "1GB".
 # Range: at least 1GB
@@ -141,7 +141,7 @@ mem_index_capacity       = 65536
 # The type of storage to use. Available options:
 # - `"local"`: (default)
 # - `"minio"`: If you set `server_mode` to `"admin"` and `storage_type` to `"minio"`, the node will start as a cluster node in `ADMIN` mode.
-# Range: {"local"|"minio"}  
+# Range: {"local"|"minio"}
 storage_type             = "local"
 
 # The number of dense vector index building worker threads. Defaults to the half number of CPU cores.
@@ -178,7 +178,7 @@ buffer_manager_size      = "4GB"
 lru_num                  = 7
 # When the required memory size exceeds the free memory in the buffer manager,
 # the buffer manager dumps some of the its in-use memory to a temporary storage.
-# `temp_dir` specifies the path to this temporary storage. 
+# `temp_dir` specifies the path to this temporary storage.
 temp_dir                 = "/var/infinity/tmp"
 # The global memory index threshold for triggering a flush to disk
 # When the memory used by all existing in-memory indices in the system exceeds this threshold,
@@ -206,10 +206,10 @@ checkpoint_interval      = "86400s"
 wal_compact_threshold         = "1GB"
 
 # Controls how the WAL manager flushes its logs to disk
-# - "only_write": (Default) Writes logs but leaves it to the OS to determine when to flush them.
+# - "only_write": Writes logs but leaves it to the OS to determine when to flush them.
 # - "flush_at_once": Writes and flushes logs upon each commit.
-# - "flush_per_second": Writes logs after each commit and flushes them to disk once per second.
-wal_flush                     = "only_write"
+# - "flush_per_second": (Default) Writes logs after each commit and flushes them to disk at most once per second.
+wal_flush                     = "flush_per_second"
 
 [resource]
 # Directory for Infinity's resource files, including the dictionary files used by the analyzer

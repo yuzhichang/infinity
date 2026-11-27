@@ -145,6 +145,18 @@ fn strip_toml_comment(value: &str) -> &str {
 }
 
 /// The reference's default invocation: `infinity [-f <config>] [-m]` starts the
+/// A `[storage]` path knob, or `None` when the config leaves it empty.
+///
+/// `catalog_dir` and `snapshot_dir` are the two settings whose default is
+/// positional (under the data root) rather than a value in the table, so an
+/// absent or blank entry has to stay distinguishable from an explicit path.
+fn configured_path(text: &str, key: &str) -> Option<PathBuf> {
+    toml_value(text, key)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Thrift and HTTP front ends on one engine. The data root is the parent of
 /// `persistence_dir`; with no config the reference's built-in defaults apply.
 /// Starts the three front ends on the engine's runtime.
@@ -236,145 +248,18 @@ async fn serve_from_config(path: Option<&str>, maintenance: bool) -> common::Res
     };
     // `[storage] snapshot_dir`: one directory per snapshot name
     // (`Config::SnapshotDir()`).
-    let snapshot_dir = toml_value(&text, "snapshot_dir")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from);
+    let snapshot_dir = configured_path(&text, "snapshot_dir");
     let options = executor::EngineOptions {
         object_dir,
         snapshot_dir,
+        catalog_dir: configured_path(&text, "catalog_dir"),
         ..Default::default()
     };
     let engine = Arc::new(Engine::open_async(&root, options).await?);
     if let Some(client) = object_store {
         engine.set_object_store(client);
     }
-    // `[wal] wal_flush` / `flush_method_at_commit` — defaults to `flush_at_once`.
-    let wal_flush = toml_value(&text, "wal_flush")
-        .or_else(|| toml_value(&text, "flush_method_at_commit"))
-        .unwrap_or_else(|| "flush_at_once".into());
-    engine.set_wal_flush(txn::WalFlush::parse(&wal_flush));
-    // `[buffer] unsealed_memory_quota` — everything not yet on disk (the append
-    // buffer plus every index tail) is drained once it passes this. The byte
-    // figure the loop compares against is `budget_bytes()`; the reference's
-    // nearest knob is `index_memory_limit` (default 4 GiB). The older spelling
-    // `memindex_memory_quota` is still accepted.
-    //
-    // Parsed before it reaches the engine and rejected with a message naming
-    // the field: a typo used to become zero, which is the explicit off switch,
-    // so the operator got a running server with reclaim disabled and no hint
-    // why. An explicit numeric `0` still disables the mechanism.
-    let quota = match configured_size(&text, "unsealed_memory_quota")? {
-        Some(bytes) => bytes,
-        None => configured_size(&text, "memindex_memory_quota")?.unwrap_or(4 * 1024 * 1024 * 1024),
-    };
-    engine.set_unsealed_memory_quota(quota);
-    // `[storage] mem_index_capacity` — rows an in-memory index holds before it
-    // is dumped into a sealed chunk (the reference defaults to 65536 rows).
-    let capacity = toml_value(&text, "mem_index_capacity")
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(64 * 1024);
-    engine.set_memindex_capacity(capacity);
-    // `[storage] flush_dumps_mem_index` — `FLUSH DATA` also dumps every memory
-    // index into its chunk. Off by default: the reference's flush is a bare
-    // checkpoint, and the cross-engine byte gates compare directories after
-    // `flush_data()`.
-    let flush_dumps = matches!(
-        toml_value(&text, "flush_dumps_mem_index")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "true" | "1" | "on" | "yes"
-    );
-    engine.set_flush_dumps_mem_index(flush_dumps);
-    // `[buffer] buffer_manager_size`: the port has no BufferManager (sealed
-    // blocks are mapped and evicted by the kernel), but the same ceiling bounds
-    // the decoded HNSW chunks and the block map, so the configured value is
-    // applied instead of being dropped - a memory-limited container that asks
-    // for 512MB must not get the built-in 8 GiB.
-    if let Some(bytes) = configured_size(&text, "buffer_manager_size")? {
-        let bytes = bytes as usize;
-        if bytes > 0 {
-            engine.set_buffer_budget(bytes);
-            // The same number is the process's RSS ceiling: the budget above
-            // bounds what the engine *knows* it holds, and this is what the
-            // cleanup pass compares `/proc/self/status` against, so a container
-            // that sized `buffer_manager_size` to its own limit reclaims pages
-            // instead of being killed.
-            engine.set_memory_limit(bytes as u64);
-        }
-    }
-    // The reference checkpoints periodically (`[wal] checkpoint_interval`), which
-    // is what dumps the memory blocks into the on-disk C++ layout.
-    let secs = interval_or_zero(&text, "checkpoint_interval")?;
-    // `-m/--maintenance` (the reference's admin mode) leaves the periodic
-    // triggers off: maintenance is about inspecting and repairing a stopped
-    // node, not about letting cleanup/compact/checkpoint mutate it.
-    if secs > 0 && !maintenance {
-        // The checkpoint itself (WAL rotation + block flush) runs on the
-        // engine's periodic trigger task, next to cleanup/compact/optimize
-        // (`PeriodicTriggerThread`). Only the page release below stays here,
-        // because `trim_allocator` is CLI-only (`infinity-executor` forbids
-        // unsafe code) - and even it is a task now: it sleeps on `tokio::time`
-        // and hands the one blocking call to the pool, so nothing parks a
-        // thread for the life of the process.
-        let weak = Arc::downgrade(&engine);
-        executor::scheduler().spawn_task(async move {
-            loop {
-                executor::sleep(std::time::Duration::from_secs(secs)).await;
-                if weak.upgrade().is_none() {
-                    break;
-                }
-                executor::scheduler().spawn_blocking(trim_allocator).await;
-            }
-        });
-    }
-    // `[storage] cleanup_interval` / `compact_interval` / `optimize_interval`:
-    // the reference's periodic triggers behind `PeriodicTriggerThread`
-    // (`periodic_trigger_thread_impl.cpp:49-74`), plus the background processor
-    // the memory-index quota dumps through (`BGMemIndexTracer::TriggerDump`).
-    // The checkpoint trigger above stays on its own thread because
-    // `trim_allocator` is CLI-only (`infinity-executor` forbids unsafe code):
-    // folding the checkpoint into the scheduler would drop the page release
-    // after each dump (Gate C).
-    let cleanup = interval_or_zero(&text, "cleanup_interval")?;
-    let compact = interval_or_zero(&text, "compact_interval")?;
-    let optimize = interval_or_zero(&text, "optimize_interval")?;
-    // `[buffer] unsealed_*`: the loop that reclaims memory from tables nobody
-    // writes any more (`docs/MEMORY_RECLAIM.md` §5). An absent key keeps the
-    // engine's default, so "not configured" must not become `0` - that value
-    // means "scheduler off" for the interval. `"250ms"` is a request, not a
-    // zero: `configured_interval` rejects anything a positive value cannot
-    // express in whole seconds instead of silently disabling the sweep.
-    if let Some(secs) = configured_interval(&text, "unsealed_reclaim_interval")? {
-        engine.set_unsealed_reclaim_interval(secs);
-    }
-    if let Some(raw) = toml_value(&text, "unsealed_max_tables_per_round") {
-        let raw = raw.trim();
-        if !raw.is_empty() {
-            // `0` is the documented "no limit"; anything unparseable is an
-            // operator error, not a reason to fall back to 100 tables.
-            let tables = raw.parse::<usize>().map_err(|_| {
-                common::Error::Invalid(format!(
-                    "[buffer] unsealed_max_tables_per_round: '{raw}' is not a count \
-                     (expected a non-negative integer; 0 means no limit)"
-                ))
-            })?;
-            engine.set_unsealed_max_tables_per_round(tables);
-        }
-    }
-    if !maintenance {
-        engine
-            .start_background_tasks(
-                std::time::Duration::from_secs(secs),
-                std::time::Duration::from_secs(cleanup),
-                std::time::Duration::from_secs(compact),
-                std::time::Duration::from_secs(optimize),
-                std::time::Duration::from_millis(engine.unsealed_reclaim_interval_ms()),
-            )
-            .await;
-    }
+    configure_server(&engine, &text, maintenance).await?;
     // The reference starts both front ends on the same storage
     // (`infinity_main.cpp`: `http_server.Start(...)` next to `StartThriftServer()`).
     // All three front ends share **one** runtime (the engine's), so the process
@@ -407,14 +292,120 @@ async fn serve_from_config(path: Option<&str>, maintenance: bool) -> common::Res
     Ok(())
 }
 
-/// Releases free heap pages back to the OS, on every target.
-///
-/// This used to be glibc's `malloc_trim` behind a Linux-only `cfg`, which made
-/// it a no-op on macOS *and* on Linux (where mimalloc, not glibc, owns the
-/// heap). See [`storage::trim_allocator`]: it now purges mimalloc's free pages
-/// everywhere.
-fn trim_allocator() {
-    storage::trim_allocator();
+async fn configure_server(
+    engine: &Arc<Engine>,
+    text: &str,
+    maintenance: bool,
+) -> common::Result<()> {
+    // One pass through `Config` first: it is the parser that owns the key set,
+    // the defaults and the validation, so the values `SHOW CONFIGS` reports are
+    // the ones this file actually resolved rather than a second set of literals
+    // maintained beside it. `Config::init` on the same text is what the tests
+    // exercise, so a config that loads there is the one that reports here.
+    let mut resolved = config::Config::default();
+    resolved
+        .apply_text(text)
+        .map_err(|e| common::Error::Invalid(format!("config: {e:?}")))?;
+    // An entry this build does not know, or a value it cannot take, was skipped
+    // while loading rather than failing the startup - an operator's config is
+    // written against whichever version they had, and refusing to boot over a
+    // dropped knob is worse than running without it. It must be audible though:
+    // otherwise the setting silently does nothing. One line covers all of them,
+    // because a config from another release can produce many.
+    if let Some(line) = resolved.warnings_line() {
+        eprintln!("warning: {line}");
+    }
+    engine.seed_config(resolved.config_values());
+    // `[wal] wal_flush` / `flush_method_at_commit`: `Config` already validated it
+    // while loading and restored the default for a bad entry, so this parse
+    // cannot fail - but it is a `Result`, and unwrapping at startup is worse than
+    // falling back, which also keeps the policy above ("skip the bad line") true
+    // for the one setting that is read here rather than from the map.
+    let wal_flush = txn::WalFlush::parse(resolved.wal_flush()).unwrap_or(txn::DEFAULT_WAL_FLUSH);
+    engine.set_wal_flush(wal_flush);
+    let explicit_buffer_size = configured_size(text, "buffer_manager_size")?.unwrap_or_default();
+    let (buffer_size, govern_rss) = executor::scheduler()
+        .spawn_blocking(move || {
+            if explicit_buffer_size > 0 {
+                return (explicit_buffer_size, true);
+            }
+            let cgroup_memory = executor::memory::cgroup_memory_limit_bytes();
+            (
+                config::default_buffer_manager_size(cgroup_memory),
+                cgroup_memory.is_none(),
+            )
+        })
+        .await;
+    engine.set_buffer_budget(usize::try_from(buffer_size).unwrap_or(usize::MAX));
+    if govern_rss {
+        engine.set_memory_limit(buffer_size);
+    }
+    let unsealed_quota = match configured_size(text, "unsealed_memory_quota")? {
+        Some(bytes) => bytes,
+        None => configured_size(text, "memindex_memory_quota")?.unwrap_or(buffer_size / 2),
+    };
+    engine.set_unsealed_memory_quota(unsealed_quota);
+    // `[storage] mem_index_capacity` — rows an in-memory index holds before it
+    // is dumped into a sealed chunk (the reference defaults to 65536 rows).
+    let capacity = toml_value(text, "mem_index_capacity")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(64 * 1024);
+    engine.set_memindex_capacity(capacity);
+    // `[storage] flush_dumps_mem_index` — `FLUSH DATA` also dumps every memory
+    // index into its chunk. Off by default: the reference's flush is a bare
+    // checkpoint, and the cross-engine byte gates compare directories after
+    // `flush_data()`.
+    let flush_dumps = matches!(
+        toml_value(text, "flush_dumps_mem_index")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "true" | "1" | "on" | "yes"
+    );
+    engine.set_flush_dumps_mem_index(flush_dumps);
+    let checkpoint = configured_interval(text, "checkpoint_interval")?
+        .unwrap_or(config::DEFAULT_CHECKPOINT_INTERVAL_SECS);
+    let cleanup = configured_interval(text, "cleanup_interval")?
+        .unwrap_or(config::DEFAULT_CLEANUP_INTERVAL_SECS);
+    let compact = configured_interval(text, "compact_interval")?.unwrap_or(0);
+    let optimize = configured_interval(text, "optimize_interval")?
+        .unwrap_or(config::DEFAULT_OPTIMIZE_INTERVAL_SECS);
+    // `[buffer] unsealed_*`: the loop that reclaims memory from tables nobody
+    // writes any more (`docs/MEMORY_RECLAIM.md` §5). An absent key keeps the
+    // engine's default, so "not configured" must not become `0` - that value
+    // means "scheduler off" for the interval. `"250ms"` is a request, not a
+    // zero: `configured_interval` rejects anything a positive value cannot
+    // express in whole seconds instead of silently disabling the sweep.
+    if let Some(secs) = configured_interval(text, "unsealed_reclaim_interval")? {
+        engine.set_unsealed_reclaim_interval(secs);
+    }
+    if let Some(raw) = toml_value(text, "unsealed_max_tables_per_round") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            // `0` is the documented "no limit"; anything unparseable is an
+            // operator error, not a reason to fall back to 100 tables.
+            let tables = raw.parse::<usize>().map_err(|_| {
+                common::Error::Invalid(format!(
+                    "[buffer] unsealed_max_tables_per_round: '{raw}' is not a count \
+                     (expected a non-negative integer; 0 means no limit)"
+                ))
+            })?;
+            engine.set_unsealed_max_tables_per_round(tables);
+        }
+    }
+    if !maintenance {
+        engine
+            .start_background_tasks(
+                std::time::Duration::from_secs(checkpoint),
+                std::time::Duration::from_secs(cleanup),
+                std::time::Duration::from_secs(compact),
+                std::time::Duration::from_secs(optimize),
+                std::time::Duration::from_millis(engine.unsealed_reclaim_interval_ms()),
+            )
+            .await;
+    }
+    Ok(())
 }
 
 /// `SELECT ROW_ID() FROM <table> SEARCH MATCH VECTOR (...)` — the statement
@@ -575,14 +566,6 @@ fn configured_interval(text: &str, key: &str) -> common::Result<Option<u64>> {
     }
 }
 
-/// A `[storage]`/`[wal]` interval whose absent value is "off".
-///
-/// Those four triggers are opt-in in the reference (the shipped config sets
-/// them explicitly), so a missing key means `0`, not an error.
-fn interval_or_zero(text: &str, key: &str) -> common::Result<u64> {
-    Ok(configured_interval(text, key)?.unwrap_or(0))
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // The process enters its runtime **exactly once**, here, and every command
@@ -647,6 +630,28 @@ fn parse_serve_args(args: &[String]) -> Result<(Option<String>, bool), String> {
         i += 1;
     }
     Ok((config, maintenance))
+}
+
+/// The `-f/--config` path among a subcommand's arguments, if one was given.
+///
+/// `parse_serve_args` only understands the flag set of the no-subcommand form,
+/// because `serve` carries a positional directory and host:port in front of it.
+/// This picks the option out of `serve <dir> [host:port] [-f <path>]` without
+/// claiming the positionals: only the value of `-f` is consumed.
+fn serve_config_path(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-f" | "--config" => return args.get(i + 1).cloned(),
+            _ if a.starts_with("--config=") => {
+                return Some(a["--config=".len()..].to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 async fn run(args: &[String]) -> common::Result<()> {
@@ -748,17 +753,36 @@ async fn run(args: &[String]) -> common::Result<()> {
             Ok(())
         }
         "serve" => {
-            // Extension: `infinity serve <dir> [host:port]` — the engine opened
-            // with default options plus both front ends (what the old
+            // Extension: `infinity serve <dir> [host:port] [-f <path>]` — the
+            // engine opened with the settings from `-f`, or its defaults when
+            // there is none, plus both front ends (what the old
             // `infinity-server` binary did).
+            //
+            // The config has to be threaded through: this arm used to pass an
+            // empty string to `configure_server`, so `-f` was accepted by the
+            // argument parser and then silently ignored - every `[wal]`,
+            // `[buffer]` and `[storage]` setting was lost on this entry point,
+            // while the no-subcommand form honoured it.
             let addr = args
                 .get(2)
                 .cloned()
                 .unwrap_or_else(|| "0.0.0.0:23817".into());
             let http_addr =
                 std::env::var("INFINITY_HTTP_BIND").unwrap_or_else(|_| "0.0.0.0:23820".into());
-            let options = executor::EngineOptions::default();
+            let text = match serve_config_path(args) {
+                Some(path) => std::fs::read_to_string(&path).map_err(|e| common::Error::Io {
+                    path: PathBuf::from(&path),
+                    source: e,
+                })?,
+                None => String::new(),
+            };
+            let options = executor::EngineOptions {
+                snapshot_dir: configured_path(&text, "snapshot_dir"),
+                catalog_dir: configured_path(&text, "catalog_dir"),
+                ..Default::default()
+            };
             let engine = std::sync::Arc::new(executor::Engine::open_async(&dir, options).await?);
+            configure_server(&engine, &text, false).await?;
             let http = server::http::HttpServer::bind(&http_addr, engine.clone())?;
             println!("http listening on {}", http.local_addr()?);
             executor::scheduler().spawn_task(http.serve());
@@ -1301,6 +1325,51 @@ mod config_parse_tests {
             )
             .as_deref(),
             Some("25")
+        );
+    }
+
+    /// `serve <dir> [host:port] [-f <path>]` finds its config without
+    /// mistaking a positional for one.
+    ///
+    /// The `serve` arm used to pass an empty string to `configure_server`, so a
+    /// `-f` the operator wrote was parsed and then dropped: every `[wal]`
+    /// setting in the file was ignored on that entry point.
+    #[test]
+    fn serve_finds_its_config_among_the_positionals() {
+        let argv = |s: &[&str]| s.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            serve_config_path(&argv(&[
+                "serve",
+                "/data",
+                "127.0.0.1:23817",
+                "-f",
+                "c.toml"
+            ]))
+            .as_deref(),
+            Some("c.toml")
+        );
+        assert_eq!(
+            serve_config_path(&argv(&[
+                "serve",
+                "/data",
+                "-f",
+                "c.toml",
+                "127.0.0.1:23817"
+            ]))
+            .as_deref(),
+            Some("c.toml")
+        );
+        assert_eq!(
+            serve_config_path(&argv(&["serve", "/data", "--config=c.toml"])).as_deref(),
+            Some("c.toml")
+        );
+        // No flag: the engine's own defaults, not a missing-file error.
+        assert_eq!(serve_config_path(&argv(&["serve", "/data"])), None);
+        // A positional that merely contains the letters is not the flag.
+        assert_eq!(
+            serve_config_path(&argv(&["serve", "/data", "host-f:23817"])),
+            None
         );
     }
 }

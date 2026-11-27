@@ -1091,6 +1091,21 @@ pub(crate) fn render_column_default(def: Option<&String>, type_text: &str) -> St
     }
 }
 
+/// The knobs `SHOW CONFIGS` reports when the config file named none of them.
+///
+/// This is the one list of queryable knobs: `server`'s `CONFIG_KEYS` and the
+/// CLI's `Config::config_values` both derive from it, so a knob cannot be
+/// settable in one place and invisible in the other. The order is the
+/// reference's alphabetical one, which is also what `BTreeMap` renders.
+pub const QUERYABLE_CONFIG_KEYS: [&str; 6] = [
+    "cache_result_capacity",
+    "checkpoint_interval",
+    "cleanup_interval",
+    "log_level",
+    "result_cache",
+    "wal_flush",
+];
+
 /// Rejects an out-of-range or malformed value for a **known** config key
 /// (unknown keys are tolerated). Mirrors the C++ `Config` range checks
 /// (`src/unit_test/main/config_ut.cpp::TestOutofRangeValues`): config values are
@@ -1112,12 +1127,35 @@ pub(crate) fn invalid_config_value(key: &str, value: &str) -> Option<String> {
                 "invalid value '{value}' for cache_result_capacity (expected a positive integer)"
             )),
         },
-        "CHECKPOINT_INTERVAL" => match value.parse::<u64>() {
-            Ok(_) => None,
-            Err(_) => Some(format!(
-                "invalid value '{value}' for CHECKPOINT_INTERVAL (expected a non-negative integer)"
-            )),
-        },
+        "CHECKPOINT_INTERVAL" | "CLEANUP_INTERVAL" | "OPTIMIZE_INTERVAL" => {
+            match value.parse::<u64>() {
+                Ok(_) => None,
+                Err(_) => Some(format!(
+                    "invalid value '{value}' for {} (expected a non-negative integer)",
+                    key.to_ascii_uppercase()
+                )),
+            }
+        }
+        // `wal_flush` has a fixed vocabulary and is reported back verbatim, so a
+        // value outside it would be stored and echoed as if it were real: `SET
+        // CONFIG wal_flush bogus` used to leave `"wal_flush":"bogus"` in the
+        // response. It is not a runtime knob in this port (the commit path reads
+        // the transaction manager, not this map), which is why it is validated
+        // here rather than applied - see `Engine::config_get`.
+        "WAL_FLUSH" => txn::WalFlush::parse(value).err(),
+        "LOG_LEVEL" => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "trace" | "debug" | "info" | "warning" | "error" | "critical"
+        )
+        .then_some(())
+        .map_or_else(
+            || {
+                Some(format!(
+                    "invalid value '{value}' for log_level (expected trace|debug|info|warning|error|critical)"
+                ))
+            },
+            |()| None,
+        ),
         _ => None,
     }
 }
@@ -3771,43 +3809,6 @@ pub(crate) type SharedTextIndex = Arc<tokio::sync::RwLock<TextIndex>>;
 /// The in-memory form of a vector index: the rows written since the last dump.
 /// The reference keeps one `HnswIndexInMem` per segment; a query searches this
 /// segment and merges it with the sealed (on-disk) ones.
-/// Bounds how many full-table scans (full-text or vector) run at once. Each
-/// such scan materialises a large share of the table, so several concurrent
-/// readers can exhaust the process's memory even when a single query fits.
-pub(crate) struct ScanGate {
-    /// `limit` permits; taking one is an `await`, so a waiting scan yields its
-    /// task instead of parking a thread.
-    sem: tokio::sync::Semaphore,
-}
-
-impl ScanGate {
-    pub(crate) fn new(limit: usize) -> Self {
-        Self {
-            sem: tokio::sync::Semaphore::new(limit.max(1)),
-        }
-    }
-
-    /// Waits for a scan slot. The returned guard releases it on drop.
-    pub(crate) async fn enter(&self) -> ScanSlot<'_> {
-        let permit = self
-            .sem
-            .acquire()
-            .await
-            .expect("a scan gate's semaphore is never closed");
-        ScanSlot {
-            gate: self,
-            _permit: permit,
-        }
-    }
-}
-
-/// One scan slot, released when it is dropped.
-pub(crate) struct ScanSlot<'a> {
-    #[allow(dead_code)] // holds the lifetime of the gate the permit belongs to
-    gate: &'a ScanGate,
-    _permit: tokio::sync::SemaphorePermit<'a>,
-}
-
 /// One multi-vector index: the chunks it published (row ids, plus the EMVB
 /// prefilter for an uncoded column) and the memory tail holding rows inserted
 /// since the last dump.
@@ -5187,27 +5188,28 @@ impl SparseIndex {
         }
     }
 
-    /// Top-k over sealed chunks and the memory tail, skipping tombstones.
-    /// `options` is the query's `alpha` / `beta` / `use_tail`
-    /// (`BMPUtil::ParseBmpSearchOptions`).
+    /// Top-k over sealed chunks and the memory tail, skipping tombstones and
+    /// applying `allowed` when provided. `options` is the query's `alpha` /
+    /// `beta` / `use_tail` (`BMPUtil::ParseBmpSearchOptions`).
     pub(crate) fn search(
         &self,
         query: &[(i32, f32)],
         k: usize,
         dead: &common::RowBitmap,
         options: index::sparse::BmpSearchOptions,
+        allowed: Option<&common::RowMask>,
     ) -> Vec<(u64, f32)> {
         let mut hits: Vec<(u64, f32)> = Vec::new();
         for (segment, reader) in &self.sealed {
-            // Ask for enough candidates that tombstoned rows cannot starve the
-            // top-k; `search` clamps to the chunk's document count. The on-disk
-            // reader runs the same `BMPAlgBase::SearchKnn` (`alpha`, `beta`,
-            // `use_tail`) as the in-memory one.
-            for (row, score) in reader.search(query, k + dead.len() as usize, options) {
+            // Filter tombstones and `allowed` inside the BMP search so
+            // excluded rows never occupy top-k slots or skew `alpha` early
+            // stopping.
+            for (row, score) in reader.search_filtered(query, k, options, |row| {
                 let seq = (segment << 32) | u64::from(row as u32);
-                if !dead.contains(seq) {
-                    hits.push((seq, score));
-                }
+                !dead.contains(seq) && allowed.is_none_or(|mask| mask.contains(seq))
+            }) {
+                let seq = (segment << 32) | u64::from(row as u32);
+                hits.push((seq, score));
             }
         }
         // The memory segment is the reference's in-memory `BMPAlg`: rebuild it
@@ -5234,14 +5236,24 @@ impl SparseIndex {
             });
         }
         if let Some(tail) = guard.as_ref() {
-            // The memory index is a `BMPAlg` too, so `use_tail`/`beta` apply to
-            // its own unsealed tail exactly as `bmp_search` does in the
-            // reference.
-            for (doc, score) in tail.alg.search_knn(&qv, k + dead.len() as usize, options) {
+            // The memory index is a `BMPAlg` too, so `use_tail`/`beta` and
+            // `search_knn_filtered` apply to its own unsealed tail exactly as
+            // `bmp_search` does in the reference.
+            let tail_allowed: Option<Vec<bool>> =
+                (allowed.is_some() || !dead.is_empty()).then(|| {
+                    tail.seqs
+                        .iter()
+                        .map(|seq| {
+                            !dead.contains(*seq) && allowed.is_none_or(|mask| mask.contains(*seq))
+                        })
+                        .collect()
+                });
+            for (doc, score) in
+                tail.alg
+                    .search_knn_filtered(&qv, k, options, tail_allowed.as_deref())
+            {
                 if let Some(seq) = tail.seqs.get(doc) {
-                    if !dead.contains(*seq) {
-                        hits.push((*seq, score));
-                    }
+                    hits.push((*seq, score));
                 }
             }
         }
@@ -6871,8 +6883,6 @@ pub(crate) struct Context {
     /// Object store backing the C++-format data files (`storage_type =
     /// "minio"`). `None` keeps everything on the local disk.
     pub(crate) object_store: Mutex<Option<Arc<storage::s3::S3Client>>>,
-    /// Concurrency limit for full-table text/vector scans.
-    pub(crate) scan_gate: ScanGate,
     /// The decoded HNSW chunk budget (built in at 8 GiB; the reference's
     /// `[buffer] buffer_manager_size` is accepted but ignored). Loaded graphs
     /// beyond it are evicted, and a scan that no longer sees full label
@@ -8310,6 +8320,10 @@ pub struct EngineOptions {
     /// C++ `[storage] snapshot_dir`. `None` puts snapshots under the data
     /// root, which is what an engine opened on a temporary directory wants.
     pub snapshot_dir: Option<std::path::PathBuf>,
+    /// C++ `[storage] catalog_dir`. `None` puts the catalog at `<dir>/catalog`,
+    /// the relative position the reference uses when the setting is left at its
+    /// default; an absolute path in the config overrides it.
+    pub catalog_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for EngineOptions {
@@ -8319,6 +8333,7 @@ impl Default for EngineOptions {
             exchange_capacity: 4,
             object_dir: None,
             snapshot_dir: None,
+            catalog_dir: None,
         }
     }
 }
@@ -10309,30 +10324,6 @@ pub(crate) fn tokenize_index_text(s: &str, tokenizer: &TextTokenizer) -> Vec<Str
         .into_iter()
         .map(|t| t.text)
         .collect()
-}
-
-/// Index-side tokens **with their position**. The C++ analyzer emits a token's
-/// original and its stem at the same offset (`common_analyzer_impl.cpp`
-/// re-uses `offset_` for both), so both share a position; `offset_` itself
-/// advances once per raw token. Phrase queries need this.
-/// Feeds `(term, position)` for the terms this column indexes, borrowing the
-/// term text so the caller can intern it without a `String` per term.
-///
-/// The dictionary-driven analyzers and the delimiter fields still produce a
-/// whole `Vec` (they are not on the hot path); the standard analyzer streams.
-pub(crate) fn for_each_index_term(
-    text: &str,
-    tokenizer: &TextTokenizer,
-    mut f: impl FnMut(&str, u32, u16),
-) {
-    let streamed = tokenizer.for_each_term(text, &mut |term: analyzer::TermView| {
-        f(term.text, term.word_offset, term.payload)
-    });
-    if !streamed {
-        for (term, pos, payload) in tokenize_index_terms(text, tokenizer) {
-            f(&term, pos, payload);
-        }
-    }
 }
 
 /// `(term, position, payload)`. The payload is `Term::payload_`

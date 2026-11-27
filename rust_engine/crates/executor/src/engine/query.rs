@@ -2100,13 +2100,7 @@ impl Engine {
                     None => (column.clone(), index_type.as_str(), None),
                 };
                 self.validate_index(table, &validate_column, effective_type, opts)?;
-                let existing = self
-                    .storage
-                    .catalog
-                    .list_indexes_for_table(table)?
-                    .into_iter()
-                    .find(|im| im.name == *name)
-                    .map(|im| im.column);
+                let existing = self.storage.catalog.find_index_for_table(table, name)?;
                 if let Some(existing_column) = existing {
                     if !*if_not_exists {
                         return Err(Error::Invalid(format!("index '{name}' already exists")));
@@ -2216,10 +2210,17 @@ impl Engine {
                 }
                 // A functional index is materialised from its base column; the
                 // expression itself is not a column of the table.
-                let has_rows = match &functional {
-                    Some((_, base)) => self.table_schema(table)?.iter().any(|c| c == base),
-                    None => self.table_schema(table)?.iter().any(|c| c == column),
-                };
+                let has_rows = self
+                    .storage
+                    .catalog
+                    .with_cached_table(table, |meta| {
+                        let target = match &functional {
+                            Some((_, base)) => base.as_str(),
+                            None => column.as_str(),
+                        };
+                        meta.columns.iter().any(|c| c == target)
+                    })?
+                    .ok_or_else(|| Error::NotFound(format!("table '{table}'")))?;
                 if let (Some((func, base)), true) = (&functional, has_rows) {
                     self.register_functional_index(
                         table,
@@ -2330,11 +2331,18 @@ impl Engine {
                     || index_type.eq_ignore_ascii_case("SMVE")
                 {
                     let dims = self
-                        .table_schema(table)
+                        .storage
+                        .catalog
+                        .with_cached_table(table, |meta| {
+                            meta.columns
+                                .iter()
+                                .position(|c| c == column)
+                                .and_then(|i| meta.types.get(i))
+                                .and_then(|ty| type_dim(ty))
+                        })
                         .ok()
-                        .and_then(|s| s.iter().position(|c| c == column))
-                        .and_then(|i| self.column_types(table).ok()?.get(i).cloned())
-                        .and_then(|ty| type_dim(&ty));
+                        .flatten()
+                        .flatten();
                     if let (Some(dims), Some(index_id)) = (dims, created_index_id) {
                         // The memory index belongs to **this** catalog record:
                         // a second index on the same column (`USING SMVE` after
@@ -2349,11 +2357,18 @@ impl Engine {
                 // The sparse BMP index is materialised the same way.
                 if index_type.eq_ignore_ascii_case("BMP") {
                     let width = self
-                        .table_schema(table)
+                        .storage
+                        .catalog
+                        .with_cached_table(table, |meta| {
+                            meta.columns
+                                .iter()
+                                .position(|c| c == column)
+                                .and_then(|i| meta.types.get(i))
+                                .map(|ty| sparse_idx_width(ty))
+                        })
                         .ok()
-                        .and_then(|s| s.iter().position(|c| c == column))
-                        .and_then(|i| self.column_types(table).ok()?.get(i).cloned())
-                        .map(|ty| sparse_idx_width(&ty));
+                        .flatten()
+                        .flatten();
                     if let (Some(width), Some(index_id)) = (width, created_index_id) {
                         let _ = self.sparse_index_by_id(table, column, index_id, width);
                     }

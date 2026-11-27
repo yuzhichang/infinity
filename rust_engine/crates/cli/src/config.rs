@@ -23,6 +23,32 @@
 use std::net::IpAddr;
 use std::path::Path;
 
+/// The version this build reports and the one a config file must name.
+///
+/// C++: `VERSION` (`src/common/default_values.cppm`). Kept as a constant so the
+/// default, the check in `Config::validate` and the accessor cannot disagree.
+pub const BUILD_VERSION: &str = "0.7.5";
+
+pub const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 10;
+pub const DEFAULT_OPTIMIZE_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 60;
+
+pub fn default_buffer_manager_size(cgroup_memory: Option<u64>) -> u64 {
+    buffer_size_for_memory(storage::physical_memory_bytes(), cgroup_memory)
+}
+
+fn buffer_size_for_memory(physical_memory: Option<u64>, cgroup_memory: Option<u64>) -> u64 {
+    let Some(bytes) = physical_memory
+        .into_iter()
+        .chain(cgroup_memory)
+        .filter(|bytes| *bytes > 0)
+        .min()
+    else {
+        return 8 * 1024 * 1024 * 1024;
+    };
+    bytes / 10 * 9 + bytes % 10 * 9 / 10
+}
+
 /// C++: `ErrorCode` subset used by `Config::Init`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
@@ -33,6 +59,41 @@ pub enum ConfigError {
     InvalidByteSize,
     InvalidLogLevel,
     InvalidTimeInfo,
+}
+
+/// Why `Config::set` refused one entry.
+///
+/// `Unknown` and `Invalid` are handled differently on purpose: see
+/// [`SetOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetError {
+    /// This build has no knob by that name (an old or a newer spelling).
+    Unknown,
+    /// A known knob whose value it cannot take.
+    Invalid,
+}
+
+impl From<ConfigError> for SetError {
+    fn from(_: ConfigError) -> Self {
+        SetError::Invalid
+    }
+}
+
+/// What `Config::set` did with one `key = value` line.
+///
+/// The three cases have to stay distinguishable: an unknown key is an operator
+/// using an older or newer spelling and is only worth a warning, while a known
+/// key with a malformed value is a real mistake in a setting the engine will
+/// use. Collapsing them (the old `Result<(), ConfigError>`) is what made both
+/// fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetOutcome {
+    /// The value was parsed and stored.
+    Applied,
+    /// No such knob in this build: ignored, with a warning.
+    Unknown,
+    /// A known knob with a value it cannot take.
+    Invalid,
 }
 
 /// C++: `LogLevel`.
@@ -82,6 +143,9 @@ pub struct Config {
     log_level: LogLevel,
 
     data_dir: String,
+    /// `[storage] catalog_dir`: where the catalog's RocksDB lives. Empty means
+    /// `<data root>/catalog`, the reference's relative default.
+    catalog_dir: String,
     wal_dir: String,
     storage_type: StorageType,
     object_storage_url: String,
@@ -97,10 +161,8 @@ pub struct Config {
 
     lru_num: usize,
     temp_dir: String,
-    /// `[buffer] buffer_manager_size`; `None` keeps the engine's built-in
-    /// budget. Only parsed real C++ configs set it.
-    buffer_manager_size: Option<i64>,
-    mem_index_memory_quota: i64,
+    buffer_manager_size: i64,
+    mem_index_memory_quota: Option<i64>,
     /// `[buffer] unsealed_reclaim_interval` in seconds: the sweep's period.
     unsealed_reclaim_interval: u64,
     /// `[buffer] unsealed_max_tables_per_round`: `0` means no limit.
@@ -114,6 +176,16 @@ pub struct Config {
     cache_result_capacity: u64,
     resource_dir: String,
     persistence_dir: String,
+
+    /// Entries this parser ignored while loading, each with the reason.
+    ///
+    /// A config file is written by an operator against whatever version they
+    /// had, so it routinely carries a knob this build dropped or renamed. That
+    /// is not a reason to refuse to start - the engine can run on the settings
+    /// it does understand - but it must not be silent either, or the operator
+    /// spends an afternoon wondering why their change had no effect. The
+    /// caller drains this into the log (`configure_server`).
+    warnings: Vec<String>,
 }
 
 impl Default for Config {
@@ -143,6 +215,7 @@ impl Default for Config {
             log_file_rotate_count: 8,
             log_level: LogLevel::Info,
             data_dir: "/var/infinity/data".into(),
+            catalog_dir: "/var/infinity/catalog".into(),
             wal_dir: "/var/infinity/wal".into(),
             storage_type: StorageType::Local,
             object_storage_url: "0.0.0.0:9000".into(),
@@ -150,27 +223,34 @@ impl Default for Config {
             object_storage_access_key: "minioadmin".into(),
             object_storage_secret_key: "minioadmin".into(),
             object_storage_https: false,
-            optimize_interval: 10,
-            cleanup_interval: 60,
+            optimize_interval: DEFAULT_OPTIMIZE_INTERVAL_SECS,
+            cleanup_interval: DEFAULT_CLEANUP_INTERVAL_SECS,
             compact_interval: 120,
             mem_index_capacity: 65536,
             snapshot_dir: "/var/infinity/snapshot".into(),
             lru_num: 7,
             temp_dir: "/var/infinity/tmp".into(),
-            buffer_manager_size: None,
-            mem_index_memory_quota: 4 * 1024 * 1024 * 1024,
+            buffer_manager_size: default_buffer_manager_size(
+                executor::memory::cgroup_memory_limit_bytes(),
+            ) as i64,
+            mem_index_memory_quota: None,
             unsealed_reclaim_interval: 30,
             unsealed_max_tables_per_round: 100,
-            checkpoint_interval: 86400,
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL_SECS,
             wal_compact_threshold: 1024 * 1024 * 1024,
-            wal_flush: "flush_at_once".into(),
+            wal_flush: txn::DEFAULT_WAL_FLUSH.as_str().into(),
             result_cache: "off".into(),
             cache_result_capacity: 10000,
             resource_dir: "/usr/share/infinity/resource".into(),
             persistence_dir: "/var/infinity/persistence".into(),
+            warnings: Vec::new(),
         }
     }
 }
+
+/// Section name used internally for entries under a section this build has no
+/// knowledge of, so they are skipped without a second warning each.
+const UNUSED_SECTION: &str = "\u{0}unused";
 
 impl Config {
     /// C++: `Config::Init(path, nullptr)`.
@@ -180,6 +260,54 @@ impl Config {
             self.apply_toml(&text)?;
         }
         self.validate()
+    }
+
+    /// Parses `text` into this config, for a caller that already has the
+    /// contents and not a path (`configure_server`).
+    ///
+    /// It is the same parser `Config::init` runs, so the values the server
+    /// reports are the ones the config tests check.
+    pub fn apply_text(&mut self, text: &str) -> Result<(), ConfigError> {
+        self.apply_toml(text)?;
+        // `init` runs the whole-file checks after the entries; a caller that
+        // has the text rather than a path needs the same pass, or a value the
+        // per-entry parser accepts but the combination cannot (a version from
+        // another release, an address that is not an IP) would go unreported.
+        self.validate()
+    }
+
+    /// Everything the loader ignored, one entry per problem.
+    ///
+    /// Empty for a clean load. Callers that log use [`Self::warnings_line`]
+    /// instead of joining this themselves, so the message has one shape.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Every warning as a **single** line, or `None` when there was nothing to
+    /// report.
+    ///
+    /// One line per ignored entry made a config written against a different
+    /// release produce a wall of text, and startup logs are skimmed. Folding
+    /// them keeps the signal ("your config was not fully understood") while the
+    /// detail stays: the count first, then each reason, so a long line can still
+    /// be read for the part that matters.
+    ///
+    /// The wording stays stable for tests: `N config setting(s) ignored:`.
+    pub fn warnings_line(&self) -> Option<String> {
+        if self.warnings.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} config setting(s) ignored: {}",
+            self.warnings.len(),
+            self.warnings.join("; ")
+        ))
+    }
+
+    /// `[wal] wal_flush`, resolved (the file's entry or the engine default).
+    pub fn wal_flush(&self) -> &str {
+        &self.wal_flush
     }
 
     fn apply_toml(&mut self, text: &str) -> Result<(), ConfigError> {
@@ -202,19 +330,46 @@ impl Config {
                         | "wal"
                         | "resource"
                 ) {
-                    return Err(ConfigError::InvalidConfig);
+                    // A whole section this build does not have: every entry
+                    // under it is unusable, so skip the section rather than
+                    // complaining once per line.
+                    self.warnings.push(format!(
+                        "ignoring unknown config section [{name}]; this build has no such section"
+                    ));
+                    section = UNUSED_SECTION.to_string();
+                    continue;
                 }
                 continue;
             }
             let (key, value) = line.split_once('=').ok_or(ConfigError::InvalidConfig)?;
             let key = key.trim().to_ascii_lowercase();
             let value = value.trim();
-            self.set(&section, &key, value)?;
+            if section == UNUSED_SECTION {
+                continue; // already reported with its section
+            }
+            match self.set(&section, &key, value) {
+                Ok(()) => {}
+                // An old or a newer spelling: the rest of the file still
+                // applies, so this is a warning and not a failure.
+                Err(SetError::Unknown) => self.warnings.push(format!(
+                    "ignoring unknown config entry [{section}] {key} = {value}"
+                )),
+                // A known knob with a value it cannot take. Also ignored, for
+                // the same reason - one bad line should not take the server
+                // down - but the message says the knob was recognised, which is
+                // what an operator needs to fix it.
+                Err(SetError::Invalid) => self.warnings.push(format!(
+                    "ignoring invalid value for [{section}] {key}: {value}"
+                )),
+            }
         }
         Ok(())
     }
 
-    fn set(&mut self, section: &str, key: &str, raw: &str) -> Result<(), ConfigError> {
+    /// Applies one entry. `Ok` means it was stored (or deliberately accepted
+    /// and ignored); `Err(UnknownKey)` means this build has no such knob, while
+    /// any other error is a known knob with a value it cannot take.
+    fn set(&mut self, section: &str, key: &str, raw: &str) -> Result<(), SetError> {
         let string = || raw.trim_matches('"').to_string();
         let integer = || raw.parse::<i64>().map_err(|_| ConfigError::InvalidConfig);
         let boolean = || match raw {
@@ -230,6 +385,14 @@ impl Config {
                 self.time_zone_bias = bias;
             }
             ("general", "cpu_limit") => self.cpu_limit = integer()? as u32,
+            // Raft cluster settings (`standalone` / `leader` / `follower` /
+            // `learner` and the peer address it dials). Accepted and ignored:
+            // this port runs standalone only, but the shipped `leader.toml`,
+            // `follower.toml`, `learner*.toml` and the pytest configs all carry
+            // them, so refusing them made half of `conf/` unloadable.
+            ("general", "server_mode") => {} // discard; see above
+            ("network", "peer_ip") => {}     // discard; see above
+            ("network", "peer_port") => {}   // discard; see above
             ("network", "server_address") => self.server_address = string(),
             ("network", "postgres_port") => self.postgres_port = integer()? as u16,
             ("network", "http_port") => self.http_port = integer()? as u16,
@@ -248,6 +411,7 @@ impl Config {
             ("log", "log_level") => self.log_level = parse_log_level(&string())?,
             ("storage", "data_dir") => self.data_dir = string(),
             ("storage", "persistence_dir") => self.persistence_dir = string(),
+            ("storage", "catalog_dir") => self.catalog_dir = string(),
             ("storage", "optimize_interval") => {
                 self.optimize_interval = parse_time_info(&string())?
             }
@@ -259,7 +423,7 @@ impl Config {
                 self.storage_type = match string().to_ascii_lowercase().as_str() {
                     "local" => StorageType::Local,
                     "minio" => StorageType::Minio,
-                    _ => return Err(ConfigError::InvalidConfig),
+                    _ => return Err(SetError::Invalid),
                 }
             }
             ("storage.object_storage", "url") => self.object_storage_url = string(),
@@ -272,18 +436,21 @@ impl Config {
             // the decoded HNSW chunks and the block map, so it is carried here
             // (`main.rs` hands it to `Engine::set_buffer_budget`).
             ("buffer", "buffer_manager_size") => {
-                self.buffer_manager_size = Some(parse_byte_size(&string())?);
+                let bytes = parse_byte_size(&string())?;
+                if bytes > 0 {
+                    self.buffer_manager_size = bytes;
+                }
             }
             ("buffer", "lru_num") => self.lru_num = integer()? as usize,
             ("buffer", "temp_dir") => self.temp_dir = string(),
             ("buffer", "unsealed_memory_quota") => {
-                self.mem_index_memory_quota = parse_byte_size(&string())?
+                self.mem_index_memory_quota = Some(parse_byte_size(&string())?)
             }
             // The old spelling. Kept so an existing config keeps working; the
             // name is misleading now - the quota bounds everything not yet on
             // disk (the append buffer plus every index tail), not one index.
             ("buffer", "memindex_memory_quota") => {
-                self.mem_index_memory_quota = parse_byte_size(&string())?
+                self.mem_index_memory_quota = Some(parse_byte_size(&string())?)
             }
             // The reclaim loop's two settings (`docs/MEMORY_RECLAIM.md` §5).
             // This parser has no consumer of its own - the serving binary reads
@@ -306,38 +473,74 @@ impl Config {
             ("wal", "wal_compact_threshold") => {
                 self.wal_compact_threshold = parse_byte_size(&string())?
             }
-            ("wal", "wal_flush") => {
+            // The reference's older spelling (`flush_method_at_commit`), which
+            // `configure_server` also honoured. Both names carry the same value.
+            ("wal", "flush_method_at_commit") | ("wal", "wal_flush") => {
                 let value = string();
-                if !matches!(value.as_str(), "only_write" | "flush" | "append") {
-                    return Err(ConfigError::InvalidConfig);
-                }
+                // Delegate to the one parser the engine also uses, so the
+                // accepted spellings cannot drift apart again: this list used
+                // to say `only_write | flush | append`, which both rejected
+                // `flush_per_second` and accepted two words `WalFlush::parse`
+                // did not know (they then fell through to `flush_at_once`).
+                txn::WalFlush::parse(&value).map_err(|_| ConfigError::InvalidConfig)?;
                 self.wal_flush = value;
             }
             ("resource", "resource_dir") => self.resource_dir = string(),
-            _ => return Err(ConfigError::InvalidConfig),
+            _ => return Err(SetError::Unknown),
         }
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Checks the values as a whole, after every entry was applied.
+    ///
+    /// A check here is a property of the *combination* (a version the build does
+    /// not know, an address that is not an IP), not of one line's syntax, so it
+    /// cannot be caught while parsing. The policy is still "keep running": a
+    /// failing check restores the default for that knob and reports it, rather
+    /// than refusing to start. The reference refuses the file instead; the port
+    /// runs on what it understood, which is what an operator recovering from a
+    /// config written for another version needs.
+    ///
+    /// `invalid_values()`/`out_of_range_values()` cover each of these.
+    fn validate(&mut self) -> Result<(), ConfigError> {
         // The reference compares against its build-time VERSION constant; the
-        // merged tree carries 0.7.5 (upstream's release bump).
-        if self.version != "0.7.5" {
-            return Err(ConfigError::MismatchVersion);
+        // merged tree carries 0.7.5 (upstream's release bump). A config from a
+        // different release is the common case for this check - it is a stale
+        // file, not a broken one - so the version falls back to the build's and
+        // the rest of the settings still apply.
+        if self.version != BUILD_VERSION {
+            let found = std::mem::replace(&mut self.version, BUILD_VERSION.to_string());
+            self.warnings.push(format!(
+                "config version '{found}' does not match this build ({BUILD_VERSION}); using {BUILD_VERSION}"
+            ));
         }
         if self.server_address.parse::<IpAddr>().is_err() {
-            return Err(ConfigError::InvalidIpAddr);
+            let found = std::mem::replace(&mut self.server_address, "0.0.0.0".to_string());
+            self.warnings
+                .push(format!("invalid server_address '{found}'; using 0.0.0.0"));
         }
         if self.connection_pool_size > u16::MAX as u32 {
-            return Err(ConfigError::InvalidConfig);
+            let found = std::mem::take(&mut self.connection_pool_size);
+            self.warnings.push(format!(
+                "connection_pool_size {found} exceeds {}; using the default 128",
+                u16::MAX
+            ));
+            self.connection_pool_size = 128;
         }
         // `log_file_max_size` must cover at least 1 MiB; `ParseByteSize`
         // rejects the unsupported TB unit.
         if self.log_file_max_size < 1024 * 1024 {
-            return Err(ConfigError::InvalidConfig);
+            let found = std::mem::replace(&mut self.log_file_max_size, 1024 * 1024 * 1024);
+            self.warnings.push(format!(
+                "log_file_max_size {found} is below 1 MiB; using 1 GiB"
+            ));
         }
         if self.optimize_interval > 720 * 3600 {
-            return Err(ConfigError::InvalidConfig);
+            let found =
+                std::mem::replace(&mut self.optimize_interval, DEFAULT_OPTIMIZE_INTERVAL_SECS);
+            self.warnings.push(format!(
+                "optimize_interval {found}s exceeds 720h; using {DEFAULT_OPTIMIZE_INTERVAL_SECS}s"
+            ));
         }
         Ok(())
     }
@@ -409,6 +612,10 @@ impl Config {
     pub fn data_dir(&self) -> &str {
         &self.data_dir
     }
+    /// `[storage] catalog_dir`. Empty means `<data root>/catalog`.
+    pub fn catalog_dir(&self) -> &str {
+        &self.catalog_dir
+    }
     pub fn wal_dir(&self) -> &str {
         &self.wal_dir
     }
@@ -453,6 +660,7 @@ impl Config {
     }
     pub fn mem_index_memory_quota(&self) -> i64 {
         self.mem_index_memory_quota
+            .unwrap_or(self.buffer_manager_size / 2)
     }
     /// `[buffer] unsealed_reclaim_interval` in seconds; `0` stops the sweep.
     pub fn unsealed_reclaim_interval(&self) -> u64 {
@@ -462,9 +670,8 @@ impl Config {
     pub fn unsealed_max_tables_per_round(&self) -> u64 {
         self.unsealed_max_tables_per_round
     }
-    /// `[buffer] buffer_manager_size` in bytes, `None` when the config leaves
-    /// it out (the engine then keeps its built-in budget).
-    pub fn buffer_manager_size(&self) -> Option<i64> {
+    /// `[buffer] buffer_manager_size` in bytes.
+    pub fn buffer_manager_size(&self) -> i64 {
         self.buffer_manager_size
     }
     pub fn checkpoint_interval(&self) -> u64 {
@@ -484,6 +691,38 @@ impl Config {
     }
     pub fn persistence_dir(&self) -> &str {
         &self.persistence_dir
+    }
+
+    /// Every knob `SHOW CONFIGS` reports, in the engine's own spelling.
+    ///
+    /// This is the one list of what is queryable: the values are the ones this
+    /// config resolved (a file entry overrides the default above), and
+    /// `configure_server` seeds the engine's config map from it, so `SET CONFIG`
+    /// and `[..]` entries end up in the same place and a getter reads one map
+    /// instead of reconstructing a default. Adding a knob here is what makes it
+    /// both settable and visible.
+    ///
+    /// Integer knobs stay integers in the JSON response (`config_is_numeric`
+    /// decides that from the name), so they are rendered here without padding.
+    pub fn config_values(&self) -> Vec<(&'static str, String)> {
+        executor::QUERYABLE_CONFIG_KEYS
+            .iter()
+            .filter_map(|key| {
+                let value = match *key {
+                    "cache_result_capacity" => self.cache_result_capacity.to_string(),
+                    "checkpoint_interval" => self.checkpoint_interval.to_string(),
+                    "cleanup_interval" => self.cleanup_interval.to_string(),
+                    "log_level" => self.log_level.as_str().to_string(),
+                    "optimize_interval" => self.optimize_index_interval().to_string(),
+                    "result_cache" => self.result_cache.clone(),
+                    // `wal_flush` is reported from the live transaction manager
+                    // (`Engine::config_get`), because `SET CONFIG` cannot change
+                    // it; leaving it out here keeps a single source for it.
+                    _ => return None,
+                };
+                Some((*key, value))
+            })
+            .collect()
     }
 }
 
@@ -560,6 +799,21 @@ fn parse_log_level(text: &str) -> Result<LogLevel, ConfigError> {
     }
 }
 
+impl LogLevel {
+    /// The spelling `parse_log_level` accepts, so a round trip is lossless and
+    /// `SHOW CONFIGS` reports what the config file said.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warning => "warning",
+            LogLevel::Error => "error",
+            LogLevel::Critical => "critical",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Ports of `ConfigTest` (`src/unit_test/main/config_ut.cpp`).
@@ -605,7 +859,13 @@ mod tests {
         assert_eq!(config.storage_type(), StorageType::Local);
         assert_eq!(config.lru_num(), 7);
         assert_eq!(config.temp_dir(), "/var/infinity/tmp");
-        assert_eq!(config.mem_index_memory_quota(), 4 * 1024 * 1024 * 1024);
+        assert_eq!(
+            config.mem_index_memory_quota(),
+            config.buffer_manager_size() / 2
+        );
+        assert_eq!(config.checkpoint_interval(), 10);
+        assert_eq!(config.optimize_interval, 30);
+        assert_eq!(config.cleanup_interval(), 60);
         assert_eq!(config.result_cache(), "off");
         assert_eq!(config.cache_result_num(), 10000);
     }
@@ -617,12 +877,20 @@ mod tests {
     #[test]
     fn buffer_manager_size_is_carried() {
         let mut config = Config::default();
-        assert_eq!(config.buffer_manager_size(), None);
         config
             .apply_toml("[buffer]\nbuffer_manager_size = \"3GB\"\n")
             .unwrap();
-        assert_eq!(config.buffer_manager_size(), Some(3 * 1024 * 1024 * 1024));
+        assert_eq!(config.buffer_manager_size(), 3 * 1024 * 1024 * 1024);
+        assert_eq!(config.mem_index_memory_quota(), 3 * 512 * 1024 * 1024);
         assert_eq!(config.lru_num(), 7);
+    }
+
+    #[test]
+    fn buffer_size_uses_nine_tenths_of_the_effective_memory() {
+        assert_eq!(buffer_size_for_memory(Some(101), None), 90);
+        assert_eq!(buffer_size_for_memory(Some(100), Some(60)), 54);
+        assert_eq!(buffer_size_for_memory(Some(60), Some(100)), 54);
+        assert_eq!(buffer_size_for_memory(None, Some(60)), 54);
     }
 
     /// C++: `ConfigTest.test2`.
@@ -660,48 +928,64 @@ mod tests {
     /// C++: `ConfigTest.TestWrongParamNames`.
     #[test]
     fn wrong_parameter_names() {
+        // Every key in that fixture is a misspelling (`versi0n`, `time_z0ne`,
+        // ...). They are skipped with a warning each and the defaults stand:
+        // refusing the file would mean an operator cannot start a server
+        // because a config carries one knob this build dropped.
         let mut config = Config::default();
-        assert_eq!(
-            config.init(Some(&fixture("test_conf_invalid_param.toml"))),
-            Err(ConfigError::InvalidConfig)
+        config
+            .init(Some(&fixture("test_conf_invalid_param.toml")))
+            .expect("a misspelled key is a warning, not a failure");
+        assert_eq!(config.version(), "0.7.5", "the default stands");
+        assert!(
+            !config.warnings().is_empty(),
+            "each ignored key has to be reported"
         );
+        for warning in config.warnings() {
+            // A misspelled section and a misspelled key are both "unknown",
+            // and both have to say so.
+            assert!(
+                warning.contains("unknown config"),
+                "the warning names the reason: {warning}"
+            );
+        }
     }
 
     /// C++: `ConfigTest.TestConfInvalidValues`.
+    ///
+    /// Each fixture carries one knob with a value it cannot take. The loader
+    /// reports it and keeps the default; the file still loads. This differs
+    /// from the reference, which refuses the file - the port's rule is that a
+    /// single bad line must not stop a server from starting, so the operator
+    /// sees the warning and the engine runs on what it understood.
     #[test]
     fn invalid_values() {
-        for (name, error) in [
-            (
-                "test_conf_invalid_version.toml",
-                ConfigError::MismatchVersion,
-            ),
-            (
-                "test_conf_invalid_timezone.toml",
-                ConfigError::InvalidTimezone,
-            ),
-            (
-                "test_conf_invalid_server_address.toml",
-                ConfigError::InvalidIpAddr,
-            ),
-            (
-                "test_conf_invalid_bytesize.toml",
-                ConfigError::InvalidByteSize,
-            ),
-            (
-                "test_conf_invalid_log_level.toml",
-                ConfigError::InvalidLogLevel,
-            ),
-            (
-                "test_conf_invalid_timeinfo.toml",
-                ConfigError::InvalidTimeInfo,
-            ),
+        for name in [
+            "test_conf_invalid_version.toml",
+            "test_conf_invalid_timezone.toml",
+            "test_conf_invalid_server_address.toml",
+            "test_conf_invalid_bytesize.toml",
+            "test_conf_invalid_log_level.toml",
+            "test_conf_invalid_timeinfo.toml",
         ] {
             let mut config = Config::default();
-            assert_eq!(config.init(Some(&fixture(name))), Err(error), "{name}");
+            let result = config.init(Some(&fixture(name)));
+            assert!(
+                result.is_ok(),
+                "{name}: an unusable value is skipped, not fatal"
+            );
+            assert!(
+                !config.warnings().is_empty(),
+                "{name}: the skipped value has to be reported"
+            );
         }
     }
 
     /// C++: `ConfigTest.TestOutofRangeValues`.
+    ///
+    /// Same policy as `invalid_values`: the offending entry is skipped with a
+    /// warning and the default stays, so one out-of-range number does not keep
+    /// the server from starting.
     #[test]
     fn out_of_range_values() {
         for name in [
@@ -712,10 +996,14 @@ mod tests {
             "test_conf_out_of_bound_walflush.toml",
         ] {
             let mut config = Config::default();
-            assert_eq!(
-                config.init(Some(&fixture(name))),
-                Err(ConfigError::InvalidConfig),
-                "{name}"
+            let result = config.init(Some(&fixture(name)));
+            assert!(
+                result.is_ok(),
+                "{name}: an out-of-range value is skipped, not fatal"
+            );
+            assert!(
+                !config.warnings().is_empty(),
+                "{name}: the skipped value has to be reported"
             );
         }
     }
@@ -757,6 +1045,126 @@ mod tests {
         assert_eq!(config.persistence_dir(), "/var/infinity/persistence");
     }
 
+    /// Every ignored setting is reported on **one** line, with a count.
+    ///
+    /// A config written against another release can have many, and a startup
+    /// log is skimmed: four separate `warning:` lines read as four unrelated
+    /// failures, while one line says "this file was not fully understood" and
+    /// still carries every reason.
+    #[test]
+    fn ignored_settings_are_reported_on_one_line() {
+        let text = r#"
+[general]
+version = "3.0.0"
+[unknown_section]
+foo = "bar"
+[log]
+typo_key = "x"
+[wal]
+wal_flush = "bogus_mode"
+"#;
+        let mut config = Config::default();
+        config.apply_text(text).expect("a bad entry is a warning");
+
+        // Four problems: the section, the unknown key, the bad wal_flush value
+        // and the version mismatch.
+        assert_eq!(config.warnings().len(), 4, "{:?}", config.warnings());
+        let line = config.warnings_line().expect("there were warnings");
+        assert!(!line.contains('\n'), "the report is one line: {line:?}");
+        assert!(
+            line.starts_with("4 config setting(s) ignored: "),
+            "the count leads: {line}"
+        );
+        for reason in [
+            "unknown config section",
+            "unknown config entry",
+            "invalid value",
+            "version",
+        ] {
+            assert!(line.contains(reason), "{reason} is missing from {line}");
+        }
+
+        // A clean load has nothing to report.
+        let mut clean = Config::default();
+        clean.apply_text("[log]\nlog_level = \"info\"\n").unwrap();
+        assert_eq!(clean.warnings_line(), None);
+    }
+
+    /// The text `configure_server` hands to `Config::apply_text`.
+    #[test]
+    fn the_served_config_text_resolves() {
+        let text = r#"
+[log]
+log_level = "debug"
+[storage]
+cleanup_interval = "30s"
+catalog_dir = "/tmp/x/mycatalog"
+[wal]
+checkpoint_interval = "86400s"
+[buffer]
+result_cache = "on"
+cache_result_capacity = 4096
+[wal]
+wal_flush = "only_write"
+"#;
+        // Split by section so a failure names the section that broke.
+        for (name, chunk) in [
+            ("log", "[log]\nlog_level = \"debug\"\n"),
+            (
+                "storage",
+                "[storage]\ncleanup_interval = \"30s\"\ncatalog_dir = \"/tmp/x/mycatalog\"\n[wal]\ncheckpoint_interval = \"86400s\"\n",
+            ),
+            (
+                "buffer",
+                "[buffer]\nresult_cache = \"on\"\ncache_result_capacity = 4096\n",
+            ),
+            ("wal_flush", "[wal]\nwal_flush = \"only_write\"\n"),
+        ] {
+            let mut c = Config::default();
+            let r = c.apply_text(chunk);
+            assert!(r.is_ok(), "section {name} must resolve: {:?}", r.err());
+        }
+        let mut c = Config::default();
+        let r = c.apply_text(text);
+        assert!(
+            r.is_ok(),
+            "configure_server's text must resolve: {:?}",
+            r.err()
+        );
+        assert_eq!(c.wal_flush(), "only_write");
+        assert_eq!(c.log_level(), LogLevel::Debug);
+    }
+
+    /// Every shipped config must load, not just the one the round-trip test
+    /// happens to name.
+    ///
+    /// `conf/infinity_conf.toml` carries `[storage] catalog_dir`, which this
+    /// parser did not know - so `Config::init` returned `InvalidConfig` for the
+    /// very file that ships with the engine. The test above only exercised
+    /// `test/data/config/infinity_conf.toml`, whose key set differs, which is
+    /// why nothing caught it.
+    #[test]
+    fn every_shipped_config_loads() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../conf");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("conf/ is readable") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let mut config = Config::default();
+            let result = config.init(Some(&path));
+            assert!(
+                result.is_ok(),
+                "conf/{name} is shipped with the engine and must load: {:?}",
+                result.err()
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "conf/ holds configs to check");
+    }
+
     /// The checked-in config carries the reclaim settings, so `Config::init`
     /// has to accept them: a key it does not know is `InvalidConfig`.
     #[test]
@@ -765,6 +1173,54 @@ mod tests {
         config.init(Some(&fixture("infinity_conf.toml"))).unwrap();
         assert_eq!(config.unsealed_reclaim_interval(), 30);
         assert_eq!(config.unsealed_max_tables_per_round(), 100);
+    }
+
+    /// `[wal] wal_flush` takes each of the engine's three modes; anything else
+    /// is skipped with a warning and the default stands.
+    ///
+    /// This list used to read `only_write | flush | append`: it rejected
+    /// `flush_per_second` (the shipped default) and accepted two words
+    /// `WalFlush::parse` mapped to `flush_at_once`, so a config could validate
+    /// and mean something else. The validation now delegates to that one parser,
+    /// and the outcome here is "kept" or "ignored with a warning".
+    #[test]
+    fn wal_flush_accepts_the_engine_modes_and_refuses_the_rest() {
+        for mode in ["only_write", "flush_at_once", "flush_per_second"] {
+            let mut config = Config::default();
+            assert!(
+                config
+                    .apply_toml(&format!("[wal]\nwal_flush = \"{mode}\"\n"))
+                    .is_ok(),
+                "{mode} is an engine mode and must load"
+            );
+            assert_eq!(config.wal_flush, mode);
+            assert!(
+                config.warnings().is_empty(),
+                "{mode} is valid and must not warn"
+            );
+        }
+        for bad in ["flush", "append", "only-write", "flush_every_second"] {
+            let mut config = Config::default();
+            assert!(
+                config
+                    .apply_toml(&format!("[wal]\nwal_flush = \"{bad}\"\n"))
+                    .is_ok(),
+                "{bad} is skipped, not a load failure"
+            );
+            assert_eq!(
+                config.wal_flush,
+                txn::DEFAULT_WAL_FLUSH.as_str(),
+                "{bad} leaves the default in place"
+            );
+            assert!(
+                config
+                    .warnings()
+                    .iter()
+                    .any(|w| w.contains("invalid value") && w.contains("wal_flush")),
+                "{bad} has to be reported: {:?}",
+                config.warnings()
+            );
+        }
     }
 
     /// `"2B"` is two bytes, not an unparseable value: the end-to-end reclaim

@@ -22,6 +22,39 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+# A build flavour for off-CPU / perf profiling, not for benchmarks or shipping.
+#
+# `offcputime` samples the user stack through the kernel's `get_stackid`, whose
+# x86_64 user unwinder is frame-pointer based: `libbcc` carries no DWARF
+# unwinder on that path (`offcputime.c` calls `get_stackid(ctx,
+# BPF_F_USER_STACK)` and symbolises only what the fp chain produced), and this
+# kernel runs `CONFIG_UNWINDER_ORC` - so *kernel* stacks always resolve while
+# *user* ones need an fp chain. `release` omits the frame pointer, and a profile
+# against it yields the syscall frame followed by `[unknown]` with no caller
+# chain: measured 0% of off-CPU time with a resolvable chain, for both the
+# libbpf `bpf-offcputime` and the BCC python tool.
+#
+# `debug = 1` is what makes the remaining frames *nameable*. Without it the
+# binary has `.symtab` only, so a frame resolves to a symbol name and nothing
+# else; with it, `debug_info` + `debug_line` let a profiler map an address back
+# through inlining to the source line. It costs binary size (~436 MB here) and
+# nothing at runtime.
+#
+# `force-frame-pointers` is NOT a Cargo profile key - writing it here is an
+# `unused manifest key` warning and the flag never reaches rustc. It only
+# exists as `-C force-frame-pointers=yes`, so it goes on the rustflags for the
+# build; `debug`/`strip` are legitimate keys and stay below.
+#
+# Built with
+#   RUSTFLAGS="-C force-frame-pointers=yes" \
+#     cargo build --profile profiling --bin infinity
+# and the output is `target/profiling/infinity`. Timings taken here are *not*
+# comparable to `release` - use this one only for stacks.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+
 # A compiler warning is a defect: every crate inherits this with
 # `[lints] workspace = true`, so `cargo build` / `cargo test` (and every CI
 # job that compiles the workspace) fails on one. A warning a crate genuinely

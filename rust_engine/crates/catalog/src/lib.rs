@@ -416,11 +416,41 @@ pub struct Catalog {
     /// lazily from the store so `CreateIndex` can allocate IDs without waiting
     /// for prior commits to land.
     next_index_ids: Mutex<HashMap<(String, u64), u64>>,
+    /// Cached `db_name -> db_id` for `catalog_only` mode, cleared on
+    /// `invalidate_tables`.
+    db_ids: Mutex<HashMap<String, u64>>,
+    /// Cached `table_name -> (db_id, table_id, create_ts)` for `catalog_only`
+    /// mode, invalidated per-table or globally alongside `table_cache`.
+    table_records: Mutex<HashMap<String, (u64, u64, u64)>>,
+}
+
+thread_local! {
+    /// Per-thread depth of `Catalog::capture` / `Catalog::begin_ddl`.
+    /// Only the thread currently staging a DDL needs to bypass `table_cache`
+    /// and read the `Overlay` under `self.capture`; other concurrent workers
+    /// must keep hitting `table_cache` without contending on `self.capture`.
+    static THREAD_DDL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct ThreadDdlScope;
+
+impl ThreadDdlScope {
+    fn enter() -> Self {
+        THREAD_DDL_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ThreadDdlScope {
+    fn drop(&mut self) {
+        THREAD_DDL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 /// Ends a DDL call: leaves the depth and drops what was cached while it ran.
 struct DdlGuard<'a> {
     catalog: &'a Catalog,
+    _scope: ThreadDdlScope,
 }
 
 impl Drop for DdlGuard<'_> {
@@ -429,6 +459,20 @@ impl Drop for DdlGuard<'_> {
             .ddl_depth
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         self.catalog.invalidate_tables();
+    }
+}
+
+/// Ends an index DDL call: invalidates only `index_cache` for `table` without
+/// wiping `table_cache` or bumping `ddl_epoch` across unrelated tables.
+struct IndexDdlGuard<'a> {
+    catalog: &'a Catalog,
+    table: &'a str,
+    _scope: ThreadDdlScope,
+}
+
+impl Drop for IndexDdlGuard<'_> {
+    fn drop(&mut self) {
+        self.catalog.invalidate_table_indexes(self.table);
     }
 }
 
@@ -534,6 +578,8 @@ impl Catalog {
             ddl_epoch: std::sync::atomic::AtomicU64::new(0),
             next_table_ids: Mutex::new(HashMap::new()),
             next_index_ids: Mutex::new(HashMap::new()),
+            db_ids: Mutex::new(HashMap::new()),
+            table_records: Mutex::new(HashMap::new()),
         }
     }
 
@@ -551,16 +597,30 @@ impl Catalog {
             ddl_epoch: std::sync::atomic::AtomicU64::new(0),
             next_table_ids: Mutex::new(HashMap::new()),
             next_index_ids: Mutex::new(HashMap::new()),
+            db_ids: Mutex::new(HashMap::new()),
+            table_records: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Enters a DDL call: reads stop using the cache and the cache is dropped
-    /// both now and when the returned guard goes out of scope.
+    /// Enters a DDL call: reads on this thread stop using the cache and the
+    /// cache is dropped both now and when the returned guard goes out of scope.
     fn begin_ddl(&self) -> DdlGuard<'_> {
         self.ddl_depth
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.invalidate_tables();
-        DdlGuard { catalog: self }
+        DdlGuard {
+            catalog: self,
+            _scope: ThreadDdlScope::enter(),
+        }
+    }
+
+    fn begin_index_ddl<'a>(&'a self, table: &'a str) -> IndexDdlGuard<'a> {
+        self.invalidate_table_indexes(table);
+        IndexDdlGuard {
+            catalog: self,
+            table,
+            _scope: ThreadDdlScope::enter(),
+        }
     }
 
     /// Drops every cached table and index record and makes in-flight reads
@@ -578,6 +638,8 @@ impl Catalog {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         cache.clear();
         self.index_cache.lock().unwrap().clear();
+        self.db_ids.lock().unwrap().clear();
+        self.table_records.lock().unwrap().clear();
     }
 
     /// Invalidates cached table and index metadata for a single table only,
@@ -590,6 +652,8 @@ impl Catalog {
         cache.retain(|k, _| k != table && k != bare && k.rsplit('.').next() != Some(bare));
         let mut idx_cache = self.index_cache.lock().unwrap();
         idx_cache.retain(|k, _| k != table && k != bare && k.rsplit('.').next() != Some(bare));
+        let mut rec_cache = self.table_records.lock().unwrap();
+        rec_cache.retain(|k, _| k != table && k != bare && k.rsplit('.').next() != Some(bare));
     }
 
     /// Whether this catalog persists only the C++ key space.
@@ -653,9 +717,21 @@ impl Catalog {
         Ok(live)
     }
 
+    /// Invalidates cached index metadata for a single table only, leaving
+    /// `table_cache` and `ddl_epoch` untouched so concurrent `CreateIndex`
+    /// calls on other tables keep their `TableMeta` cache hits.
+    pub fn invalidate_table_indexes(&self, table: &str) {
+        let bare = table.rsplit('.').next().unwrap_or(table);
+        let mut idx_cache = self.index_cache.lock().unwrap();
+        idx_cache.retain(|k, _| k != table && k != bare && k.rsplit('.').next() != Some(bare));
+    }
+
     /// Runs `f` against the store as the DDL in flight sees it: either the
     /// store itself, or the store with the captured writes applied.
     fn with_view<T>(&self, f: impl FnOnce(&dyn MetaStore) -> Result<T>) -> Result<T> {
+        if THREAD_DDL_DEPTH.with(|d| d.get() == 0) {
+            return f(self.store.as_ref());
+        }
         let guard = self.capture.read().unwrap();
         match guard.as_ref() {
             Some(capture) => f(&Overlay {
@@ -808,9 +884,7 @@ impl Catalog {
     }
 
     fn indexes_cached(&self, key: &str, qualified: &str) -> Result<Vec<IndexMeta>> {
-        if self.capture.read().unwrap().is_some()
-            || self.ddl_depth.load(std::sync::atomic::Ordering::SeqCst) > 0
-        {
+        if THREAD_DDL_DEPTH.with(|d| d.get() > 0) {
             return self.indexes_of_table_uncached(qualified);
         }
         let epoch = self.ddl_epoch.load(std::sync::atomic::Ordering::SeqCst);
@@ -841,7 +915,8 @@ impl Catalog {
             ),
         };
         self.with_view(|store| {
-            let Some(layout) = crate::layout::read_table(store, &db_name, &bare)? else {
+            let Some(layout) = crate::layout::read_table_header_only(store, &db_name, &bare)?
+            else {
                 return Ok(Vec::new());
             };
             let db_id = layout.db_id.to_string();
@@ -986,6 +1061,7 @@ impl Catalog {
     /// lock), so a single slot is enough; a nested capture is a programming
     /// error and is reported rather than silently nesting.
     pub fn capture<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<(T, Vec<BatchItem>)> {
+        let _scope = ThreadDdlScope::enter();
         {
             let mut slot = self.capture.write().unwrap();
             if slot.is_some() {
@@ -1811,14 +1887,37 @@ impl Catalog {
         Ok(tables.iter().map(crate::layout::table_meta_of).collect())
     }
 
+    /// Runs `f` on the cached `TableMeta` for `name` without cloning the
+    /// whole metadata struct (column lists, types, indexes).
+    pub fn with_cached_table<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&TableMeta) -> R,
+    ) -> Result<Option<R>> {
+        if THREAD_DDL_DEPTH.with(|d| d.get() > 0) {
+            return Ok(self.get_table_by_name_uncached(name)?.as_ref().map(f));
+        }
+        let epoch = self.ddl_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(meta) = self.table_cache.lock().unwrap().get(name) {
+            return Ok(Some(f(meta)));
+        }
+        let found = self.get_table_by_name_uncached(name)?;
+        let out = found.as_ref().map(f);
+        if let Some(meta) = found {
+            let mut cache = self.table_cache.lock().unwrap();
+            if self.ddl_epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                cache.insert(name.to_string(), meta);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_table_by_name(&self, name: &str) -> Result<Option<TableMeta>> {
         // Inside a capture the read is answered through an overlay of the
         // transaction's own uncommitted DDL, so a cached record would answer
         // from before that DDL. Captures are DDL-only and short, so they simply
         // bypass the cache.
-        if self.capture.read().unwrap().is_some()
-            || self.ddl_depth.load(std::sync::atomic::Ordering::SeqCst) > 0
-        {
+        if THREAD_DDL_DEPTH.with(|d| d.get() > 0) {
             return self.get_table_by_name_uncached(name);
         }
         let epoch = self.ddl_epoch.load(std::sync::atomic::Ordering::SeqCst);
@@ -2224,12 +2323,63 @@ impl Catalog {
             // what names the `db_{id}` directory - including for a database
             // that was dropped and created again (the dropped record is still
             // there, so the newest one is the live id).
+            if THREAD_DDL_DEPTH.with(|d| d.get() == 0) {
+                if let Some(&id) = self.db_ids.lock().unwrap().get(name) {
+                    return Ok(Some(id));
+                }
+                let epoch = self.ddl_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                let found = crate::layout::db_record(self.store.as_ref(), name)?.map(|(id, _)| id);
+                if let Some(id) = found {
+                    let mut cache = self.db_ids.lock().unwrap();
+                    if self.ddl_epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                        cache.insert(name.to_string(), id);
+                    }
+                }
+                return Ok(found);
+            }
             return Ok(crate::layout::db_record(self.store.as_ref(), name)?.map(|(id, _)| id));
         }
         Ok(self
             .store
             .get(&db_key(name))?
             .map(|v| String::from_utf8_lossy(&v).parse::<u64>().unwrap_or(0)))
+    }
+
+    /// Resolves `(db_id, table_id, table_create_ts)` for `table` in
+    /// `catalog_only` mode, using `table_records` / `db_ids` caches when
+    /// outside a `DdlGuard` capture.
+    pub fn table_record_cached(&self, table: &str) -> Result<Option<(u64, u64, u64)>> {
+        if !self.catalog_only {
+            return Ok(None);
+        }
+        let in_ddl = THREAD_DDL_DEPTH.with(|d| d.get() > 0);
+        if !in_ddl {
+            if let Some(&rec) = self.table_records.lock().unwrap().get(table) {
+                return Ok(Some(rec));
+            }
+        }
+        let epoch = self.ddl_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let (db_name, bare) = match table.split_once('.') {
+            Some((db, bare)) => (db, bare),
+            None => ("default_db", table),
+        };
+        let Some(db_id) = self.database_id_of_name(db_name)? else {
+            return Ok(None);
+        };
+        let db_id_str = db_id.to_string();
+        let Some((table_id, ts)) =
+            crate::layout::table_record(self.store.as_ref(), &db_id_str, bare)?
+        else {
+            return Ok(None);
+        };
+        let rec = (db_id, table_id, ts);
+        if !in_ddl {
+            let mut cache = self.table_records.lock().unwrap();
+            if self.ddl_epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                cache.insert(table.to_string(), rec);
+            }
+        }
+        Ok(Some(rec))
     }
 
     /// Whether `name` is **recorded** as a database, as opposed to being
@@ -2322,7 +2472,7 @@ impl Catalog {
         index_type: &str,
         options: &[(String, String)],
     ) -> Result<IndexMeta> {
-        let _ddl = self.begin_ddl();
+        let _ddl = self.begin_index_ddl(table);
         // Per-table index ids start at 1 and are never reused. The counter is
         // the authority in both modes: deriving the id from the **live** indexes
         // hands a dropped index's id to the new one, which then inherits its
@@ -2370,8 +2520,16 @@ impl Catalog {
                 .max()
                 .unwrap_or(0)
         };
-        let Some((table_id, _)) = crate::layout::table_record(self.store.as_ref(), &db_id, &bare)?
-        else {
+        let table_id = if self.catalog_only {
+            if let Some(&(_, tid, _)) = self.table_records.lock().unwrap().get(table) {
+                Some(tid)
+            } else {
+                crate::layout::table_record(self.store.as_ref(), &db_id, &bare)?.map(|(tid, _)| tid)
+            }
+        } else {
+            crate::layout::table_record(self.store.as_ref(), &db_id, &bare)?.map(|(tid, _)| tid)
+        };
+        let Some(table_id) = table_id else {
             // No C++ table record yet (a native-only catalog before its first
             // layout rewrite): there is no counter to read, so the live ids are
             // the only history. They are correct here because nothing has been
@@ -2389,14 +2547,26 @@ impl Catalog {
                 *cached += 1;
                 *cached
             } else {
-                let previous = self
-                    .with_view(|store| store.get(tag.as_bytes()))?
-                    .and_then(|v| String::from_utf8_lossy(&v).parse::<u64>().ok())
-                    .unwrap_or(0);
+                let (previous, live_max) = self.with_view(|store| {
+                    let prev = store
+                        .get(tag.as_bytes())?
+                        .and_then(|v| String::from_utf8_lossy(&v).parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let live = if self.catalog_only {
+                        crate::layout::read_table_indexes(store, &db_id, &table_id.to_string())?
+                            .iter()
+                            .filter_map(|d| d.index_id)
+                            .max()
+                            .unwrap_or(0)
+                    } else {
+                        live_max(self)
+                    };
+                    Ok((prev, live))
+                })?;
                 // The counter is the authority, but a catalog that has records and no
                 // tag yet (one written before the tag existed) still has to start past
                 // the live ids.
-                let next_id = previous.max(live_max(self)) + 1;
+                let next_id = previous.max(live_max) + 1;
                 ids.insert((db_id, table_id), next_id);
                 next_id
             }
@@ -2440,22 +2610,72 @@ impl Catalog {
             // swept records the layout does not emit.
             let db_name = table.split('.').next().unwrap_or(table);
             let bare = table.rsplit('.').next().unwrap_or(table);
-            let (db_str, _) = self.db_and_bare_name(table)?;
-            let needs_columns = !meta.column.is_empty()
-                && !matches!(
-                    meta.index_type.as_str(),
-                    "HNSW" | "SPANN" | "FULLTEXT" | "BMP" | "SMVE" | "PLAID" | "EMVB" | "DISKANN"
-                );
-            let layout = if needs_columns {
-                crate::layout::read_table(self.store.as_ref(), db_name, bare)?
+            let has_pending_table_writes = self.capture.read().unwrap().as_ref().is_some_and(|c| {
+                c.view
+                    .keys()
+                    .any(|k| k.starts_with(b"catalog|tbl|") || k.starts_with(b"catalog|tbl_col|"))
+            });
+            let fast_cached = if !has_pending_table_writes && !meta.column.is_empty() {
+                let rec = self.table_records.lock().unwrap().get(table).copied();
+                let col_type = self.table_cache.lock().unwrap().get(table).and_then(|tm| {
+                    tm.columns
+                        .iter()
+                        .position(|c| c == &meta.column)
+                        .and_then(|i| tm.types.get(i).cloned())
+                });
+                rec.and_then(|(db_id_num, table_id_num, _)| {
+                    crate::layout::index_def_for_cached(&meta, bare, col_type.as_deref())
+                        .map(|def| (db_id_num.to_string(), table_id_num.to_string(), def))
+                })
             } else {
-                crate::layout::read_table_header_only(self.store.as_ref(), db_name, bare)?
+                None
             };
-            let Some(layout) = layout else {
-                return Err(Error::Catalog(format!("table '{table}' does not exist")));
-            };
-            let table_id = layout.table_id.to_string();
-            let mut batch: Vec<BatchItem> = Vec::new();
+            let (db_str, table_id, mut batch, fast_def) =
+                if let Some((db_str, table_id, def)) = fast_cached {
+                    (db_str, table_id, Vec::new(), Some(def))
+                } else {
+                    let (db_str, _) = self.db_and_bare_name(table)?;
+                    let needs_columns = !meta.column.is_empty()
+                        && !matches!(
+                            meta.index_type.as_str(),
+                            "HNSW"
+                                | "SPANN"
+                                | "FULLTEXT"
+                                | "BMP"
+                                | "SMVE"
+                                | "PLAID"
+                                | "EMVB"
+                                | "DISKANN"
+                        );
+                    let layout = if needs_columns {
+                        let target_col = meta
+                            .options
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("FUNC_COLUMN"))
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or(meta.column.as_str());
+                        crate::layout::read_table_for_column(
+                            self.store.as_ref(),
+                            db_name,
+                            bare,
+                            target_col,
+                        )?
+                    } else {
+                        crate::layout::read_table_header_only(self.store.as_ref(), db_name, bare)?
+                    };
+                    let Some(layout) = layout else {
+                        return Err(Error::Catalog(format!("table '{table}' does not exist")));
+                    };
+                    let table_id = layout.table_id.to_string();
+                    let def = if meta.column.is_empty() {
+                        None
+                    } else {
+                        Some(crate::layout::index_def_for(&meta, &layout).ok_or_else(|| {
+                            Error::Catalog(format!("index '{name}' has no C++ record"))
+                        })?)
+                    };
+                    (db_str, table_id, Vec::new(), def)
+                };
             if meta.column.is_empty() {
                 // An expression index has no `IndexBase`; the reference keeps
                 // it in a table tag (see `write_layout_batch`).
@@ -2477,7 +2697,7 @@ impl Catalog {
                 names.push(name.to_string());
                 batch.push((tag.into_bytes(), Some(names.join(",").into_bytes())));
             } else {
-                let def = crate::layout::index_def_for(&meta, &layout)
+                let def = fast_def
                     .ok_or_else(|| Error::Catalog(format!("index '{name}' has no C++ record")))?;
                 batch.push((
                     storage::catalog_format::catalog_index_key(
@@ -2527,6 +2747,73 @@ impl Catalog {
             .into_iter()
             .map(|(k, v)| IndexMeta::decode(&k[INDEX_PREFIX.len()..], &v))
             .collect()
+    }
+
+    /// Returns the column name if an index named `name` already exists on `table`.
+    pub fn find_index_for_table(&self, table: &str, name: &str) -> Result<Option<String>> {
+        if !self.catalog_only {
+            return Ok(self
+                .list_indexes_for_table(table)?
+                .into_iter()
+                .find(|im| im.name == name)
+                .map(|im| im.column));
+        }
+        let cached_ids = self.table_record_cached(table)?;
+        self.with_view(|store| {
+            let (db_id, table_id) = match cached_ids {
+                Some((db_id, table_id, _)) => (db_id.to_string(), table_id.to_string()),
+                None => {
+                    let db_name = table.split('.').next().unwrap_or(table);
+                    let bare = table.rsplit('.').next().unwrap_or(table);
+                    let Some(t) = crate::layout::read_table_header_only(store, db_name, bare)?
+                    else {
+                        return Ok(None);
+                    };
+                    (t.db_id.to_string(), t.table_id.to_string())
+                }
+            };
+            if let Some((index_id, ts)) =
+                crate::layout::index_record(store, &db_id, &table_id, name)?
+            {
+                let dropped = crate::layout::dropped_index_key(
+                    &db_id,
+                    &table_id,
+                    name,
+                    ts,
+                    &index_id.to_string(),
+                );
+                if store.get(dropped.as_bytes())?.is_none() {
+                    let tag = storage::catalog_format::catalog_index_tag_key(
+                        &db_id,
+                        &table_id,
+                        &index_id.to_string(),
+                        "index_base",
+                    );
+                    if let Some(bytes) = store.get(tag.as_bytes())? {
+                        if let Some(def) = value_format::index_def_from_bytes(&bytes) {
+                            return Ok(Some(
+                                def.base.column_names.into_iter().next().unwrap_or_default(),
+                            ));
+                        }
+                    }
+                    return Ok(Some(String::new()));
+                }
+            }
+            let tag = storage::catalog_format::catalog_table_tag_key(
+                &db_id,
+                &table_id,
+                "rust_name_only_indexes",
+            );
+            if let Some(bytes) = store.get(tag.as_bytes())? {
+                if String::from_utf8_lossy(&bytes)
+                    .split(',')
+                    .any(|s| s.trim() == name)
+                {
+                    return Ok(Some(String::new()));
+                }
+            }
+            Ok(None)
+        })
     }
 
     /// Lists the indexes belonging to a single table (`db.table` or bare name).

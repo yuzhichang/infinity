@@ -35,6 +35,41 @@
 // (which would need `unsafe`) nor a bit-at-a-time scalar loop.
 #![feature(portable_simd)]
 
+/// Total physical memory reported by the operating system, in bytes.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn physical_memory_bytes() -> Option<u64> {
+    // SAFETY: `sysconf` takes constant keys and does not access caller memory.
+    let (pages, page_size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(page_size).ok()?)
+}
+
+/// Total physical memory reported by the operating system, in bytes.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn physical_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut memory = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `memory` points to writable storage with the size the API requires.
+    (unsafe { GlobalMemoryStatusEx(&mut memory) } != 0).then_some(memory.ullTotalPhys)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn physical_memory_bytes() -> Option<u64> {
+    None
+}
+
 /// Releases free heap pages back to the OS, on every target.
 /// Long imports allocate per-batch buffers; without this the allocator retains
 /// them and RSS looks like a leak (Gate C).

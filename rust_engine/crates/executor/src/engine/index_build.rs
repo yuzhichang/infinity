@@ -643,7 +643,6 @@ impl Engine {
         index_id: u64,
         only_segment: Option<u32>,
     ) -> Result<()> {
-        let schema = self.table_schema(table)?;
         // Every secondary column has a chunk form, so the build only reads the
         // indexed column (not the wide vectors in the same row): `index_lookup`
         // merges the chunks with the in-memory tail.
@@ -657,28 +656,35 @@ impl Engine {
                 .get(&tkey)
                 .and_then(|e| e.secondary.functional.get(column).cloned())
         };
-        let (col_idx, type_upper) = match &functional {
-            Some(f) => {
-                let pos = schema
-                    .iter()
-                    .position(|c| c == &f.base)
-                    .ok_or_else(|| Error::Invalid(format!("unknown column '{}'", f.base)))?;
-                (pos, f.returns.clone())
-            }
-            None => {
-                let pos = schema
-                    .iter()
-                    .position(|c| c == column)
-                    .ok_or_else(|| Error::Invalid(format!("unknown column '{column}'")))?;
-                let ty = self
-                    .column_types(table)
-                    .ok()
-                    .and_then(|t| t.get(pos).cloned())
-                    .map(|t| t.trim().to_ascii_uppercase())
-                    .unwrap_or_default();
-                (pos, ty)
-            }
-        };
+        let (col_idx, type_upper) =
+            self.storage
+                .catalog
+                .with_cached_table(table, |meta| -> Result<(usize, String)> {
+                    match &functional {
+                        Some(f) => {
+                            let pos = meta.columns.iter().position(|c| c == &f.base).ok_or_else(
+                                || Error::Invalid(format!("unknown column '{}'", f.base)),
+                            )?;
+                            Ok((pos, f.returns.clone()))
+                        }
+                        None => {
+                            let pos =
+                                meta.columns
+                                    .iter()
+                                    .position(|c| c == column)
+                                    .ok_or_else(|| {
+                                        Error::Invalid(format!("unknown column '{column}'"))
+                                    })?;
+                            let ty = meta
+                                .types
+                                .get(pos)
+                                .map(|t| t.trim().to_ascii_uppercase())
+                                .unwrap_or_default();
+                            Ok((pos, ty))
+                        }
+                    }
+                })?
+                .ok_or_else(|| Error::NotFound(format!("table '{table}'")))??;
         // The tail is registered *before* the scan, not after: a row committed
         // while the scan runs must land somewhere, and the write hook can only
         // put it in a tail that already exists. `base` is the first row id the
@@ -730,6 +736,9 @@ impl Engine {
             .secondary
             .disk
             .remove(&index_id);
+        if base == 0 {
+            return Ok(());
+        }
         // `TINYINT`/`SMALLINT`/`BIGINT` are integral but do not start with
         // `INT`, and a functional index contributes its *return* type here
         // (`abs(c1)` over an integer is a `BIGINT`), so the classification asks

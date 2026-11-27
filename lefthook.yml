@@ -36,6 +36,16 @@ pre-commit:
               fi
           - name: trailing-whitespace
             stage_fixed: true
+            # Markdown uses two trailing spaces for a hard line break (`<br>`),
+            # so stripping them reflows every paragraph it touches: one edited
+            # example rewrote 700 lines of `http_api_reference.mdx`. The check
+            # stays on for source files, where trailing space is always noise,
+            # and off for prose anywhere in the tree, where it can be syntax.
+            # `eof` and `mixed-line-ending` still apply to prose.
+            exclude:
+              - "**/*.md"
+              - "**/*.mdx"
+              - "**/*.txt"
             run: |
               if [ "${LEFTHOOK_CHECK_ONLY:-}" = "1" ]; then
                 python3 tools/hooks/check_files.py trailing-whitespace {staged_files}

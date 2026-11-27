@@ -161,6 +161,60 @@ async fn start_background_tasks_sets_processor() {
     engine.drain_background_tasks().await;
     drop(engine);
 }
+
+#[tokio::test]
+async fn set_config_pauses_and_resumes_periodic_checkpoint() {
+    use std::time::Duration;
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap(),
+    );
+    engine
+        .start_background_tasks(
+            Duration::from_secs(1),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await;
+    assert_eq!(
+        engine.config_get("checkpoint_interval").as_deref(),
+        Some("1")
+    );
+    engine
+        .execute("SET CONFIG CHECKPOINT_INTERVAL 0")
+        .await
+        .unwrap();
+    engine
+        .execute("CREATE TABLE checkpoint_test (id INT)")
+        .await
+        .unwrap();
+    engine
+        .execute("INSERT INTO checkpoint_test VALUES (1)")
+        .await
+        .unwrap();
+    let commit_ts = engine.txn.current_ts();
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(engine.txn.synced_ts() < commit_ts);
+
+    engine
+        .execute("SET CONFIG CHECKPOINT_INTERVAL 1")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while engine.txn.synced_ts() < commit_ts {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the periodic checkpoint did not resume");
+}
+
 /// C++: `compact_segments_task_ut.cpp:73` (`bg_compact`).
 ///
 /// Eleven imports form eleven segments; compaction merges them (`segment_count`

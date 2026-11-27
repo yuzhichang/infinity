@@ -134,10 +134,9 @@ SIMD 侧同样核对过：向量化走 `std::simd`（`storage/src/simd.rs`、`co
 
 进程内存由一个 governor 统一管（`executor/src/memory.rs`），不让每个组件各管一段：
 
-- **上限**：`[buffer] buffer_manager_size`（`cli` 把它同时交给 `Engine::set_buffer_budget` 与
-  `set_memory_limit`）；没配时取 cgroup 的 `memory.max` × 0.9（v2 从本 cgroup 逐级向上取最紧的一个，
-  v1 读**进程自己** cgroup 的 `memory.limit_in_bytes`，不是挂载根的——根通常是"无限"）。
-  两者都没有（裸机且没配）时不治理，上限交给部署侧的 cgroup / systemd `MemoryMax`。
+- **上限**：`[buffer] buffer_manager_size` 为缓存预算和进程 RSS 上限。
+  未显式配置时，缓存预算取系统总内存的 90%，并受更小的 cgroup 内存限制约束。
+  裸机使用默认预算作为 RSS 上限。受 cgroup 限制时，默认 governor 按 cgroup 的用量和上限判断水位。
 - **水位**：低 70% / 高 85% / 临界 95%；cgroup 设了 `memory.high` 且落在 (低, 临界) 内时用内核那个。
 - **回收**（`memory_tick`，1 s tick，**不**前置于 `needs_cleanup`，否则只读实例永远不回收）：
   分配器（`mi_collect`）→ 全部存活映射的常驻页（`madvise(DONTNEED)`，按注册表游标轮转，
@@ -179,8 +178,8 @@ drop 的数据库。
 `mapped::MappedFile` 映射。映射本身在进程内共享：引擎的 `Context::block_maps` 每个 `BlockId` 只留一个
 `Arc<MappedBlock>`，同一块的并发读共用它，块被重写/压缩/删除时按表丢弃（`drop_block_maps`）。因此参考
 那套「读进预算内的 owned buffer + LRU 淘汰 + 溢出到临时文件 + 句柄引用计数」没有对应物：`BufferObj` /
-`BufferHandle` / `BufferPool` / `FileWorker` / `VarBuffer` 都不再存在，`[buffer] buffer_manager_size`
-仍被解析（C++ 配置要能加载）但被忽略，索引缓冲用内置的 8 GiB 预算。`SHOW BUFFERS` 因此一行对应一个映射（路径是块目录，状态 `Loaded`、类型 `Mmap`），
+`[buffer] buffer_manager_size` 为块映射和解码后的 HNSW chunk 提供预算。
+`SHOW BUFFERS` 每行对应一个映射（路径是块目录，状态 `Loaded`、类型 `Mmap`），
 `buffer_pool_usage` 是已映射字节/预算，`SHOW VARIABLES` 的 `buffered_object_count` 是映射数。
 未封存的行（append buffer）本来就在引擎的 `TableEntry::pending_rows` 里，按表一份，所有读者共享。
 

@@ -41,7 +41,7 @@ impl PreparedText {
     /// The terms for `seq`, taken out of the batch. `None` when the position is
     /// outside the batch or another pass already took it.
     fn take(&mut self, column: &str, seq: usize) -> Option<PreparedTerms> {
-        let position = self.seqs.iter().position(|held| *held == seq)?;
+        let position = self.seqs.binary_search(&seq).ok()?;
         let (_, rows) = self.columns.iter_mut().find(|(name, _)| name == column)?;
         rows.get_mut(position)?.take()
     }
@@ -2272,12 +2272,12 @@ impl Engine {
         if jobs.is_empty() {
             return None;
         }
-        let columns: Vec<(String, Vec<Option<PreparedTerms>>)> = if cells.len() >= 16 {
-            let cells_bg = Arc::clone(cells);
-            tokio::task::spawn_blocking(move || {
+        let prepare = {
+            let cells = Arc::clone(cells);
+            move || {
                 jobs.into_iter()
                     .map(|(column, ci, tokenizer)| {
-                        let rows = cells_bg
+                        let rows = cells
                             .iter()
                             .map(|row| {
                                 let text = row.get(ci)?;
@@ -2287,24 +2287,15 @@ impl Engine {
                             .collect();
                         (column, rows)
                     })
-                    .collect()
-            })
-            .await
-            .unwrap_or_default()
+                    .collect::<Vec<_>>()
+            }
+        };
+        let columns = if cells.len() >= 16 {
+            tokio::task::spawn_blocking(prepare)
+                .await
+                .unwrap_or_default()
         } else {
-            jobs.into_iter()
-                .map(|(column, ci, tokenizer)| {
-                    let rows = cells
-                        .iter()
-                        .map(|row| {
-                            let text = row.get(ci)?;
-                            let doc = prepare_doc(0, text, &tokenizer);
-                            Some((doc.terms, doc.cost))
-                        })
-                        .collect();
-                    (column, rows)
-                })
-                .collect()
+            prepare()
         };
         if columns.is_empty() {
             return None;
@@ -3063,6 +3054,27 @@ impl Engine {
     /// (`flush_at_once` / `only_write` / `flush_per_second`).
     pub fn set_wal_flush(&self, mode: txn::WalFlush) {
         self.txn.set_wal_flush(mode);
+    }
+
+    /// `[wal] wal_flush` as it is in effect, for `SHOW CONFIGS`.
+    pub fn wal_flush(&self) -> txn::WalFlush {
+        self.txn.wal_flush()
+    }
+
+    /// Seeds the queryable config map from the resolved config file.
+    ///
+    /// `SHOW CONFIGS` used to report hardcoded literals for every key except the
+    /// two it could read live, so `log_level = "debug"` in a config file came
+    /// back as `"info"`. The values here are the ones the file produced (or the
+    /// defaults when it named nothing), so a getter reads the same map
+    /// `SET CONFIG` writes to and the two cannot disagree.
+    ///
+    /// Call once after `Engine::open_async`, before the front ends serve.
+    pub fn seed_config(&self, values: impl IntoIterator<Item = (&'static str, String)>) {
+        let mut config = self.context.config.lock().unwrap();
+        for (key, value) in values {
+            config.insert(key.to_string(), value);
+        }
     }
 
     /// Sets the decoded-block budget (C++ `BufferManager`'s

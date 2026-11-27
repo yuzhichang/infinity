@@ -35,18 +35,17 @@ import (
 
 // config is everything the run needs, read from the environment.
 type config struct {
-	Server    string
-	Mapping   string
-	Model     string
-	Scenario  Scenario
-	Seed      int64
-	Queries   int
-	Sparsegram bool
-	Skew      bool
-	IndexLast    bool // P1b: load first, then build indexes
-	Batches      int  // concurrent ingest/DDL workers
-	QueryWorkers int  // concurrent query workers
-	LimitTables  int  // 0 = all tables in the scenario
+	Server      string
+	Mapping     string
+	Model       string
+	Scenario    Scenario
+	Seed        int64
+	Queries     int
+	Sparsegram  bool
+	Skew        bool
+	IndexLast   bool // P1b: load first, then build indexes
+	Connections int  // fixed number of Thrift clients
+	LimitTables int  // 0 = all tables in the scenario
 }
 
 func loadConfig(t *testing.T) config {
@@ -88,22 +87,62 @@ func loadConfig(t *testing.T) config {
 	}
 
 	return config{
-		Server:   server,
-		Mapping:  mapping,
-		Model:    model,
-		Scenario: sc,
-		Seed:     int64(getenvInt("LT_SEED", 20261124)),
-		Queries:  getenvInt("LT_QUERIES", 200),
-		Sparsegram: os.Getenv("LT_SPARSEGRAM") != "",
-		Skew:     os.Getenv("LT_SKEW") != "",
-		IndexLast:    os.Getenv("LT_INDEX_LAST") != "",
-		Batches:      getenvInt("LT_BATCHES", 4),
-		QueryWorkers: getenvInt("LT_QUERY_WORKERS", 4),
+		Server:      server,
+		Mapping:     mapping,
+		Model:       model,
+		Scenario:    sc,
+		Seed:        int64(getenvInt("LT_SEED", 20261124)),
+		Queries:     getenvInt("LT_QUERIES", 200),
+		Sparsegram:  os.Getenv("LT_SPARSEGRAM") != "",
+		Skew:        os.Getenv("LT_SKEW") != "",
+		IndexLast:   os.Getenv("LT_INDEX_LAST") != "",
+		Connections: connectionCount(sc.Name, runtime.NumCPU()),
 		// LimitTables trims the plan to the first N tables. It exists so a run
 		// fits inside a window where the machine is not reclaimed underneath it;
 		// it is not a way to measure a smaller workload (the per-table shape is
 		// unchanged, so the numbers stay comparable).
 		LimitTables: getenvInt("LT_LIMIT_TABLES", 0),
+	}
+}
+
+func connectionCount(scenario string, cpus int) int {
+	base := strings.SplitN(scenario, "/", 2)[0]
+	multiplier := 1
+	switch base {
+	case "L":
+		multiplier = 2
+	case "XL":
+		multiplier = 5
+	}
+	return max(1, cpus) * multiplier
+}
+
+func TestConnectionCount(t *testing.T) {
+	const cpus = 8
+	cases := []struct {
+		scenario string
+		want     int
+	}{
+		{"S", cpus},
+		{"M", cpus},
+		{"L", cpus * 2},
+		{"L/100", cpus * 2},
+		{"XL", cpus * 5},
+		{"XL/100", cpus * 5},
+		{"S:10x200", cpus},
+		{"L:10x200", cpus * 2},
+	}
+	for _, tc := range cases {
+		sc, err := parseScenario(tc.scenario)
+		if err != nil {
+			t.Fatalf("parseScenario(%q): %v", tc.scenario, err)
+		}
+		if got := connectionCount(sc.Name, cpus); got != tc.want {
+			t.Errorf("connectionCount(%q, %d) = %d, want %d", sc.Name, cpus, got, tc.want)
+		}
+	}
+	if got := connectionCount("L", 0); got != 2 {
+		t.Errorf("connectionCount(\"L\", 0) = %d, want 2", got)
 	}
 }
 
@@ -203,6 +242,7 @@ type Run struct {
 	emb           *Embedder
 	alloc         Allocation
 	engine        *Engine
+	clients       []*Engine
 
 	createdMu     sync.Mutex
 	createdTables []string
@@ -293,13 +333,31 @@ func (r *Run) Execute() {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer eng.Close()
 	r.engine = eng
-	t.Cleanup(r.cleanupOnExit)
-	r.record("setup", time.Since(start), 0, "mapping+corpus+embedder+connect")
+	r.clients = append(r.clients, eng)
+	defer func() {
+		r.cleanupOnExit()
+		for _, client := range r.clients {
+			client.Close()
+		}
+	}()
+	for len(r.clients) < r.Cfg.Connections {
+		client, err := Connect(host, port, r.dbName, m, 1024)
+		if err != nil {
+			t.Fatalf("connect client %d/%d: %v", len(r.clients)+1, r.Cfg.Connections, err)
+		}
+		r.clients = append(r.clients, client)
+	}
+	t.Logf("Thrift clients: %d (Go NumCPU=%d, scenario=%s)", len(r.clients), runtime.NumCPU(), r.Cfg.Scenario.Name)
+	r.record("setup", time.Since(start), 0, "mapping+corpus+embedder+clients")
 
 	// ---- P0: create tables ----------------------------------------------
 	r.phaseCreate()
+	if os.Getenv("LT_CREATE_ONLY") != "" {
+		r.phaseTeardown()
+		r.printReport()
+		return
+	}
 
 	// ---- P1: ingest ------------------------------------------------------
 	r.phaseIngest()
@@ -309,6 +367,9 @@ func (r *Run) Execute() {
 		r.phaseIndex()
 	}
 
+	// ---- P2b: seal the indexes ------------------------------------------
+	r.phaseDumpIndex()
+
 	// ---- queries --------------------------------------------------------
 	queries, err := BuildQueries(rand.New(rand.NewSource(r.Cfg.Seed)), r.corpus, r.alloc, r.emb, r.Cfg.Queries)
 	if err != nil {
@@ -317,6 +378,11 @@ func (r *Run) Execute() {
 	// Exercise each kind against the same query set, so the difference between
 	// the numbers is the query shape and nothing else.
 	kinds := []string{"dense", "text", "hybrid", "filtered", "like", "point"}
+	if os.Getenv("LT_PROBE_INDEX") != "" {
+		// Attribution runs: the index path, the index path without the filter,
+		// and the no-index control. Not part of the production mix.
+		kinds = []string{"dense", "denseidx", "scan"}
+	}
 	for _, k := range kinds {
 		r.phaseQueries(k, withKind(queries, k))
 	}
@@ -367,20 +433,48 @@ func (r *Run) phaseCreate() {
 	}
 
 	start := time.Now()
-	// Step 1: CREATE TABLE serially (catalog next_table_id is a single key).
-	for i, name := range r.alloc.Names {
-		if _, err := r.engine.CreateTable(name, false, r.Cfg.Sparsegram); err != nil {
-			r.T.Fatalf("create table %d/%d (%s): %v", i+1, len(r.alloc.Names), name, err)
+	// Step 1: CREATE TABLE in parallel over the fixed client pool.
+	if len(r.alloc.Names) > 0 {
+		if len(r.clients) == 0 {
+			r.T.Fatal("no Thrift clients")
 		}
-		r.trackCreated(name)
+		workers := min(len(r.clients), len(r.alloc.Names))
+		jobs := make(chan string, len(r.alloc.Names))
+		for _, name := range r.alloc.Names {
+			jobs <- name
+		}
+		close(jobs)
+		var wg sync.WaitGroup
+		errCh := make(chan error, len(r.alloc.Names))
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func(worker int) {
+				defer wg.Done()
+				eng := r.clients[worker]
+				for name := range jobs {
+					if _, err := eng.CreateTable(name, false, r.Cfg.Sparsegram); err != nil {
+						errCh <- fmt.Errorf("create table %s: %w", name, err)
+						return
+					}
+					r.trackCreated(name)
+				}
+			}(w)
+		}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			r.T.Fatalf("create table: %v", err)
+		}
 	}
-	// Step 2: CREATE INDEX concurrently across tables.
+	tableDuration := time.Since(start)
+	r.T.Logf("P0 tables: %d tables in %.2fs (%.1f tables/s)", len(r.alloc.Names), tableDuration.Seconds(), float64(len(r.alloc.Names))/tableDuration.Seconds())
+	indexStart := time.Now()
+	// Step 2: CREATE INDEX in parallel over the same client pool.
 	if !r.Cfg.IndexLast && len(r.alloc.Names) > 0 {
-		host, port, err := splitHostPort(r.Cfg.Server)
-		if err != nil {
-			r.T.Fatalf("splitHostPort: %v", err)
+		if len(r.clients) == 0 {
+			r.T.Fatal("no Thrift clients")
 		}
-		workers := min(max(1, getenvInt("LT_DDL_WORKERS", 16)), len(r.alloc.Names))
+		workers := min(len(r.clients), len(r.alloc.Names))
 		jobs := make(chan string, len(r.alloc.Names))
 		for _, name := range r.alloc.Names {
 			jobs <- name
@@ -391,16 +485,11 @@ func (r *Run) phaseCreate() {
 		errCh := make(chan error, len(r.alloc.Names))
 		for w := 0; w < workers; w++ {
 			wg.Add(1)
-			go func() {
+			go func(worker int) {
 				defer wg.Done()
-				eng, err := Connect(host, port, r.dbName, r.mapping, 1024)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				defer eng.Close()
+				eng := r.clients[worker]
 				for name := range jobs {
-					tbl, err := eng.DB.GetTable(name)
+					tbl, err := eng.Table(name)
 					if err != nil {
 						errCh <- fmt.Errorf("get table %s: %w", name, err)
 						return
@@ -410,18 +499,22 @@ func (r *Run) phaseCreate() {
 						return
 					}
 				}
-			}()
+			}(w)
 		}
 		wg.Wait()
 		close(errCh)
 		for err := range errCh {
 			r.T.Fatalf("create indexes: %v", err)
 		}
+		indexDuration := time.Since(indexStart)
+		count := len(r.alloc.Names) * r.mapping.IndexObjects(r.Cfg.Sparsegram)
+		r.T.Logf("P0 indexes: %d indexes in %.2fs (%.1f indexes/s)", count, indexDuration.Seconds(), float64(count)/indexDuration.Seconds())
 	}
 	dur := time.Since(start)
 	n := len(r.alloc.Names)
-	r.record("P0 create", dur, 0, fmt.Sprintf("%d tables x %d columns + %d indexes, %.1f ms/table",
-		n, len(r.mapping.Columns)+1, r.mapping.IndexObjects(r.Cfg.Sparsegram), float64(dur.Milliseconds())/float64(n)))
+	r.record("P0 create", dur, 0, fmt.Sprintf("%d tables x %d columns + %d indexes, %d clients, %.1f ms/table",
+		n, len(r.mapping.Columns)+1, r.mapping.IndexObjects(r.Cfg.Sparsegram), len(r.clients),
+		float64(dur.Milliseconds())/float64(max(1, n))))
 }
 
 // dropExisting removes tables left by an earlier run, plus any P7 writer tables.
@@ -516,21 +609,17 @@ func (r *Run) phaseIngest() {
 	}()
 	defer close(done)
 
-	workers := max(1, r.Cfg.Batches)
+	workers := min(len(r.clients), len(r.alloc.Names))
+	if len(r.alloc.Names) > 0 && workers == 0 {
+		t.Fatal("P1 ingest: no Thrift clients")
+	}
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
-			// One connection per worker: the engine's per-connection state is
-			// not shared, and reusing one connection across goroutines would
-			// serialise the inserts and measure the SDK's mutex.
-			host, port, _ := splitHostPort(r.Cfg.Server)
-			eng, err := Connect(host, port, r.dbName, r.mapping, 1024)
-			if err != nil {
-				errCh <- fmt.Errorf("worker %d connect: %w", worker, err)
-				return
-			}
-			defer eng.Close()
+			// One pooled connection per worker; no SDK connection is shared
+			// between goroutines.
+			eng := r.clients[worker]
 
 			for j := range jobs {
 				idx := j.idx
@@ -538,7 +627,7 @@ func (r *Run) phaseIngest() {
 				if rows == 0 {
 					continue
 				}
-				tbl, err := eng.DB.GetTable(r.alloc.Names[idx])
+				tbl, err := eng.Table(r.alloc.Names[idx])
 				if err != nil {
 					errCh <- fmt.Errorf("get table %s: %w", r.alloc.Names[idx], err)
 					return
@@ -633,7 +722,7 @@ func (r *Run) phaseIndex() {
 		if r.alloc.Rows[i] == 0 {
 			continue
 		}
-		tbl, err := r.engine.DB.GetTable(name)
+		tbl, err := r.engine.Table(name)
 		if err != nil {
 			t.Fatalf("P2 get table %s: %v", name, err)
 		}
@@ -648,6 +737,59 @@ func (r *Run) phaseIndex() {
 	dur := time.Since(start)
 	r.record("P2 index", dur, totalRows, fmt.Sprintf("%d index objects per table over %d rows, %.1f ms/row",
 		r.mapping.IndexObjects(r.Cfg.Sparsegram), totalRows, float64(dur.Milliseconds())/float64(max(1, totalRows))))
+}
+
+// phaseDumpIndex is P2b: seal each table's indexes into their chunks.
+//
+// Without it every query reads the in-memory tail, not the chunk: `CREATE INDEX`
+// builds the graph in `hnsw_mem` and only a dump publishes it, and a query over
+// a tail is a different code path (and, while a build holds the graph's
+// `tokio::sync::Mutex`, a skipped one). Production dumps (`DumpMemIndex`), so a
+// latency measured on tails is not the latency production sees. `LT_DUMP_INDEX=0`
+// keeps the tails on purpose, to compare the two.
+func (r *Run) phaseDumpIndex() {
+	if os.Getenv("LT_DUMP_INDEX") == "0" {
+		r.T.Log("P2b skipped: LT_DUMP_INDEX=0, queries will read the in-memory tails")
+		return
+	}
+	t := r.T
+	start := time.Now()
+	dumped := 0
+	for i, name := range r.alloc.Names {
+		if r.alloc.Rows[i] == 0 {
+			continue
+		}
+		tbl, err := r.engine.Table(name)
+		if err != nil {
+			t.Fatalf("P2b get table %s: %v", name, err)
+		}
+		// One dump per index: the server dumps the named index only.
+		for _, info := range r.indexNames(name) {
+			if _, err := tbl.DumpIndex(info); err != nil {
+				t.Fatalf("P2b dump %s.%s: %v", name, info, err)
+			}
+			dumped++
+		}
+		if i%25 == 0 {
+			t.Logf("P2b: %d/%d tables sealed (%.0fs)", i+1, len(r.alloc.Names), time.Since(start).Seconds())
+		}
+	}
+	dur := time.Since(start)
+	r.record("P2b dump", dur, 0, fmt.Sprintf("%d indexes sealed over %d tables, %.1f ms/index",
+		dumped, len(r.alloc.Names), float64(dur.Milliseconds())/float64(max(1, dumped))))
+}
+
+// indexNames lists the index names CreateIndexes creates for a table.
+func (r *Run) indexNames(table string) []string {
+	var out []string
+	for _, ft := range r.mapping.FullTextIndexes(r.Cfg.Sparsegram) {
+		out = append(out, SafeIndexName("ft_", ft[0], ft[1]))
+	}
+	for _, col := range r.mapping.SecondaryIndexes() {
+		out = append(out, strings.TrimSuffix(SafeIndexName("sec_", col, ""), "_"))
+	}
+	out = append(out, "vec_idx")
+	return out
 }
 
 // withKind copies specs under another query kind, keeping text and vector.
@@ -665,11 +807,9 @@ func withKind(specs []QuerySpec, kind string) []QuerySpec {
 	return out
 }
 
-// phaseQueries runs one query kind N times sequentially and reports latency.
-//
-// Sequential on one connection: this measures the engine, not the client. The
-// concurrency phases (P4/P5) are what measure the engine under load, and
-// concurrency in this phase would confound the two.
+// phaseQueries runs one query kind across the fixed client pool and reports
+// latency. The pool is opened during setup, so connection setup is not part of
+// any query measurement.
 func (r *Run) phaseQueries(kind string, specs []QuerySpec) {
 	if kind == "point" {
 		// Resolve a real id per table so the point lookup is not a miss.
@@ -678,14 +818,10 @@ func (r *Run) phaseQueries(kind string, specs []QuerySpec) {
 	ctx := context.Background()
 	start := time.Now()
 	var timings []Timed
-	if r.Cfg.QueryWorkers <= 1 {
+	if len(r.clients) <= 1 {
 		timings = r.engine.RunSequential(ctx, specs)
 	} else {
-		host, port, err := splitHostPort(r.Cfg.Server)
-		if err != nil {
-			r.T.Fatalf("splitHostPort: %v", err)
-		}
-		timings = RunConcurrent(ctx, host, port, r.dbName, r.mapping, 1024, specs, r.Cfg.QueryWorkers)
+		timings = RunConcurrent(ctx, r.clients, specs)
 	}
 	dur := time.Since(start)
 
@@ -771,8 +907,8 @@ func sortDurations(xs []time.Duration) {
 func (r *Run) phaseMixed(queries []QuerySpec) {
 	t := r.T
 	hybrid := withKind(queries, "hybrid")
-	readers := getenvInt("LT_READERS", 8)
-	writers := getenvInt("LT_WRITERS", 2)
+	readers := min(max(0, getenvInt("LT_READERS", 8)), len(r.clients))
+	writers := min(max(0, getenvInt("LT_WRITERS", 2)), len(r.clients)-readers)
 	dur := time.Duration(getenvInt("LT_MIXED_SECONDS", 20)) * time.Second
 	if len(hybrid) == 0 {
 		t.Log("P7 skipped: no queries")
@@ -824,14 +960,7 @@ func (r *Run) phaseMixed(queries []QuerySpec) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			host, port, _ := splitHostPort(r.Cfg.Server)
-			eng, err := Connect(host, port, r.dbName, r.mapping, 1024)
-			if err != nil {
-				readErrs.Add(1)
-				firstReadErrOnce.Do(func() { firstReadErr = err })
-				return
-			}
-			defer eng.Close()
+			eng := r.clients[id]
 			lats := make([]time.Duration, 0, 512)
 			j := id
 			for phaseCtx.Err() == nil {
@@ -862,15 +991,9 @@ func (r *Run) phaseMixed(queries []QuerySpec) {
 		}(i)
 	}
 
-	// Writers: new tables, filled while the readers run.
-	//
-	// CREATE TABLE is serialised across writers: the catalog write
-	// (`db|2|next_table_id`) is a single RocksDB key, and two concurrent creates
-	// lose the race with "Resource busy" (measured). That is a real server
-	// limitation worth noting in the report, not something to paper over with
-	// retries inside a timing loop, so the writers take a lock and the creates
-	// are counted as their own step.
-	var createMu sync.Mutex
+	// Writers: new tables, filled while the readers run. Each writer owns one
+	// pooled client so concurrent CREATE TABLE statements exercise the server's
+	// DDL path without sharing a Thrift connection.
 	var written atomic.Int64
 	var writerErrMu sync.Mutex
 	var writerErrs []error
@@ -879,20 +1002,18 @@ func (r *Run) phaseMixed(queries []QuerySpec) {
 		writerErrs = append(writerErrs, err)
 		writerErrMu.Unlock()
 	}
+	// Per writer, not for the phase. A shared cap makes the writer count a
+	// no-op: at `LT_WRITER_ROWS=400` a run with 2 writers and one with 6 both
+	// stopped at ~400 rows total, so raising LT_WRITERS measured nothing. Each
+	// writer now runs its own budget, so write pressure scales with the count.
+	writerRows := getenvInt("LT_WRITER_ROWS", 2000)
 	for i := 0; i < writers; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			host, port, _ := splitHostPort(r.Cfg.Server)
-			eng, err := Connect(host, port, r.dbName, r.mapping, 1024)
-			if err != nil {
-				recordWriterErr(fmt.Errorf("writer %d connect: %w", id, err))
-				return
-			}
-			defer eng.Close()
+			eng := r.clients[readers+id]
 
 			name := fmt.Sprintf("ragflow_lt_w%d_%d", id, time.Now().UnixNano()%100000)
-			createMu.Lock()
 			// P7 writer tables are always created without indexes, regardless of
 			// LT_INDEX_LAST. Reason, measured: a CREATE INDEX issued on a table
 			// that already has rows, while another connection is running SELECT,
@@ -902,7 +1023,6 @@ func (r *Run) phaseMixed(queries []QuerySpec) {
 			// exercise the load-then-index order; that order is measured in P1
 			// where nothing else is running.
 			tbl, err := eng.CreateTable(name, false, r.Cfg.Sparsegram)
-			createMu.Unlock()
 			if err != nil {
 				recordWriterErr(fmt.Errorf("writer %d create %s: %w", id, name, err))
 				return
@@ -910,7 +1030,8 @@ func (r *Run) phaseMixed(queries []QuerySpec) {
 			defer eng.DB.DropTable(name, infinity.ConflictTypeIgnore)
 			rng := rand.New(rand.NewSource(r.Cfg.Seed + int64(id)*104729))
 			rb := &RowBuilder{Mapping: r.mapping, Dim: r.emb.Dim()}
-			for ctx.Err() == nil && written.Load() < int64(getenvInt("LT_WRITER_ROWS", 400)) {
+			mine := 0
+			for ctx.Err() == nil && mine < writerRows {
 				rows := make([]Row, 0, 32)
 				texts := make([]string, 0, 32)
 				for k := 0; k < 32; k++ {
@@ -933,6 +1054,7 @@ func (r *Run) phaseMixed(queries []QuerySpec) {
 					return
 				}
 				written.Add(int64(len(rows)))
+				mine += len(rows)
 			}
 		}(i)
 	}
@@ -949,8 +1071,8 @@ func (r *Run) phaseMixed(queries []QuerySpec) {
 	if writers > 0 && len(writerErrs) > 0 {
 		r.T.Errorf("P7: %d writer error(s); first: %v", len(writerErrs), writerErrs[0])
 	}
-	detail := fmt.Sprintf("%d readers / %d writers for %s: %d reads, p50 %s p99 %s, %d read errors, %d rows written",
-		readers, writers, dur, len(all), p50.Round(time.Microsecond), p99.Round(time.Microsecond),
+	detail := fmt.Sprintf("%d readers / %d writers for %s (%d fixed clients): %d reads, p50 %s p99 %s, %d read errors, %d rows written",
+		readers, writers, dur, len(r.clients), len(all), p50.Round(time.Microsecond), p99.Round(time.Microsecond),
 		readErrs.Load(), written.Load())
 	if firstReadErr != nil {
 		detail += fmt.Sprintf("; first error: %v", firstReadErr)
@@ -992,15 +1114,9 @@ func (r *Run) cleanupOnExit() {
 			r.T.Errorf("cleanup teardown failed: %s", strings.Join(errs, "; "))
 		}
 	}
-	if r.dbName != "" {
-		host, port, err := splitHostPort(r.Cfg.Server)
-		if err == nil {
-			if eng, err := Connect(host, port, r.dbName, r.mapping, 1024); err == nil {
-				if _, err := eng.Conn.DropDatabase(r.dbName, infinity.ConflictTypeIgnore); err != nil {
-					r.T.Logf("cleanup drop database %s: %v", r.dbName, err)
-				}
-				eng.Close()
-			}
+	if r.dbName != "" && r.engine != nil && r.engine.Conn != nil {
+		if _, err := r.engine.Conn.DropDatabase(r.dbName, infinity.ConflictTypeIgnore); err != nil {
+			r.T.Logf("cleanup drop database %s: %v", r.dbName, err)
 		}
 	}
 }
@@ -1015,11 +1131,10 @@ func (r *Run) dropTableList(names []string) (int64, []string) {
 		errMu.Unlock()
 	}
 	if len(names) > 0 {
-		host, port, err := splitHostPort(r.Cfg.Server)
-		if err != nil {
-			return 0, []string{fmt.Sprintf("splitHostPort: %v", err)}
+		if len(r.clients) == 0 {
+			return 0, []string{"no Thrift clients"}
 		}
-		workers := min(max(1, getenvInt("LT_DDL_WORKERS", 16)), len(names))
+		workers := min(len(r.clients), len(names))
 		jobs := make(chan string, len(names))
 		for _, name := range names {
 			jobs <- name
@@ -1028,14 +1143,9 @@ func (r *Run) dropTableList(names []string) (int64, []string) {
 		var wg sync.WaitGroup
 		for w := 0; w < workers; w++ {
 			wg.Add(1)
-			go func() {
+			go func(worker int) {
 				defer wg.Done()
-				eng, err := Connect(host, port, r.dbName, r.mapping, 1024)
-				if err != nil {
-					addErr(fmt.Sprintf("teardown connect: %v", err))
-					return
-				}
-				defer eng.Close()
+				eng := r.clients[worker]
 				for name := range jobs {
 					if _, err := eng.DB.DropTable(name, infinity.ConflictTypeIgnore); err != nil {
 						addErr(fmt.Sprintf("drop %s: %v", name, err))
@@ -1043,7 +1153,7 @@ func (r *Run) dropTableList(names []string) (int64, []string) {
 					}
 					dropped.Add(1)
 				}
-			}()
+			}(w)
 		}
 		wg.Wait()
 	}
@@ -1056,6 +1166,7 @@ func (r *Run) printReport() {
 	var b strings.Builder
 	b.WriteString("\n=== load test report ===\n")
 	fmt.Fprintf(&b, "scenario     %s (skew=%v)\n", r.Cfg.Scenario.Name, r.effectiveSkew)
+	fmt.Fprintf(&b, "clients      %d (Go NumCPU=%d)\n", len(r.clients), runtime.NumCPU())
 	fmt.Fprintf(&b, "database     %s\n", r.dbName)
 	if r.mappingSHA != "" {
 		fmt.Fprintf(&b, "mapping      sha256 %s\n", r.mappingSHA)

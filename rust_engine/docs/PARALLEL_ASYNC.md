@@ -305,7 +305,7 @@ C++ 参考也是整包物化：Thrift 的 `Select` 签名就是 `Select(SelectRe
 - `scheduler()` 的 runtime **不设** `max_blocking_threads`（实测 `cores+4` 会让池成为已由核数约束的工作的瓶颈）。`INFINITY_BLOCKING_THREADS` 仅作为线程预算紧的机器上的逃生阀，默认不设。阻塞池里合法的常驻项只有三样：每表 bottom 排空、行分配器的长驻消费者、fragment 的 sink。
 - **请求积压一律有界**：`operator/mod.rs` 的 exchange 用 `tokio::sync::mpsc::channel(1024)`；`bg_task.rs` 的队列 1024；行分配器（`engine/statements.rs` 的 `Allocator`）现为 `tokio::sync::mpsc::channel(ALLOC_QUEUE_CAPACITY = 1024)`——每次 append 都在等自己的答复，所以队列里只有分配器尚未取走的活，上限存在只是为了分配器卡住时不会被灌爆。
 
-**连接不设上限**（实现后修正）：volo 每连接一个 task，空闲连接不占线程（1000 条实测 23 线程 / 109 MB），所以参考的 `connection_pool_size` 和原计划的连接 `Semaphore` 都没有作用对象，A3 里把 `ConnGate` 与 `INFINITY_MAX_CONNECTIONS` 删掉了。会话状态用 `Engine::with_session`（执行线程上的 `SessionScope`，panic 也会恢复）；请求顺序由 tokio 的 per-connection task 保证。feature 需 `rt-multi-thread`、`rt`、`net`、`io-util`、`time`、`sync`（`Cargo.toml` 已补）。`ScanGate`（`state.rs:2960`）不是连接限流。请求侧已无任何许可（见上条）：同时在处理的请求数不设上限，decoded 峰值由协议级硬上限（§6.2.1，单条消息的大小）与阻塞池的线程数约束，而不是按“核数 × 单请求”推算。
+**连接不设上限**（实现后修正）：volo 每连接一个 task，空闲连接不占线程（1000 条实测 23 线程 / 109 MB），所以参考的 `connection_pool_size` 和原计划的连接 `Semaphore` 都没有作用对象，A3 里把 `ConnGate` 与 `INFINITY_MAX_CONNECTIONS` 删掉了。会话状态用 `Engine::with_session`（执行线程上的 `SessionScope`，panic 也会恢复）；请求顺序由 tokio 的 per-connection task 保证。feature 需 `rt-multi-thread`、`rt`、`net`、`io-util`、`time`、`sync`（`Cargo.toml` 已补）。查询侧同样不设许可：原 `ScanGate`（全表文本/向量扫描的并发闸）已删除——实测它把 dense/text/hybrid/filtered 的 p50 拉高 31–55%，而 gate=2 与 gate=32 的峰值 RSS 完全相同（1255 vs 1254 MiB），即它保护的内存前提不成立；HNSW 检索只读 `ef` 个候选，WAND 走惰性 posting 流，都不物化全表。请求侧已无任何许可（见上条）：同时在处理的请求数不设上限，decoded 峰值由协议级硬上限（§6.2.1，单条消息的大小）与阻塞池的线程数约束，而不是按“核数 × 单请求”推算。
 
 ### 6.6 CPU 密集型扇出：tokio task + Semaphore（不用 rayon，也不用自建线程池）
 

@@ -3135,33 +3135,14 @@ The response includes a JSON object like the following:
 
 ```shell
 {
-    "buffer_manager_size":"4294967296",
-    "cleanup_interval":"10",
-    "client_port":"23817",
-    "compact_interval":"10",
-    "connection_pool_size":"256",
-    "cpu_limit":"16",
-    "data_dir":"/var/infinity/data",
-    "error_code":0,
-    "checkpoint_interval":"30",
-    "http_port":"23820",
-    "log_dir":"/var/infinity/log",
-    "log_file_max_size":"1073741824",
-    "log_file_rotate_count":"8",
-    "log_filename":"infinity.log",
-    "log_level":"Info",
-    "log_to_stdout":"False",
-    "mem_index_capacity":"65536",
-    "optimize_interval":"10",
-    "postgres_port":"5432",
-    "resource_dir":"/usr/share/infinity/resource",
-    "server_address":"0.0.0.0",
-    "temp_dir":"/var/infinity/tmp",
-    "time_zone":"UTC+8",
-    "version":"0.7.5",
-    "wal_compact_threshold":"1073741824",
-    "wal_dir":"/var/infinity/wal",
-    "wal_flush":"FlushAtOnce"
+    "cache_result_capacity":1024,
+    "checkpoint_interval":10,
+    "cleanup_interval":60,
+    "log_level":"info",
+    "optimize_interval":30,
+    "result_cache":"off",
+    "wal_flush":"flush_per_second",
+    "error_code":0
 }
 ```
 
@@ -4433,35 +4414,14 @@ The response includes a JSON object like the following:
 
 ```shell
 {
-    "buffer_manager_size":"4294967296",
-    "cleanup_interval":"60",
-    "client_port":"23818",
-    "compact_interval":"120",
-    "connection_pool_size":"128",
-    "cpu_limit":"16",
-    "data_dir":"/var/infinity/leader/data",
-    "error_code":0,
-    "checkpoint_interval":"86400",
-    "http_port":"23821",
-    "log_dir":"/var/infinity/leader/log",
-    "log_file_max_size":"10737418240",
-    "log_file_rotate_count":"10",
-    "log_filename":"infinity.log",
-    "log_level":"Debug",
-    "log_to_stdout":"true",
-    "mem_index_capacity":"65536",
-    "optimize_interval":"10",
-    "peer_server_connection_pool_size":"64",
-    "postgres_port":"5433",
-    "record_running_query":"false",
-    "resource_dir":"/var/infinity/leader/resource",
-    "server_address":"0.0.0.0",
-    "temp_dir":"/var/infinity/leader/tmp",
-    "time_zone":"UTC-8",
-    "version":"0.7.5",
-    "wal_compact_threshold":"1073741824",
-    "wal_dir":"/var/infinity/leader/wal",
-    "wal_flush":"FlushAtOnce"
+    "cache_result_capacity":1024,
+    "checkpoint_interval":86400,
+    "cleanup_interval":60,
+    "log_level":"debug",
+    "optimize_interval":30,
+    "result_cache":"off",
+    "wal_flush":"flush_per_second",
+    "error_code":0
 }
 ```
 

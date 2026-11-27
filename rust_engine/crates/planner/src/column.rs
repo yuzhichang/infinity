@@ -33,7 +33,7 @@ use crate::{output_width, LogicalPlan};
 pub type ColumnMap = Vec<Option<usize>>;
 
 /// Every input column referenced by `expr`.
-fn collect_expr_columns(expr: &Expr, out: &mut BTreeSet<usize>) {
+pub fn collect_expr_columns(expr: &Expr, out: &mut BTreeSet<usize>) {
     match expr {
         Expr::Column(i) => {
             out.insert(*i);

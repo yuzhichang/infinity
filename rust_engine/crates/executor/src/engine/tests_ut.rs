@@ -1694,6 +1694,33 @@ mod tests {
         );
     }
 
+    /// `SET CONFIG wal_flush` refuses a spelling the engine does not have.
+    ///
+    /// The value is reported back verbatim by `SHOW CONFIGS`, so accepting one
+    /// it cannot mean would put a made-up mode in the response.
+    #[tokio::test]
+    async fn set_config_rejects_an_unknown_wal_flush() {
+        let dir = tempdir().unwrap();
+        let e = Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+
+        // A real mode is accepted and reported unchanged.
+        e.execute("SET CONFIG wal_flush only_write").await.unwrap();
+        assert_eq!(e.config_get("wal_flush").as_deref(), Some("only_write"));
+
+        // A misspelling is refused, and the previous value stands.
+        let err = e
+            .execute("SET CONFIG wal_flush bogus")
+            .await
+            .expect_err("an unknown mode must be rejected");
+        assert!(
+            err.to_string().contains("wal_flush"),
+            "the message names the knob: {err}"
+        );
+        assert_eq!(e.config_get("wal_flush").as_deref(), Some("only_write"));
+    }
+
     /// With `result_cache` on, a repeated scan is answered from the plan-node
     /// cache (`ResultCacheGetter` + `ResultCacheSetter`), and a write drops it.
     #[tokio::test]

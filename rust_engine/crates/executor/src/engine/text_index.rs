@@ -299,12 +299,19 @@ pub(crate) struct PreparedDoc {
 /// Tokenises one document for a [`TextIndex`]. Takes no index state, so it runs
 /// without the write lock - the analyzer is the only input.
 pub(crate) fn prepare_doc(seq: u64, text: &str, tokenizer: &TextTokenizer) -> PreparedDoc {
-    let mut terms: Vec<(String, u32, u16)> = Vec::new();
-    let mut cost = 64usize;
-    for_each_index_term(text, tokenizer, |term, pos, payload| {
-        cost += term.len() + 32;
-        terms.push((term.to_string(), pos, payload));
-    });
+    let mut terms = Vec::new();
+    if !text.is_empty()
+        && !tokenizer.for_each_term(text, &mut |term| {
+            terms.push((term.text.to_owned(), term.word_offset, term.payload));
+        })
+    {
+        terms = tokenize_index_terms(text, tokenizer);
+    }
+    let cost = 64
+        + terms
+            .iter()
+            .map(|(term, _, _)| term.len() + 32)
+            .sum::<usize>();
     PreparedDoc { seq, terms, cost }
 }
 
