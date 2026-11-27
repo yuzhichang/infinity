@@ -192,7 +192,7 @@ impl Engine {
     /// Marks `table` as having a write in flight, until the guard drops.
     ///
     /// **The marker and an index seal share one exclusion.** The dump takes
-    /// `flush_lock` *after* it has checked `write_in_flight`
+    /// `flush_lock` *after* it has checked `has_staging_import`
     /// (`index_build.rs::dump_index_transaction`), so a marker set without that
     /// lock can land between the check and the seal: the dump then publishes a
     /// chunk over a slice of the import's rows, which is exactly the split
@@ -213,7 +213,7 @@ impl Engine {
                 .unwrap()
                 .entry(key)
                 .or_default()
-                .writes_in_flight += 1;
+                .staging_imports += 1;
         }
         ImportStaging {
             engine: self,
@@ -366,7 +366,7 @@ impl Engine {
         // transaction and only populates the indexes at its end, so nothing
         // dumps from the staging loop. Marking the table for the duration keeps
         // the append path's capacity/quota triggers off - see
-        // `TableEntry::writes_in_flight`.
+        // `TableEntry::staging_imports`.
         let mut staging = self.stage_import(table).await;
         loop {
             let mut batch: Vec<Vec<Literal>> = Vec::with_capacity(Self::COPY_BATCH_ROWS);
@@ -1561,7 +1561,7 @@ impl Drop for ImportStaging<'_> {
             self.engine.rollback_index_rows(&self.table, &self.staged);
         }
         if let Some(entry) = self.engine.tables.lock().unwrap().get_mut(&self.key) {
-            entry.writes_in_flight = entry.writes_in_flight.saturating_sub(1);
+            entry.staging_imports = entry.staging_imports.saturating_sub(1);
         }
     }
 }

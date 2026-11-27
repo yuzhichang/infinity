@@ -1471,7 +1471,7 @@ impl Engine {
         // same lock** below, immediately before the seal. Reading it here can
         // only skip a dump early; it cannot let one through, since the decisive
         // read happens with the import excluded.
-        if self.write_in_flight(&table) {
+        if self.has_staging_import(&table) {
             return Ok(());
         }
         // The reference skips a dump when the memory index has nothing new
@@ -1520,7 +1520,7 @@ impl Engine {
             // The decisive read, with imports excluded: `stage_import` holds
             // this lock to raise the marker, so a marker that is absent here
             // cannot appear before the seal finishes.
-            if self.write_in_flight(&table) {
+            if self.has_staging_import(&table) {
                 return Ok(());
             }
             let (seal_table, seal_index) = (table.clone(), version.index.clone());

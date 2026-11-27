@@ -289,12 +289,13 @@ impl Engine {
 
     /// Whether a table should enter this round's candidate set.
     fn reclaim_candidate_eligible(&self, stat: &TableStat) -> bool {
-        // A table an `IMPORT` is still staging into is not reclaimable: its rows
-        // are not committed, so a dump would publish a chunk over rows the table
-        // may never have.
-        if self.write_in_flight(&stat.key) {
-            return false;
-        }
+        // A staging `IMPORT` is not a reason to skip the table. Its rows are
+        // committed (the import commits before it stages), and `dump_table`
+        // writes only at or below `reclaim_bound_ts`, so the dump takes the
+        // settled part and leaves the tail. What a staging import *does* block
+        // is the index seal, and `dump_index_transaction` checks that itself -
+        // twice, the second time under `flush_lock`. Excluding the table here
+        // only kept its memory resident for the whole import.
         if !self.table_has_unsealed(&stat.key) {
             return false;
         }

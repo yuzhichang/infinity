@@ -19695,11 +19695,20 @@ mod tests {
         );
     }
 
-    /// A table an `IMPORT` is staging into is not a candidate: its rows are not
-    /// committed, so a dump would publish a chunk over rows the table may never
-    /// have.
+    /// A table an `IMPORT` is staging into *is* a candidate, and only its
+    /// settled rows are dumped.
+    ///
+    /// The old behaviour excluded it, on the theory that a dump would publish a
+    /// chunk over rows the table may never have. That is not what happens: the
+    /// import commits before it stages, and `dump_table` writes at or below
+    /// `reclaim_bound_ts`. Excluding the table only kept its memory resident for
+    /// the whole import - on a bulk load, where every table is staging, that
+    /// left reclaim with no candidates at all.
+    ///
+    /// The index seal is still skipped for a staging table; that check lives in
+    /// `dump_index_transaction`, which is where the segment shape matters.
     #[tokio::test]
-    async fn reclaim_skips_a_table_an_import_is_staging_into() {
+    async fn reclaim_includes_a_table_an_import_is_staging_into() {
         let dir = tempdir().unwrap();
         let e = Engine::open_async(dir.path(), Default::default())
             .await
@@ -19712,25 +19721,40 @@ mod tests {
             .unwrap()
             .get_mut(&key)
             .unwrap()
-            .writes_in_flight = 1;
+            .staging_imports = 1;
+
+        let before = e
+            .tables
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|entry| entry.unsealed_bytes())
+            .unwrap_or(0);
+        assert!(before > 0, "the insert left buffered rows");
+        // A non-zero quota is what makes the round run at all: `reclaim_unsealed`
+        // returns early when the budget is disabled, and its target is half the
+        // quota, so a small one keeps it under.
+        e.set_unsealed_memory_quota(1);
 
         let dumped = e.reclaim_unsealed().await;
         assert_eq!(
-            dumped, 0,
-            "an writes_in_flight table is excluded from the candidates"
+            dumped, 1,
+            "a staging table is a candidate; the seal is what it blocks, not the dump"
         );
+        let after = e
+            .tables
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|entry| entry.unsealed_bytes())
+            .unwrap_or(0);
         assert!(
-            e.tables
-                .lock()
-                .unwrap()
-                .get(&key)
-                .map(|entry| entry.unsealed_bytes())
-                .unwrap_or(0)
-                > 0
+            after < before,
+            "the buffered rows were dumped: {before} -> {after}"
         );
     }
 
-    /// Under pressure an writes_in_flight table *is* a candidate, and the dump takes
+    /// Under pressure a table with unsettled writes *is* a candidate, and the dump takes
     /// only its committed rows.
     ///
     /// The marker means "these rows are not settled yet", not "uncommitted" - an
@@ -19761,7 +19785,7 @@ mod tests {
             .unwrap()
             .get_mut(&key)
             .unwrap()
-            .writes_in_flight = 1;
+            .staging_imports = 1;
 
         // A ceiling of zero makes every pass "over the watermark", so the
         // pressure path runs with `ignore_backoff = true`.
@@ -19771,7 +19795,7 @@ mod tests {
         let dumped = e.reclaim_unsealed_under_pressure(1).await;
         assert!(
             dumped > 0,
-            "the writes_in_flight table must be a candidate under pressure"
+            "a table with unsettled writes must be a candidate under pressure"
         );
         let after = e
             .tables
@@ -20392,8 +20416,12 @@ mod tests {
         assert_eq!(dumped, 5, "cap 0 drains the whole candidate list");
     }
 
-    /// A table being imported into does not stop another table from being
-    /// reclaimed: the exclusion is per table, not a global gate.
+    /// A table with a staging import does not stop another table from being
+    /// reclaimed - and is reclaimed itself once its committed rows are the ones
+    /// being dumped.
+    ///
+    /// Both are candidates now: the staging marker blocks the index seal, not
+    /// the dump, so neither table is held resident on the other's account.
     #[tokio::test]
     async fn an_import_in_one_table_does_not_stop_other_tables() {
         let dir = tempdir().unwrap();
@@ -20406,25 +20434,36 @@ mod tests {
         e.execute("CREATE TABLE ok_t (id INT);").await.unwrap();
         e.execute("INSERT INTO ip VALUES (1);").await.unwrap();
         e.execute("INSERT INTO ok_t VALUES (1);").await.unwrap();
-        let writes_in_flight = e.table_key("default_db.ip");
+        let staging_key = e.table_key("default_db.ip");
         e.tables
             .lock()
             .unwrap()
-            .get_mut(&writes_in_flight)
+            .get_mut(&staging_key)
             .unwrap()
-            .writes_in_flight = 1;
+            .staging_imports = 1;
 
+        let staging_before = e
+            .tables
+            .lock()
+            .unwrap()
+            .get(&staging_key)
+            .map(|entry| entry.unsealed_bytes())
+            .unwrap_or(0);
         let dumped = e.reclaim_unsealed().await;
-        assert_eq!(dumped, 1, "the healthy table is still reclaimed");
+        assert_eq!(
+            dumped, 2,
+            "both tables are candidates: the staging marker blocks the seal, not the dump"
+        );
+        let staging_after = e
+            .tables
+            .lock()
+            .unwrap()
+            .get(&staging_key)
+            .map(|entry| entry.unsealed_bytes())
+            .unwrap_or(0);
         assert!(
-            e.tables
-                .lock()
-                .unwrap()
-                .get(&writes_in_flight)
-                .map(|entry| entry.unsealed_bytes())
-                .unwrap_or(0)
-                > 0,
-            "and the writes_in_flight table keeps its buffer"
+            staging_after < staging_before,
+            "the staging table's committed rows were dumped too: {staging_before} -> {staging_after}"
         );
     }
 

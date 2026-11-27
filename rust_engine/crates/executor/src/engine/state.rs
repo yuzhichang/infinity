@@ -5489,7 +5489,7 @@ impl Default for TableEntry {
     fn default() -> Self {
         Self {
             write_batches: 0,
-            writes_in_flight: 0,
+            staging_imports: 0,
             block_rows: None,
             pending_rows: Default::default(),
             staged_import_blocks: Default::default(),
@@ -5540,14 +5540,16 @@ impl Default for TableEntry {
 }
 
 impl TableEntry {
-    /// A write holds this table's indexes: the append-path dump triggers are
-    /// suppressed until it commits (see [`TableEntry::writes_in_flight`]).
+    /// An `IMPORT` is staging rows into this table (see
+    /// [`TableEntry::staging_imports`]).
     ///
-    /// Named for the state, not for its current user. An `IMPORT` is the only
-    /// caller today, but the flag suppresses *any* write batch's index dump -
-    /// it is raised around the batch, not around the `IMPORT` statement.
-    pub(crate) fn write_in_flight(&self) -> bool {
-        self.writes_in_flight > 0
+    /// This is deliberately narrower than "the table has unsealed rows": a
+    /// staging import has already committed, so `table_has_unsealed` is true for
+    /// it too - but its rows belong to a segment it is still filling, and a
+    /// chunk sealed now would split that segment's coverage. The two states are
+    /// orthogonal and only this one means "do not seal yet".
+    pub(crate) fn has_staging_import(&self) -> bool {
+        self.staging_imports > 0
     }
 
     /// Appends rows to the append buffer, keeping it **ordered by row id**.
@@ -5791,7 +5793,11 @@ impl TableEntry {
 pub(crate) struct TableEntry {
     /// Number of write batches (`COPY`/`INSERT`) seen by this process.
     pub(crate) write_batches: usize,
-    /// Set while a write is staging rows and has not committed.
+    /// Set while an `IMPORT` is staging rows into this table.
+    ///
+    /// "Staging", not "uncommitted": the rows are durable, but the import is
+    /// still filling the segment, so an index chunk sealed now would cut it at
+    /// a batch boundary.
     ///
     /// `NewTxn::Import` never consults the memory-index tracer: the rows go into
     /// the segment's blocks and `PopulateIndex` writes one chunk per index per
@@ -5806,9 +5812,13 @@ pub(crate) struct TableEntry {
     /// Only the **append** triggers are suppressed; the rows are still fed to
     /// every index tail, so `populate_import_indexes` sees them.
     ///
-    /// A count, not a flag: an `IMPORT` and an `INSERT` can overlap on one
-    /// table, and the first to finish must not clear the other's marker.
-    pub(crate) writes_in_flight: usize,
+    /// A count, not a flag: two `COPY`s can overlap on one table, and the first
+    /// to finish must not clear the other's marker.
+    ///
+    /// Reclaim does **not** consult this: a staging import's committed rows are
+    /// dumped like any other (see `reclaim_unsealed_until`). Only the index
+    /// seal does, because that is the operation the segment shape constrains.
+    pub(crate) staging_imports: usize,
     /// Row ids the C++ block mirror was written from, in block order.
     ///
     /// The mirror is a snapshot: rows appended after it was written are read
