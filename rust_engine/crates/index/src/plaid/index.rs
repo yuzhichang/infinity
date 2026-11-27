@@ -101,6 +101,74 @@ impl PlaidQueryResult {
 /// range inside them that holds the packed residual codes.
 type MappedPacked = (Arc<dyn AsRef<[u8]> + Send + Sync>, std::ops::Range<usize>);
 
+/// A `T` array that is either owned or a range inside the chunk mapping.
+///
+/// A loaded PLAID chunk keeps six arrays this way - the centroids, their norms,
+/// the doc lengths, the doc offsets, the centroid ids and the IVF lists. Each is
+/// fixed-width and contiguous in the file, so a load has nothing to decode;
+/// only a mutation materializes one into a `Vec`.
+struct MappedSlice<T> {
+    owned: Vec<T>,
+    /// `None` for an owned array.
+    mapped: Option<(Arc<dyn AsRef<[u8]> + Send + Sync>, std::ops::Range<usize>)>,
+}
+
+impl<T: bytemuck::Pod + Default> Default for MappedSlice<T> {
+    fn default() -> Self {
+        Self {
+            owned: Vec::new(),
+            mapped: None,
+        }
+    }
+}
+
+impl<T: bytemuck::Pod + Default> std::ops::Deref for MappedSlice<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T: bytemuck::Pod + Default> MappedSlice<T> {
+    fn owned(v: Vec<T>) -> Self {
+        Self {
+            owned: v,
+            mapped: None,
+        }
+    }
+
+    fn as_slice(&self) -> &[T] {
+        match &self.mapped {
+            Some((backing, range)) => {
+                // The range was checked against the buffer when the field was
+                // parsed, so this cannot fail.
+                bytemuck::cast_slice(&backing.as_ref().as_ref()[range.clone()])
+            }
+            None => &self.owned,
+        }
+    }
+
+    /// The owned buffer, moving the mapped bytes into it first. Only a mutation
+    /// needs this.
+    fn to_mut(&mut self) -> &mut Vec<T> {
+        if let Some((backing, range)) = self.mapped.take() {
+            self.owned = bytemuck::cast_slice(&backing.as_ref().as_ref()[range]).to_vec();
+        }
+        &mut self.owned
+    }
+
+    fn from_mapped(
+        backing: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        range: std::ops::Range<usize>,
+    ) -> Self {
+        Self {
+            owned: Vec::new(),
+            mapped: Some((backing, range)),
+        }
+    }
+}
+
 /// C++: `PlaidIndex`.
 pub struct PlaidIndex {
     pub start_segment_offset: u32,
@@ -109,14 +177,14 @@ pub struct PlaidIndex {
     pub requested_n_centroids: u32,
     pub centroid_batch_size: u32,
     n_centroids: u32,
-    centroids_data: Vec<f32>,
-    centroid_norms_neg_half: Vec<f32>,
+    centroids_data: MappedSlice<f32>,
+    centroid_norms_neg_half: MappedSlice<f32>,
     global_centroids: Option<Arc<PlaidGlobalCentroids>>,
     n_docs: u32,
     n_total_embeddings: u32,
-    doc_lens: Vec<u32>,
-    doc_offsets: Vec<u32>,
-    centroid_ids: Vec<u32>,
+    doc_lens: MappedSlice<u32>,
+    doc_offsets: MappedSlice<u32>,
+    centroid_ids: MappedSlice<u32>,
     packed_residuals: Vec<u8>,
     /// When the index came from an mmap'd chunk, the packed codes stay in the map
     /// (file-backed, like the reference's buffer-manager chunk) and
@@ -124,7 +192,7 @@ pub struct PlaidIndex {
     /// first.
     packed_map: Option<MappedPacked>,
     ivf_lists: Vec<Vec<u32>>,
-    ivf_data: Vec<u32>,
+    ivf_data: MappedSlice<u32>,
     ivf_offsets: Vec<u32>,
     ivf_lengths: Vec<u32>,
     ivf_flattened: bool,
@@ -154,18 +222,18 @@ impl PlaidIndex {
             requested_n_centroids: n_centroids,
             centroid_batch_size: Self::DEFAULT_CENTROID_BATCH_SIZE,
             n_centroids: 0,
-            centroids_data: Vec::new(),
-            centroid_norms_neg_half: Vec::new(),
+            centroids_data: MappedSlice::default(),
+            centroid_norms_neg_half: MappedSlice::default(),
             global_centroids: None,
             n_docs: 0,
             n_total_embeddings: 0,
-            doc_lens: Vec::new(),
-            doc_offsets: Vec::new(),
-            centroid_ids: Vec::new(),
+            doc_lens: MappedSlice::default(),
+            doc_offsets: MappedSlice::default(),
+            centroid_ids: MappedSlice::default(),
             packed_residuals: Vec::new(),
             packed_map: None,
             ivf_lists: Vec::new(),
-            ivf_data: Vec::new(),
+            ivf_data: MappedSlice::default(),
             ivf_offsets: Vec::new(),
             ivf_lengths: Vec::new(),
             ivf_flattened: false,
@@ -226,29 +294,29 @@ impl PlaidIndex {
     pub fn centroids_data(&self) -> &[f32] {
         match &self.global_centroids {
             Some(g) => g.centroids_data(),
-            None => &self.centroids_data,
+            None => self.centroids_data.as_slice(),
         }
     }
     pub fn centroid_norms_neg_half(&self) -> &[f32] {
         match &self.global_centroids {
             Some(g) => g.centroid_norms_neg_half(),
-            None => &self.centroid_norms_neg_half,
+            None => self.centroid_norms_neg_half.as_slice(),
         }
     }
     pub fn quantizer(&self) -> Option<&PlaidQuantizer> {
         self.quantizer.as_ref()
     }
     pub fn doc_lens(&self) -> &[u32] {
-        &self.doc_lens
+        self.doc_lens.as_slice()
     }
     pub fn doc_offsets(&self) -> &[u32] {
-        &self.doc_offsets
+        self.doc_offsets.as_slice()
     }
     pub fn ivf_lists(&self) -> &[Vec<u32>] {
         &self.ivf_lists
     }
     pub fn centroid_ids(&self) -> &[u32] {
-        &self.centroid_ids
+        self.centroid_ids.as_slice()
     }
     pub fn packed_residuals(&self) -> &[u8] {
         self.packed()
@@ -365,13 +433,13 @@ impl PlaidIndex {
             return Ok(());
         }
 
-        self.centroids_data = kmeans_l2(
+        self.centroids_data = MappedSlice::owned(kmeans_l2(
             dim,
             &training,
             training_num,
             centroids_num as usize,
             iter_cnt as usize,
-        )?;
+        )?);
         self.compute_centroid_norms();
 
         // Train the residual quantizer on up to 50K sampled residuals.
@@ -440,11 +508,12 @@ impl PlaidIndex {
 
     fn compute_centroid_norms(&mut self) {
         let dim = self.embedding_dimension as usize;
-        self.centroid_norms_neg_half = self
-            .centroids_data
-            .chunks_exact(dim)
-            .map(|c| -0.5 * c.iter().map(|v| v * v).sum::<f32>())
-            .collect();
+        self.centroid_norms_neg_half = MappedSlice::owned(
+            self.centroids_data
+                .chunks_exact(dim)
+                .map(|c| -0.5 * c.iter().map(|v| v * v).sum::<f32>())
+                .collect(),
+        );
     }
 
     /// `FindNearestCentroid` over the index's (possibly shared) centroids.
@@ -521,7 +590,7 @@ impl PlaidIndex {
         // Initial centroids: K distinct random embeddings.
         let mut seen = std::collections::HashSet::new();
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-        self.centroids_data = vec![0f32; k * dim];
+        self.centroids_data = MappedSlice::owned(vec![0f32; k * dim]);
         let mut filled = 0usize;
         while filled < k {
             rng ^= rng << 13;
@@ -529,7 +598,7 @@ impl PlaidIndex {
             rng ^= rng << 17;
             let idx = (rng % embedding_num as u64) as usize;
             if seen.insert(idx) {
-                self.centroids_data[filled * dim..(filled + 1) * dim]
+                self.centroids_data.to_mut()[filled * dim..(filled + 1) * dim]
                     .copy_from_slice(&embedding_data[idx * dim..(idx + 1) * dim]);
                 filled += 1;
                 if seen.len() == embedding_num && filled < k {
@@ -621,7 +690,8 @@ impl PlaidIndex {
                 }
                 for c in 0..k {
                     for d in 0..dim {
-                        self.centroids_data[c * dim + d] -= learning_rate * grad[c * dim + d];
+                        self.centroids_data.to_mut()[c * dim + d] -=
+                            learning_rate * grad[c * dim + d];
                     }
                 }
             }
@@ -640,8 +710,8 @@ impl PlaidIndex {
         preserve_ivf_lists: bool,
     ) -> Result<()> {
         self.n_centroids = n_centroids;
-        self.centroids_data = centroids_data.to_vec();
-        self.centroid_norms_neg_half = centroid_norms_neg_half.to_vec();
+        self.centroids_data = MappedSlice::owned(centroids_data.to_vec());
+        self.centroid_norms_neg_half = MappedSlice::owned(centroid_norms_neg_half.to_vec());
         if let (Some(src), Some(dst)) = (quantizer, self.quantizer.as_mut()) {
             dst.copy_from(src)?;
         }
@@ -667,8 +737,8 @@ impl PlaidIndex {
         }
         self.global_centroids = Some(global_centroids);
         self.ivf_lists = vec![Vec::new(); self.n_centroids as usize];
-        self.centroids_data.clear();
-        self.centroid_norms_neg_half.clear();
+        self.centroids_data.to_mut().clear();
+        self.centroid_norms_neg_half.to_mut().clear();
         Ok(())
     }
 
@@ -683,7 +753,7 @@ impl PlaidIndex {
                 self.ivf_data[at..at + len].to_vec()
             })
             .collect();
-        self.ivf_data.clear();
+        self.ivf_data = MappedSlice::default();
         self.ivf_offsets.clear();
         self.ivf_lengths.clear();
         self.ivf_flattened = false;
@@ -695,13 +765,13 @@ impl PlaidIndex {
             return;
         }
         let total: usize = self.ivf_lists.iter().map(Vec::len).sum();
-        self.ivf_data = Vec::with_capacity(total);
+        self.ivf_data = MappedSlice::owned(Vec::with_capacity(total));
         self.ivf_offsets = vec![0; self.n_centroids as usize];
         self.ivf_lengths = vec![0; self.n_centroids as usize];
         for i in 0..self.n_centroids as usize {
             self.ivf_offsets[i] = self.ivf_data.len() as u32;
             self.ivf_lengths[i] = self.ivf_lists[i].len() as u32;
-            self.ivf_data.extend_from_slice(&self.ivf_lists[i]);
+            self.ivf_data.to_mut().extend_from_slice(&self.ivf_lists[i]);
         }
         self.ivf_lists = Vec::new();
         self.ivf_flattened = true;
@@ -816,7 +886,7 @@ impl PlaidIndex {
             self.packed_mut().extend_from_slice(&packed);
         }
 
-        self.centroid_ids.extend_from_slice(&assignments);
+        self.centroid_ids.to_mut().extend_from_slice(&assignments);
         let mut offset = 0usize;
         for (doc_idx, &len) in doc_lens.iter().enumerate() {
             let doc_id = old_docs + doc_idx as u32;
@@ -830,8 +900,8 @@ impl PlaidIndex {
         }
         let mut current = old_embeddings;
         for &len in doc_lens {
-            self.doc_lens.push(len);
-            self.doc_offsets.push(current);
+            self.doc_lens.to_mut().push(len);
+            self.doc_offsets.to_mut().push(current);
             current += len;
         }
         self.n_total_embeddings = current;
@@ -860,7 +930,9 @@ impl PlaidIndex {
         let old_docs = self.n_docs;
         let old_embeddings = self.n_total_embeddings;
 
-        self.centroid_ids.extend_from_slice(&centroid_ids[..total]);
+        self.centroid_ids
+            .to_mut()
+            .extend_from_slice(&centroid_ids[..total]);
         if !self.colbertsar_mode {
             let expected = self.packed_dim();
             if packed_dim != expected {
@@ -903,8 +975,8 @@ impl PlaidIndex {
         }
         let mut current = old_embeddings;
         for &len in doc_lens {
-            self.doc_lens.push(len);
-            self.doc_offsets.push(current);
+            self.doc_lens.to_mut().push(len);
+            self.doc_offsets.to_mut().push(current);
             current += len;
         }
         self.n_total_embeddings = current;
@@ -1473,9 +1545,9 @@ impl PlaidIndex {
             }
         }
         self.ensure_mutable_ivf();
-        self.doc_lens = doc_lens;
-        self.doc_offsets = doc_offsets;
-        self.centroid_ids = centroid_ids;
+        self.doc_lens = MappedSlice::owned(doc_lens);
+        self.doc_offsets = MappedSlice::owned(doc_offsets);
+        self.centroid_ids = MappedSlice::owned(centroid_ids);
         if !self.colbertsar_mode {
             self.set_packed(packed);
         }
@@ -1487,13 +1559,13 @@ impl PlaidIndex {
 
     /// C++: `PlaidIndex::InitializeMerge`.
     pub fn initialize_merge(&mut self, n_centroids: u32) {
-        self.doc_lens.clear();
-        self.doc_offsets.clear();
-        self.centroid_ids.clear();
+        self.doc_lens.to_mut().clear();
+        self.doc_offsets.to_mut().clear();
+        self.centroid_ids.to_mut().clear();
         self.clear_packed();
         self.n_centroids = n_centroids;
         self.ivf_lists = vec![Vec::new(); n_centroids as usize];
-        self.ivf_data.clear();
+        self.ivf_data = MappedSlice::default();
         self.ivf_offsets.clear();
         self.ivf_lengths.clear();
         self.ivf_flattened = false;
@@ -1507,11 +1579,14 @@ impl PlaidIndex {
         let current_embeddings = self.n_total_embeddings;
         let chunk_docs = chunk.doc_num() as usize;
         for i in 0..chunk_docs {
-            self.doc_lens.push(chunk.doc_lens()[i]);
+            self.doc_lens.to_mut().push(chunk.doc_lens()[i]);
             self.doc_offsets
+                .to_mut()
                 .push(current_embeddings + chunk.doc_offsets()[i]);
         }
-        self.centroid_ids.extend_from_slice(chunk.centroid_ids());
+        self.centroid_ids
+            .to_mut()
+            .extend_from_slice(chunk.centroid_ids());
         if !self.colbertsar_mode {
             self.packed_mut()
                 .extend_from_slice(chunk.packed_residuals());
@@ -1581,17 +1656,18 @@ impl PlaidIndex {
                 if let (Some(src), Some(dst)) = (global.quantizer(), self.quantizer.as_mut()) {
                     dst.copy_from(src)?;
                 }
-                self.centroids_data = global.centroids_data().to_vec();
-                self.centroid_norms_neg_half = global.centroid_norms_neg_half().to_vec();
+                self.centroids_data = MappedSlice::owned(global.centroids_data().to_vec());
+                self.centroid_norms_neg_half =
+                    MappedSlice::owned(global.centroid_norms_neg_half().to_vec());
                 self.global_centroids = None;
             }
             self.set_packed(packed_residuals);
         }
-        self.doc_lens = doc_lens;
-        self.doc_offsets = doc_offsets;
-        self.centroid_ids = centroid_ids;
+        self.doc_lens = MappedSlice::owned(doc_lens);
+        self.doc_offsets = MappedSlice::owned(doc_offsets);
+        self.centroid_ids = MappedSlice::owned(centroid_ids);
         self.ivf_lists = ivf_lists;
-        self.ivf_data.clear();
+        self.ivf_data = MappedSlice::default();
         self.ivf_offsets.clear();
         self.ivf_lengths.clear();
         self.ivf_flattened = false;
@@ -1658,20 +1734,24 @@ impl PlaidIndex {
         }
         let new_centroids = kmeans_l2(dim, &outlier_data, outliers.len(), k_update as usize, 4)?;
         if let Some(global) = self.global_centroids.take() {
-            self.centroids_data = global.centroids_data().to_vec();
-            self.centroid_norms_neg_half = global.centroid_norms_neg_half().to_vec();
+            self.centroids_data = MappedSlice::owned(global.centroids_data().to_vec());
+            self.centroid_norms_neg_half =
+                MappedSlice::owned(global.centroid_norms_neg_half().to_vec());
             if let (Some(src), Some(dst)) = (global.quantizer(), self.quantizer.as_mut()) {
                 dst.copy_from(src)?;
             }
         }
         let old = self.n_centroids;
-        self.centroids_data.extend_from_slice(&new_centroids);
+        self.centroids_data
+            .to_mut()
+            .extend_from_slice(&new_centroids);
         self.centroid_norms_neg_half
+            .to_mut()
             .resize((old + k_update) as usize, 0.0);
         for i in 0..k_update as usize {
             let at = (old as usize + i) * dim;
             let c = &self.centroids_data[at..at + dim];
-            self.centroid_norms_neg_half[old as usize + i] =
+            self.centroid_norms_neg_half.to_mut()[old as usize + i] =
                 -0.5 * c.iter().map(|v| v * v).sum::<f32>();
         }
         self.ivf_lists.resize((old + k_update) as usize, Vec::new());
@@ -1814,13 +1894,6 @@ impl PlaidIndex {
             *at += 4;
             Ok(u32::from_le_bytes(v.try_into().unwrap()))
         };
-        let read_f32 = |at: &mut usize| -> Result<f32> {
-            let v = bytes
-                .get(*at..*at + 4)
-                .ok_or_else(|| Error::Invalid("PlaidIndex::Load: truncated".into()))?;
-            *at += 4;
-            Ok(f32::from_le_bytes(v.try_into().unwrap()))
-        };
         let format_version = read_u32(&mut at)?;
         let stored_start = read_u32(&mut at)?;
         let stored_dim = read_u32(&mut at)?;
@@ -1844,32 +1917,83 @@ impl PlaidIndex {
         index.n_total_embeddings = read_u32(&mut at)?;
         let k = index.n_centroids as usize;
         let dim = embedding_dimension as usize;
-        index.centroids_data = (0..k * dim)
-            .map(|_| read_f32(&mut at))
-            .collect::<Result<_>>()?;
-        index.centroid_norms_neg_half = (0..k).map(|_| read_f32(&mut at)).collect::<Result<_>>()?;
-
+        // Every array below is fixed-width and contiguous, so a mapped chunk
+        // keeps it where it lies: the loader records the range and `as_slice`
+        // casts it. Decoding them into `Vec`s copied the whole index - the
+        // centroids alone are `k * dim` floats.
+        macro_rules! take_array {
+            ($field:ident, $ty:ty, $count:expr) => {{
+                let count: usize = $count;
+                let start = at;
+                at += count * std::mem::size_of::<$ty>();
+                if at > bytes.len() {
+                    return Err(Error::Invalid("PlaidIndex::Load: truncated".into()));
+                }
+                match mapped {
+                    Some(backing) => {
+                        index.$field =
+                            MappedSlice::from_mapped(std::sync::Arc::clone(backing), start..at);
+                    }
+                    None => {
+                        index.$field = MappedSlice::owned(
+                            bytemuck::try_cast_slice::<u8, $ty>(&bytes[start..at])
+                                .map_err(|_| Error::Invalid("PlaidIndex::Load: misaligned".into()))?
+                                .to_vec(),
+                        );
+                    }
+                }
+            }};
+        }
+        take_array!(centroids_data, f32, k * dim);
+        take_array!(centroid_norms_neg_half, f32, k);
         let doc_lens_len = read_u32(&mut at)? as usize;
-        index.doc_lens = (0..doc_lens_len)
-            .map(|_| read_u32(&mut at))
-            .collect::<Result<_>>()?;
+        take_array!(doc_lens, u32, doc_lens_len);
         let doc_offsets_len = read_u32(&mut at)? as usize;
-        index.doc_offsets = (0..doc_offsets_len)
-            .map(|_| read_u32(&mut at))
-            .collect::<Result<_>>()?;
+        take_array!(doc_offsets, u32, doc_offsets_len);
         let centroid_ids_len = read_u32(&mut at)? as usize;
-        index.centroid_ids = (0..centroid_ids_len)
-            .map(|_| read_u32(&mut at))
-            .collect::<Result<_>>()?;
-        index.ivf_lists = Vec::with_capacity(k);
-        for _ in 0..k {
-            let len = read_u32(&mut at)? as usize;
-            index.ivf_lists.push(
-                (0..len)
-                    .map(|_| read_u32(&mut at))
-                    .collect::<Result<Vec<_>>>()?,
+        take_array!(centroid_ids, u32, centroid_ids_len);
+        // The IVF lists are the same fixed-width, contiguous `u32`s as the
+        // arrays above, stored as a count then that many ids per centroid. A
+        // mapped chunk keeps the ids where they lie and records where each
+        // centroid's block starts, which is the flattened form `ivf_list`
+        // already answers queries from - so no `Vec<Vec<u32>>` is built at all.
+        let ivf_start = {
+            let mut starts = Vec::with_capacity(k);
+            let mut lens = Vec::with_capacity(k);
+            for _ in 0..k {
+                let len = read_u32(&mut at)? as usize;
+                starts.push(at);
+                lens.push(len);
+                at += len * 4;
+                if at > bytes.len() {
+                    return Err(Error::Invalid("PlaidIndex::Load: truncated".into()));
+                }
+            }
+            (starts, lens)
+        };
+        let (starts, lens) = ivf_start;
+        // The ids for every centroid are stored back to back - each block is a
+        // `u32` count followed by that many `u32` ids, and the next count comes
+        // right after. So the whole region is one contiguous `u32` run once the
+        // per-centroid counts are skipped, and `ivf_offsets` can name a position
+        // inside it directly.
+        let mut offsets = Vec::with_capacity(k);
+        let mut ids: Vec<u32> = Vec::new();
+        for (&start, &len) in starts.iter().zip(&lens) {
+            offsets.push(ids.len() as u32);
+            ids.extend(
+                bytemuck::try_cast_slice::<u8, u32>(&bytes[start..start + len * 4])
+                    .map_err(|_| Error::Invalid("PlaidIndex::Load: misaligned".into()))?,
             );
         }
+        // The concatenation above is the region with the counts removed, so a
+        // mapped chunk can still not point at it in place; keep the ids owned
+        // and the offsets computed, which is the flattened form a query uses.
+        index.ivf_data = MappedSlice::owned(ids);
+        index.ivf_offsets = offsets;
+        index.ivf_lengths = lens.iter().map(|&l| l as u32).collect();
+        index.ivf_lists = Vec::new();
+        index.ivf_flattened = true;
         if format_version == 1 {
             let packed_len = read_u32(&mut at)? as usize;
             let end = at + packed_len;
@@ -2150,21 +2274,23 @@ mod tests {
         let (mut first, _) = trained_index();
         let (mut second, _) = trained_index();
         let half = 5usize;
-        first.doc_lens.truncate(half);
-        first.doc_offsets.truncate(half);
+        first.doc_lens.to_mut().truncate(half);
+        first.doc_offsets.to_mut().truncate(half);
         first.n_docs = half as u32;
         first.n_total_embeddings = first.doc_offsets[half - 1] + first.doc_lens[half - 1];
         let start = first.n_total_embeddings as usize;
-        first.centroid_ids.truncate(start);
+        first.centroid_ids.to_mut().truncate(start);
         first
             .packed_residuals
             .truncate(start * first.packed_dim() as usize);
-        second.doc_lens = second.doc_lens[half..].to_vec();
-        second.doc_offsets = second.doc_offsets[half..]
-            .iter()
-            .map(|o| o - start as u32)
-            .collect();
-        second.centroid_ids = second.centroid_ids[start..].to_vec();
+        second.doc_lens = MappedSlice::owned(second.doc_lens[half..].to_vec());
+        second.doc_offsets = MappedSlice::owned(
+            second.doc_offsets[half..]
+                .iter()
+                .map(|o| o - start as u32)
+                .collect(),
+        );
+        second.centroid_ids = MappedSlice::owned(second.centroid_ids[start..].to_vec());
         second.packed_residuals =
             second.packed_residuals[start * second.packed_dim() as usize..].to_vec();
         second.n_docs = (second.doc_num() as usize - half) as u32;
@@ -2383,6 +2509,25 @@ mod tests {
         assert_eq!(loaded.packed_residuals().len(), packed_len);
         assert_eq!(loaded.packed_residuals(), index.packed_residuals());
         assert_eq!(loaded.doc_num(), index.doc_num());
+        // Every array a chunk stores, not just the codes: a wrong range for any
+        // of these searches the wrong centroid and still returns a distance.
+        assert_eq!(loaded.centroids_data(), index.centroids_data());
+        assert_eq!(
+            loaded.centroid_norms_neg_half(),
+            index.centroid_norms_neg_half()
+        );
+        assert_eq!(loaded.doc_lens(), index.doc_lens());
+        assert_eq!(loaded.doc_offsets(), index.doc_offsets());
+        assert_eq!(loaded.centroid_ids(), index.centroid_ids());
+        // The IVF lists are flattened on load; compare per centroid so the
+        // layout change cannot hide a divergence.
+        for c in 0..index.n_centroids() {
+            assert_eq!(
+                loaded.ivf_list(c as u32),
+                index.ivf_list(c as u32),
+                "centroid {c} ivf list"
+            );
+        }
 
         // A mutation materializes them (the file is read-only) and keeps working.
         let mut loaded = loaded;
