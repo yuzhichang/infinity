@@ -159,12 +159,28 @@ impl Engine {
                 .load(Ordering::Relaxed)
         };
 
+        let trace = std::env::var_os("INFINITY_PROFILE_RECLAIM").is_some();
         if stop() {
+            if trace {
+                eprintln!("[reclaim] stop() before any work: goal already met");
+            }
             return 0;
         }
 
         let stats = self.unsealed_table_stats();
+        if trace {
+            let total: u64 = stats.iter().map(|s| s.footprint).sum();
+            eprintln!(
+                "[reclaim] ignore_backoff={ignore_backoff} stats={} footprint={} MiB stop_now={}",
+                stats.len(),
+                total / (1024 * 1024),
+                stop()
+            );
+        }
         if stats.is_empty() {
+            if trace {
+                eprintln!("[reclaim] no table has unsealed rows or index tails");
+            }
             return 0;
         }
         let candidates: Vec<ReclaimCandidate> = stats
@@ -199,7 +215,35 @@ impl Engine {
                 age_ms: now_ts.saturating_sub(stat.last_ts),
             })
             .collect();
+        if trace {
+            eprintln!(
+                "[reclaim] candidates={} of stats={}",
+                candidates.len(),
+                stats.len()
+            );
+            if candidates.len() < stats.len() {
+                for stat in &stats {
+                    let eligible = if ignore_backoff {
+                        self.table_has_unsealed(&stat.key)
+                    } else {
+                        self.reclaim_candidate_eligible(stat)
+                    };
+                    if !eligible {
+                        eprintln!(
+                            "[reclaim]   excluded {} footprint={} failures={} staging={}",
+                            stat.key,
+                            stat.footprint,
+                            stat.dump_failures,
+                            self.has_staging_import(&stat.key)
+                        );
+                    }
+                }
+            }
+        }
         if candidates.is_empty() {
+            if trace {
+                eprintln!("[reclaim] every table was excluded; nothing to dump");
+            }
             return 0;
         }
         let order = rrf_order(&candidates);
@@ -218,10 +262,25 @@ impl Engine {
             if cap != 0 && attempted >= cap {
                 break;
             }
-            if self.dump_table(&key).await {
+            let usage_before = self.memory_usage();
+            let started = std::time::Instant::now();
+            let ok = self.dump_table(&key).await;
+            if trace {
+                let after = self.memory_usage();
+                eprintln!(
+                    "[reclaim]   dump {key} released={ok} in {} ms; RSS {} -> {} MiB",
+                    started.elapsed().as_millis(),
+                    usage_before / (1024 * 1024),
+                    after / (1024 * 1024)
+                );
+            }
+            if ok {
                 progressed = true;
                 dumped += 1;
             }
+        }
+        if trace {
+            eprintln!("[reclaim] round done: dumped={dumped} progressed={progressed} cap={cap}");
         }
         // A round that released nothing must not be repeated on the next slot: it
         // would walk the same hopeless candidates and pay one `list_indexes()`
