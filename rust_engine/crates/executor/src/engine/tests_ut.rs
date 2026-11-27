@@ -19725,6 +19725,57 @@ mod tests {
         );
     }
 
+    /// Under pressure an importing table *is* a candidate, and the dump takes
+    /// only its committed rows.
+    ///
+    /// The marker means "these rows are not settled yet", not "uncommitted" - an
+    /// import commits before it stages - and `dump_table` writes at or below
+    /// `reclaim_bound_ts`, the table's newest committed append ts. Excluding
+    /// the table entirely is what made the ceiling unreachable on a bulk load:
+    /// every table was staging, so the only lever that frees a large amount of
+    /// memory had no candidates.
+    #[tokio::test]
+    async fn pressure_reclaim_includes_a_table_an_import_is_staging_into() {
+        let dir = tempdir().unwrap();
+        let e = Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+        e.execute("CREATE TABLE rp (id INT);").await.unwrap();
+        e.execute("INSERT INTO rp VALUES (1);").await.unwrap();
+        let key = e.table_key("default_db.rp");
+        let before = e
+            .tables
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|entry| entry.unsealed_bytes())
+            .unwrap_or(0);
+        assert!(before > 0, "the insert left unsealed rows");
+        e.tables.lock().unwrap().get_mut(&key).unwrap().importing = 1;
+
+        // A ceiling of zero makes every pass "over the watermark", so the
+        // pressure path runs with `ignore_backoff = true`.
+        e.set_memory_limit(1);
+        // A target below the process's current usage: the drain runs until it
+        // is met or no eligible table remains.
+        let dumped = e.reclaim_unsealed_under_pressure(1).await;
+        assert!(
+            dumped > 0,
+            "the importing table must be a candidate under pressure"
+        );
+        let after = e
+            .tables
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|entry| entry.unsealed_bytes())
+            .unwrap_or(0);
+        assert!(
+            after < before,
+            "the committed rows were dumped: {before} -> {after}"
+        );
+    }
+
     /// A round that releases nothing defers the next one: without the backoff
     /// every tick would walk the same candidates and pay a `list_indexes()` each.
     ///

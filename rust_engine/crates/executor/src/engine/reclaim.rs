@@ -171,7 +171,20 @@ impl Engine {
             .iter()
             .filter(|stat| {
                 if ignore_backoff {
-                    !self.import_in_flight(&stat.key) && self.table_has_unsealed(&stat.key)
+                    // Under pressure a table an import is staging into is still
+                    // a candidate. The marker means "these rows are not settled
+                    // yet", not "uncommitted" - the import commits before it
+                    // stages - and `dump_table` only writes rows at or below
+                    // `reclaim_bound_ts`, which is the table's newest *committed*
+                    // append ts. So the dump publishes exactly the settled part
+                    // and leaves the tail that is still being staged.
+                    //
+                    // Excluding them entirely is what made the ceiling
+                    // unreachable on a bulk load: every table was staging, so
+                    // the only lever that frees a large amount of memory had no
+                    // candidates and the tick reported "nothing left to
+                    // release" while RSS sat above the critical watermark.
+                    self.table_has_unsealed(&stat.key)
                 } else {
                     self.reclaim_candidate_eligible(stat)
                 }
