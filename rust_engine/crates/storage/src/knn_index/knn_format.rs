@@ -144,24 +144,20 @@ pub fn encode_labels(labels: &[u32]) -> Vec<u8> {
 }
 
 /// Decodes the trailing `labels` array.
-pub fn decode_labels(buf: &[u8]) -> Result<Vec<u32>, FormatError> {
-    if !buf.len().is_multiple_of(4) {
-        return Err(FormatError::Truncated {
-            need: (buf.len() / 4 + 1) * 4,
-            got: buf.len(),
-        });
-    }
-    Ok(buf
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect())
+pub fn decode_labels(buf: &[u8]) -> Result<&[u32], FormatError> {
+    // Borrowed, not decoded: the file already stores the labels as native
+    // little-endian `u32`s, so the bytes *are* the slice. `bytemuck` rejects a
+    // length that is not a multiple of 4 and a misaligned buffer, which is what
+    // the hand-written check did.
+    bytemuck::try_cast_slice(buf).map_err(|_| FormatError::Truncated {
+        need: (buf.len() / 4 + 1) * 4,
+        got: buf.len(),
+    })
 }
 
 /// A decoded chunk with an opaque vec-store meta blob (LVQ / RaBitQ).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HnswChunkExt {
+pub struct HnswChunkExt<'a> {
     pub m: u64,
     pub ef_construction: u64,
     pub cur_vec_num: u64,
@@ -169,10 +165,12 @@ pub struct HnswChunkExt {
     pub mmax: u64,
     pub max_layer: i32,
     pub enterpoint: i32,
-    pub store_meta: Vec<u8>,
-    pub vectors: Vec<u8>,
-    pub graph: Vec<u8>,
-    pub labels: Vec<u32>,
+    /// Every region below borrows the chunk buffer: a load maps the file and
+    /// these are windows into it, so reading an index costs no copy at all.
+    pub store_meta: &'a [u8],
+    pub vectors: &'a [u8],
+    pub graph: &'a [u8],
+    pub labels: &'a [u32],
 }
 
 /// Encodes a chunk whose vec-store meta is an opaque blob: the plain `dim u64`
@@ -211,13 +209,13 @@ pub fn encode_hnsw_chunk_ext(
 
 /// Decodes a chunk written by [`encode_hnsw_chunk_ext`]. `store_meta_len` and
 /// `record_size` come from the index metadata (encoding, dimension, metric).
-pub fn decode_hnsw_chunk_ext(
-    buf: &[u8],
+pub fn decode_hnsw_chunk_ext<'a>(
+    buf: &'a [u8],
     store_meta_len: usize,
     record_size: usize,
     vertex_l0_size: usize,
     vertex_lx_size: usize,
-) -> Result<HnswChunkExt, FormatError> {
+) -> Result<HnswChunkExt<'a>, FormatError> {
     if buf.len() < 24 + store_meta_len + 24 {
         return Err(FormatError::Truncated {
             need: 24 + store_meta_len + 24,
@@ -229,7 +227,7 @@ pub fn decode_hnsw_chunk_ext(
     let m = u64_at(0);
     let ef_construction = u64_at(8);
     let cur_vec_num = u64_at(16);
-    let store_meta = buf[24..24 + store_meta_len].to_vec();
+    let store_meta = &buf[24..24 + store_meta_len];
     let mut at = 24 + store_meta_len;
     let mmax0 = u64_at(at);
     let mmax = u64_at(at + 8);
@@ -249,7 +247,7 @@ pub fn decode_hnsw_chunk_ext(
             got: buf.len(),
         });
     }
-    let vectors = buf[at..at + vec_len].to_vec();
+    let vectors = &buf[at..at + vec_len];
     at += vec_len;
     let layer_sum = u64_at(at);
     let graph_len = graph_region_len(
@@ -264,7 +262,7 @@ pub fn decode_hnsw_chunk_ext(
             got: buf.len(),
         });
     }
-    let graph = buf[at..at + graph_len].to_vec();
+    let graph = &buf[at..at + graph_len];
     at += graph_len;
     let labels = decode_labels(&buf[at..])?;
     Ok(HnswChunkExt {
@@ -316,14 +314,14 @@ pub fn graph_region_len(
 
 /// A decoded HNSW chunk file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HnswChunk {
+pub struct HnswChunk<'a> {
     pub header: HnswHeader,
     /// Raw vector region (`cur_vec_num * dim * element_size` bytes).
-    pub vectors: Vec<u8>,
+    pub vectors: &'a [u8],
     /// Raw graph region (see [`graph_region_len`]).
-    pub graph: Vec<u8>,
+    pub graph: &'a [u8],
     /// `SegmentOffset` per vector.
-    pub labels: Vec<u32>,
+    pub labels: &'a [u32],
 }
 
 /// Splits a chunk file into its header, vector region, graph region and labels.
@@ -334,12 +332,12 @@ pub struct HnswChunk {
 /// The graph region is checked against `u64 layer_sum` plus the two strides, so
 /// a truncated or padded file is reported instead of silently accepted (the C++
 /// loader makes the same assertion).
-pub fn decode_hnsw_chunk(
-    buf: &[u8],
+pub fn decode_hnsw_chunk<'a>(
+    buf: &'a [u8],
     element_size: usize,
     vertex_l0_size: usize,
     vertex_lx_size: usize,
-) -> Result<HnswChunk, FormatError> {
+) -> Result<HnswChunk<'a>, FormatError> {
     let (header, mut at) = HnswHeader::decode(buf)?;
     let vec_len = header.vector_region_len(element_size);
     let labels_len = 4 * header.cur_vec_num as usize;
@@ -349,9 +347,9 @@ pub fn decode_hnsw_chunk(
             got: buf.len(),
         });
     }
-    let vectors = buf[at..at + vec_len].to_vec();
+    let vectors = &buf[at..at + vec_len];
     at += vec_len;
-    let graph = buf[at..buf.len() - labels_len].to_vec();
+    let graph = &buf[at..buf.len() - labels_len];
 
     let layer_sum = u64::from_le_bytes(graph[0..8].try_into().unwrap());
     let expected = graph_region_len(

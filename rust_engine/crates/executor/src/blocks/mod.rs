@@ -56,17 +56,19 @@ use storage::knn_index::knn_format;
 
 /// that is on disk (plan #70). `labels[i]` is the row id of node `i`.
 /// Decoded parts of one HNSW chunk.
-pub(crate) struct HnswChunkParts {
+pub(crate) struct HnswChunkParts<'a> {
     pub(crate) m: u64,
     pub(crate) ef: u64,
     pub(crate) n: usize,
     pub(crate) dims: usize,
     pub(crate) max_layer: usize,
     pub(crate) enterpoint: Option<usize>,
-    pub(crate) store_meta: Vec<u8>,
-    pub(crate) records: Vec<u8>,
+    /// Windows into the chunk mapping, not copies of it: a loaded index reads
+    /// its vectors, graph and labels where the publisher left them.
+    pub(crate) store_meta: &'a [u8],
+    pub(crate) records: &'a [u8],
     pub(crate) vertices: Vec<knn_format::HnswGraphVertex>,
-    pub(crate) labels: Vec<u32>,
+    pub(crate) labels: &'a [u32],
     pub(crate) options: HnswOptions,
 }
 

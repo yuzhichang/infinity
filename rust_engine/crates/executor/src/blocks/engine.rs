@@ -7893,7 +7893,7 @@ impl Engine {
         )
         .ok_or_else(|| Error::Invalid("bad HNSW store".to_string()))?;
         Ok((0..parts.n)
-            .zip(parts.labels)
+            .zip(parts.labels.iter().copied())
             .map(|(i, label)| (label, index.vector(i)))
             .collect())
     }
@@ -7904,12 +7904,12 @@ impl Engine {
     /// Decodes one HNSW chunk with the encoding/metric recorded in the
     /// catalog. The store meta length and the record size follow from those
     /// options and the dimension stored in the meta.
-    pub(crate) fn read_hnsw_chunk_parts(
+    pub(crate) fn read_hnsw_chunk_parts<'a>(
         &self,
         table: &str,
         index_name: &str,
-        bytes: &[u8],
-    ) -> Option<HnswChunkParts> {
+        bytes: &'a [u8],
+    ) -> Option<HnswChunkParts<'a>> {
         let options = self.hnsw_options(table, index_name);
         if bytes.len() < 32 {
             return None;
@@ -7956,8 +7956,8 @@ impl Engine {
         })
     }
 
-    pub(crate) fn assemble_loaded_index(
-        parts: HnswChunkParts,
+    pub(crate) fn assemble_loaded_index<'a>(
+        parts: HnswChunkParts<'a>,
         chunk_id: u64,
         stamp: (u64, u64),
         // The mapping `parts.records` points into, so a `Plain` store can read
@@ -8013,7 +8013,7 @@ impl Engine {
         )?;
         Some(LoadedVectorIndex {
             index: HnswHandler::from_index(index),
-            labels: parts.labels,
+            labels: parts.labels.to_vec(),
             chunk_id,
             bytes,
             stamp,
@@ -8028,13 +8028,17 @@ impl Engine {
         // Mapped, not read: the decode borrows the mapping, so the load's
         // transient peak is the decoded graph alone rather than the file plus
         // the graph. `chunk_store().open` keeps the object-store mode working.
-        let mapped = storage::chunk_store::chunk_store()
-            .open(std::path::Path::new(&path))
-            .map_err(|_| Error::NotFound(format!("no HNSW mirror at {}", path.display())))?;
+        let mapped: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = std::sync::Arc::new(
+            storage::chunk_store::chunk_store()
+                .open(std::path::Path::new(&path))
+                .map_err(|_| Error::NotFound(format!("no HNSW mirror at {}", path.display())))?,
+        );
+        // The parts borrow the mapping through the `Arc`, so both live as long
+        // as the index does.
         let parts = self
-            .read_hnsw_chunk_parts(&table, index_name, &mapped)
+            .read_hnsw_chunk_parts(&table, index_name, mapped.as_ref().as_ref())
             .ok_or_else(|| Error::Invalid("bad HNSW chunk".to_string()))?;
-        Self::assemble_loaded_index(parts, 0, file_stamp(&path), std::sync::Arc::new(mapped))
+        Self::assemble_loaded_index(parts, 0, file_stamp(&path), std::sync::Arc::clone(&mapped))
             .ok_or_else(|| Error::Invalid("HNSW mirror has no vectors".to_string()))
     }
 
@@ -8064,18 +8068,22 @@ impl Engine {
                 continue;
             }
             // Mapped for the same reason as `load_vector_index`.
-            let Ok(mapped) = storage::chunk_store::chunk_store().open(std::path::Path::new(&path))
+            let Ok(mapped) = storage::chunk_store::chunk_store()
+                .open(std::path::Path::new(&path))
+                .map(|m| std::sync::Arc::new(m) as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
             else {
                 continue;
             };
-            let Some(parts) = self.read_hnsw_chunk_parts(&table, index_name, &mapped) else {
+            let Some(parts) =
+                self.read_hnsw_chunk_parts(&table, index_name, mapped.as_ref().as_ref())
+            else {
                 continue;
             };
             if let Some(loaded) = Self::assemble_loaded_index(
                 parts,
                 chunk_id,
                 file_stamp(&path),
-                std::sync::Arc::new(mapped),
+                std::sync::Arc::clone(&mapped),
             ) {
                 out.push(loaded);
             }
@@ -8112,13 +8120,17 @@ impl Engine {
             .into_iter()
             .find(|(id, _)| *id == chunk_id)
             .map(|(_, path)| path)?;
-        let bytes = storage::chunk_store::read_file(&path).ok()?;
-        let parts = self.read_hnsw_chunk_parts(&table, index_name, &bytes)?;
-        // Read into a buffer, not mapped: there is no mapping to hand over, so
-        // the store owns its copy. This path decodes one chunk by id for
-        // inspection, not the bulk load that the zero-copy arm exists for.
-        let owned: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = std::sync::Arc::new(bytes);
-        Self::assemble_loaded_index(parts, chunk_id, file_stamp(&path), owned)
+        // Read into a buffer rather than mapped: this path decodes one chunk by
+        // id for inspection, not the bulk load the zero-copy arm exists for.
+        let owned: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> =
+            std::sync::Arc::new(storage::chunk_store::read_file(&path).ok()?);
+        let parts = self.read_hnsw_chunk_parts(&table, index_name, owned.as_ref().as_ref())?;
+        Self::assemble_loaded_index(
+            parts,
+            chunk_id,
+            file_stamp(&path),
+            std::sync::Arc::clone(&owned),
+        )
     }
 
     /// `chunk_id -> (file size, mtime seconds)` for the live chunks.
