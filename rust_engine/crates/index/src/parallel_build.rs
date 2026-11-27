@@ -34,7 +34,7 @@ use crate::lsg::LsgIndex;
 use crate::vector::{Cand, SearchScratch, Store};
 
 /// The graph with one lock per vertex, the shape a concurrent build needs.
-pub(crate) type LockedLinks = Vec<Vec<RwLock<Vec<usize>>>>;
+pub(crate) type LockedLinks = Vec<Vec<RwLock<Vec<u32>>>>;
 
 /// The query a build searches with.
 ///
@@ -194,9 +194,9 @@ impl<'a> Builder<'a> {
     /// row once the first line is in. The reference's `PrefetchVec` likewise
     /// touches one line (`cache_prefetch`, one hint per vector).
     #[inline(always)]
-    fn prefetch_rows(&self, nodes: &[usize], from: usize, count: usize) {
+    fn prefetch_rows(&self, nodes: &[u32], from: usize, count: usize) {
         for &node in nodes.iter().take(from + count).skip(from) {
-            if let Some(row) = self.store.plain_row(node) {
+            if let Some(row) = self.store.plain_row(node as usize) {
                 // `black_box` keeps the load alive without letting the value
                 // reach the distance loop's own expression.
                 let _ = std::hint::black_box(row.first().copied());
@@ -234,7 +234,7 @@ impl<'a> Builder<'a> {
     /// 200k build under `perf`. Holding the read lock is safe because the
     /// closure only reads memory and computes distances: it takes no other
     /// lock, so a writer waiting for this vertex cannot block the holder.
-    fn with_neighbors<R>(&self, layer: usize, node: usize, f: impl FnOnce(&[usize]) -> R) -> R {
+    fn with_neighbors<R>(&self, layer: usize, node: usize, f: impl FnOnce(&[u32]) -> R) -> R {
         match self.links.get(layer).and_then(|l| l.get(node)) {
             Some(cell) => {
                 let list = cell.read().unwrap_or_else(|e| e.into_inner());
@@ -269,12 +269,12 @@ impl<'a> Builder<'a> {
                     .write()
                     .unwrap_or_else(|e| e.into_inner());
                 own.clear();
-                own.extend_from_slice(neighbors);
+                own.extend(neighbors.iter().map(|&n| n as u32));
             }
             // A reverse-link prune runs the heuristic again, which reuses
             // `select`'s buffers, so the loop walks its own copy of the list
             // (the slice borrows `select` and cannot outlive that call).
-            let neighbors = neighbors.to_vec();
+            let neighbors: Vec<usize> = neighbors.iter().map(|&n| n as usize).collect();
             for nb in neighbors {
                 self.connect_neighbors(nb, node, layer, select);
             }
@@ -294,7 +294,7 @@ impl<'a> Builder<'a> {
         let mut list = self.links[layer][target]
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        if list.contains(&node) {
+        if list.contains(&(node as u32)) {
             // Already a neighbour. The serial path cannot see this (a vertex is
             // only ever linked once, by its own build), but in a batch the entry
             // vertex is built before its neighbours exist, so its list can
@@ -302,17 +302,18 @@ impl<'a> Builder<'a> {
             return;
         }
         if list.len() < max_m {
-            list.push(node);
+            list.push(node as u32);
             return;
         }
         let mut cands: Vec<(f32, usize)> = Vec::with_capacity(list.len() + 1);
         cands.push((self.distance_nodes(target, node), node));
         for &nb in list.iter() {
+            let nb = nb as usize;
             cands.push((self.distance_nodes(target, nb), nb));
         }
         let kept = self.select_neighbors(&cands, max_m, select);
         list.clear();
-        list.extend(kept);
+        list.extend(kept.iter().map(|&n| n as u32));
     }
 
     /// `SelectNeighborsHeuristic`: closer-than-a-kept-neighbour candidates are
@@ -377,6 +378,7 @@ impl<'a> Builder<'a> {
                 let mut best = (cur, cur_d);
                 // Farthest first, as the reference walks its list.
                 for &nb in list.iter().rev() {
+                    let nb = nb as usize;
                     if nb >= nodes {
                         continue;
                     }
@@ -443,6 +445,7 @@ impl<'a> Builder<'a> {
                     if at.is_multiple_of(PREFETCH_AHEAD) {
                         self.prefetch_rows(list, at, PREFETCH_AHEAD);
                     }
+                    let nb = nb as usize;
                     if nb >= nodes || nb == self_id || !visited.visit(nb) {
                         continue;
                     }

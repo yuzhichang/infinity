@@ -7887,7 +7887,11 @@ impl Engine {
             Some(backing.clone()),
             parts.n,
             Vec::new(),
-            Vec::new(),
+            // Reading the vectors only; the graph is not consulted.
+            index::vector::FlatGraph {
+                offsets: Vec::new(),
+                neighbors: Vec::new(),
+            },
             None,
             0,
         )
@@ -7977,31 +7981,14 @@ impl Engine {
                     .count()
             })
             .collect();
-        // The flat region is already the CSR the index searches with, so it is
-        // moved through rather than rebuilt: the previous shape allocated one
-        // `Vec` per vertex here and copied every neighbor twice (u32 -> usize ->
-        // flat).
-        let links: Vec<Vec<Vec<usize>>> = parts
-            .graph
-            .offsets
-            .iter()
-            .zip(&parts.graph.neighbors)
-            .map(|(offsets, neighbors)| {
-                offsets
-                    .windows(2)
-                    .map(|w| {
-                        neighbors[w[0] as usize..w[1] as usize]
-                            .iter()
-                            .map(|&n| n as usize)
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
         let entry = parts.enterpoint.map(|e| e.min(parts.n.saturating_sub(1)));
-        let graph_bytes: usize = links
+        // The flat region is already the CSR the index searches with, so it is
+        // moved straight in. Rebuilding a nested `Vec<Vec<Vec<usize>>>` here
+        // allocated one `Vec` per vertex and copied every neighbour twice.
+        let graph_bytes: usize = parts
+            .graph
+            .neighbors
             .iter()
-            .flat_map(|layer| layer.iter())
             .map(|neighbors| neighbors.len() * 4 + 24)
             .sum();
         let bytes = parts.records.len() + parts.labels.len() * 4 + levels.len() * 8 + graph_bytes;
@@ -8016,13 +8003,24 @@ impl Engine {
             Some(backing.clone()),
             parts.n,
             levels,
-            links,
+            index::vector::FlatGraph {
+                offsets: parts.graph.offsets,
+                neighbors: parts.graph.neighbors,
+            },
             entry,
             parts.max_layer,
         )?;
         Some(LoadedVectorIndex {
             index: HnswHandler::from_index(index),
-            labels: parts.labels.to_vec(),
+            labels: {
+                // A window, not a copy: the labels are `u32`s inside the chunk
+                // mapping and the `Arc` a few lines up keeps it mapped.
+                let ptr = parts.labels.as_ptr();
+                let len = parts.labels.len();
+                blocks::index_chunk::Labels::Mapped(blocks::index_chunk::MappedLabels::new(
+                    backing, ptr, len,
+                ))
+            },
             chunk_id,
             bytes,
             stamp,

@@ -106,9 +106,93 @@ impl HnswOptions {
     }
 }
 
+/// A `u32` label window into the chunk mapping, kept alive by the `Arc`.
+///
+/// `Deref<Target = [u32]>` so every reader (`.len()`, `[node]`, `.iter()`)
+/// works unchanged; the point is that a load stops copying the label array -
+/// 33 MB on the L scenario - out of a file that is already mapped.
+pub struct MappedLabels {
+    _owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ptr: *const u32,
+    len: usize,
+}
+
+#[allow(unsafe_code)]
+impl MappedLabels {
+    /// A window over `ptr`/`len`, which must point into `owner`'s mapping.
+    ///
+    /// The caller established the range; this only records it. `ptr` is the
+    /// label array's own address inside the mapping, so it is 4-byte aligned by
+    /// construction (`bytemuck` checked that when the region was decoded).
+    pub fn new(
+        owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+        ptr: *const u32,
+        len: usize,
+    ) -> Self {
+        Self {
+            _owner: owner,
+            ptr,
+            len,
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+impl std::ops::Deref for MappedLabels {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        // SAFETY: `_owner` keeps the mapping alive for `&self`; the bytes are
+        // immutable (a chunk is published by rename); `ptr`/`len` came from
+        // `bytemuck::try_cast_slice` at construction.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+// SAFETY: the only shared state is the `Arc` (already `Send + Sync`) and a
+// pointer into memory it owns and never mutates.
+#[allow(unsafe_code)]
+unsafe impl Send for MappedLabels {}
+#[allow(unsafe_code)]
+unsafe impl Sync for MappedLabels {}
+
+pub enum Labels {
+    Owned(Vec<u32>),
+    Mapped(MappedLabels),
+}
+
+impl std::fmt::Debug for Labels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl PartialEq for Labels {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<u32>> for Labels {
+    fn eq(&self, other: &Vec<u32>) -> bool {
+        &**self == other.as_slice()
+    }
+}
+
+impl std::ops::Deref for Labels {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(m) => m,
+        }
+    }
+}
+
 pub struct LoadedVectorIndex {
     pub index: HnswHandler,
-    pub labels: Vec<u32>,
+    pub labels: Labels,
     /// The `chunk_{id}.idx` this graph came from, so a later reload can load
     /// only the chunks written since the last one.
     pub chunk_id: u64,

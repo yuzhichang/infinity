@@ -773,28 +773,68 @@ impl Store {
 }
 
 /// Flat CSR-like adjacency list for one layer of an immutable/loaded graph.
+/// A chunk's graph region as flat arrays: `offsets[layer][node]` indexes into
+/// `neighbors[layer]`.
+///
+/// The same shape as `storage::knn_format::FlatGraphRegion`, declared here
+/// because `index` does not depend on `storage`; the loader converts one to the
+/// other by moving the arrays.
+pub struct FlatGraph {
+    pub offsets: Vec<Vec<u32>>,
+    pub neighbors: Vec<Vec<u32>>,
+}
+
+impl FlatGraph {
+    /// Widens a builder's nested adjacency into the CSR. The remaining copy
+    /// path in this file, and only for callers that start from nested lists
+    /// (the builder and the tests) - a loaded chunk arrives already flat.
+    pub fn from_nested(links: Vec<Vec<Vec<usize>>>) -> Self {
+        let mut offsets = Vec::with_capacity(links.len());
+        let mut neighbors = Vec::with_capacity(links.len());
+        for layer in &links {
+            let mut layer_offsets = Vec::with_capacity(layer.len() + 1);
+            layer_offsets.push(0u32);
+            let mut layer_neighbors: Vec<u32> =
+                Vec::with_capacity(layer.iter().map(Vec::len).sum());
+            for nbs in layer {
+                layer_neighbors.extend(nbs.iter().map(|&n| n as u32));
+                layer_offsets.push(layer_neighbors.len() as u32);
+            }
+            offsets.push(layer_offsets);
+            neighbors.push(layer_neighbors);
+        }
+        Self { offsets, neighbors }
+    }
+}
+
 struct FlatLayer {
-    offsets: Vec<usize>,
-    neighbors: Vec<usize>,
+    /// `offsets[node]..offsets[node + 1]` is the node's neighbor range in
+    /// `neighbors`. `u32` because that is what a chunk stores and what a node
+    /// id is; `usize` doubled the adjacency for no gain.
+    offsets: Vec<u32>,
+    neighbors: Vec<u32>,
 }
 
 impl FlatLayer {
+    /// The builder's shape: nested lists widened into the CSR. This is the one
+    /// path that still copies, because the builder produces nested lists; a
+    /// loaded chunk takes the CSR as it is.
     fn from_nested(layer: &[Vec<usize>]) -> Self {
         let total: usize = layer.iter().map(Vec::len).sum();
         let mut offsets = Vec::with_capacity(layer.len() + 1);
-        let mut neighbors = Vec::with_capacity(total);
-        offsets.push(0);
+        let mut neighbors: Vec<u32> = Vec::with_capacity(total);
+        offsets.push(0u32);
         for nbs in layer {
-            neighbors.extend_from_slice(nbs);
-            offsets.push(neighbors.len());
+            neighbors.extend(nbs.iter().map(|&n| n as u32));
+            offsets.push(neighbors.len() as u32);
         }
         Self { offsets, neighbors }
     }
 
     #[inline]
-    fn get(&self, node: usize) -> Option<&[usize]> {
-        let start = *self.offsets.get(node)?;
-        let end = *self.offsets.get(node + 1)?;
+    fn get(&self, node: usize) -> Option<&[u32]> {
+        let start = *self.offsets.get(node)? as usize;
+        let end = *self.offsets.get(node + 1)? as usize;
         self.neighbors.get(start..end)
     }
 
@@ -822,7 +862,7 @@ pub struct HnswIndex {
     /// call - free when an index was built in one batch, and O(rows x layers)
     /// per call once a caller feeds the rows a block at a time (123 calls on
     /// SIFT 1M).
-    links: Vec<Vec<std::sync::RwLock<Vec<usize>>>>,
+    links: Vec<Vec<std::sync::RwLock<Vec<u32>>>>,
     /// Lock-free flat adjacency lists for loaded/sealed graphs (`from_store_parts`).
     /// When non-empty, `links` is empty and searches read without taking any lock.
     flat_links: Vec<FlatLayer>,
@@ -1009,7 +1049,9 @@ impl HnswIndex {
     /// handed out. The hot paths inside this type use [`Self::with_neighbors`]
     /// instead, which reads the list under the lock and allocates nothing.
     pub fn neighbors(&self, layer: usize, node: usize) -> Vec<usize> {
-        self.with_neighbors(layer, node, |list| list.to_vec())
+        self.with_neighbors(layer, node, |list| {
+            list.iter().map(|&n| n as usize).collect()
+        })
     }
 
     /// `GetNeighbors` with the read lock held for the span of `f`.
@@ -1020,7 +1062,7 @@ impl HnswIndex {
         &self,
         layer: usize,
         node: usize,
-        f: impl FnOnce(&[usize]) -> R,
+        f: impl FnOnce(&[u32]) -> R,
     ) -> R {
         if !self.flat_links.is_empty() {
             return match self.flat_links.get(layer).and_then(|l| l.get(node)) {
@@ -1028,10 +1070,13 @@ impl HnswIndex {
                 None => f(&[]),
             };
         }
+        // The building graph keeps its lists as `Vec<usize>` behind a lock; only
+        // this path widens, and it is never the one a loaded index takes.
         match self.links.get(layer).and_then(|l| l.get(node)) {
             Some(cell) => {
                 let list = cell.read().unwrap_or_else(|e| e.into_inner());
-                f(&list)
+                let narrowed: Vec<u32> = list.iter().map(|&n| n as u32).collect();
+                f(&narrowed)
             }
             None => f(&[]),
         }
@@ -1059,9 +1104,10 @@ impl HnswIndex {
                 return Err(Error::Invalid(format!("entry {entry} outside 0..{n}")));
             }
         }
-        let check_node = |layer: usize, node: usize, neighbors: &[usize]| -> Result<()> {
+        let check_node = |layer: usize, node: usize, neighbors: &[u32]| -> Result<()> {
             let mut seen = HashSet::with_capacity(neighbors.len());
             for &neighbor in neighbors {
+                let neighbor = neighbor as usize;
                 if neighbor >= n {
                     return Err(Error::Invalid(format!(
                         "layer {layer} node {node} links to {neighbor} outside 0..{n}"
@@ -1334,6 +1380,45 @@ impl HnswIndex {
         }
     }
 
+    /// Builds the flat adjacency straight from the chunk's CSR region.
+    ///
+    /// [`Self::from_store_parts`] takes nested `Vec<Vec<Vec<usize>>>` because
+    /// the builder produces that shape; a loaded chunk already has the CSR, so
+    /// routing it through the nested form meant one `Vec` per vertex and two
+    /// copies of every neighbor. This takes the two arrays as they are.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_flat_parts(
+        dims: usize,
+        m: usize,
+        ef_search: usize,
+        store: Store,
+        levels: Vec<usize>,
+        graph: FlatGraph,
+        entry: Option<usize>,
+        max_level: usize,
+    ) -> Self {
+        Self {
+            dims,
+            m,
+            ef_construction: m * 2,
+            ef_search,
+            ml: 1.0 / (m as f64).ln(),
+            store,
+            lsg: None,
+            levels,
+            links: Vec::new(),
+            flat_links: graph
+                .offsets
+                .into_iter()
+                .zip(graph.neighbors)
+                .map(|(offsets, neighbors)| FlatLayer { offsets, neighbors })
+                .collect(),
+            entry,
+            max_level,
+            rng: Rng::new(0x9E37_79B9_7F4A_7C15),
+        }
+    }
+
     fn ensure_locked_links(&mut self) {
         if self.flat_links.is_empty() {
             return;
@@ -1500,7 +1585,10 @@ impl HnswIndex {
         backing: Option<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>,
         n: usize,
         levels: Vec<usize>,
-        links: Vec<Vec<Vec<usize>>>,
+        // The chunk's CSR adjacency, taken as decoded. Routing it through
+        // `Vec<Vec<Vec<usize>>>` (what a builder produces) meant one `Vec` per
+        // vertex and two copies of every neighbour on load.
+        graph: FlatGraph,
         entry: Option<usize>,
         max_level: usize,
     ) -> Option<Self> {
@@ -1554,8 +1642,8 @@ impl HnswIndex {
                 )?)
             }
         };
-        Some(Self::from_store_parts(
-            dims, m, ef_search, store, None, levels, links, entry, max_level,
+        Some(Self::from_flat_parts(
+            dims, m, ef_search, store, levels, graph, entry, max_level,
         ))
     }
 
@@ -1619,12 +1707,13 @@ impl HnswIndex {
             .write()
             .unwrap_or_else(|e| e.into_inner());
         if list.len() < max_m {
-            list.push(node);
+            list.push(node as u32);
             return;
         }
         let mut cands: Vec<(f32, usize)> = Vec::with_capacity(list.len() + 1);
         cands.push((self.distance_nodes(target, node), node));
         for &nb in list.iter() {
+            let nb = nb as usize;
             cands.push((self.distance_nodes(target, nb), nb));
         }
         let kept = self.select_neighbors_heuristic(&cands, max_m);
@@ -1632,7 +1721,7 @@ impl HnswIndex {
         // vector (as the reference's in-slab write does not) would throw that
         // capacity away and reallocate on the next prune.
         list.clear();
-        list.extend(kept.into_iter().map(|(_, n)| n));
+        list.extend(kept.into_iter().map(|(_, n)| n as u32));
     }
 
     /// `Build`: insert one vector into the graph.
@@ -1907,7 +1996,8 @@ impl HnswIndex {
             ep = neighbors[0].1;
             *self.links[l as usize][node]
                 .write()
-                .unwrap_or_else(|e| e.into_inner()) = neighbors.iter().map(|(_, n)| *n).collect();
+                .unwrap_or_else(|e| e.into_inner()) =
+                neighbors.iter().map(|(_, n)| *n as u32).collect();
             for (_, nb) in &neighbors {
                 self.connect_neighbors(*nb, node, l as usize);
             }
@@ -1933,6 +2023,7 @@ impl HnswIndex {
                 let mut changed = false;
                 if let Some(list) = flat_layer.get(cur) {
                     for &nb in list.iter().rev() {
+                        let nb = nb as usize;
                         let d = self.distance_query(q, self_id, nb);
                         if d < cur_d {
                             cur = nb;
@@ -1951,6 +2042,7 @@ impl HnswIndex {
             if let Some(cell) = self.links.get(layer).and_then(|l| l.get(cur)) {
                 let list = cell.read().unwrap_or_else(|e| e.into_inner());
                 for &nb in list.iter().rev() {
+                    let nb = nb as usize;
                     let d = self.distance_query(q, self_id, nb);
                     if d < cur_d {
                         cur = nb;
@@ -2065,6 +2157,7 @@ impl HnswIndex {
                     continue;
                 };
                 for &nb in list {
+                    let nb = nb as usize;
                     if nb < nodes && visited.visit(nb) {
                         to_visit.push(nb);
                     }
@@ -2075,6 +2168,7 @@ impl HnswIndex {
                 };
                 let list = cell.read().unwrap_or_else(|e| e.into_inner());
                 for &nb in list.iter() {
+                    let nb = nb as usize;
                     if nb < nodes && visited.visit(nb) {
                         to_visit.push(nb);
                     }
@@ -2372,7 +2466,18 @@ pub(crate) mod chunk_file {
         }
         assert_eq!(reader.pos, reader.bytes.len(), "trailing HNSW bytes");
         HnswIndex::from_chunk_parts(
-            dims, m, ef_search, metric, encoding, &meta, &records, None, n, levels, links, entry,
+            dims,
+            m,
+            ef_search,
+            metric,
+            encoding,
+            &meta,
+            &records,
+            None,
+            n,
+            levels,
+            crate::vector::FlatGraph::from_nested(links),
+            entry,
             max_level,
         )
         .expect("chunk parts")
@@ -2738,7 +2843,7 @@ mod reference_suite {
             None,
             index.len(),
             levels,
-            links,
+            FlatGraph::from_nested(links),
             index.entry_point(),
             max_level,
         )

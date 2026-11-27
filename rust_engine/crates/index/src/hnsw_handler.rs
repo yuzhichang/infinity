@@ -283,7 +283,7 @@ mod reference_suite {
             None,
             n,
             levels,
-            links,
+            crate::vector::FlatGraph::from_nested(links),
             index.entry_point(),
             max_level,
         )

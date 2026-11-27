@@ -26,7 +26,11 @@
 //! Execution is single-threaded per fragment; the reference's task scheduler is
 //! the part of the model that is not ported (see `docs/CLASS_MAP.md`).
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: `blocks::index_chunk::MappedLabels` needs one unsafe
+// block to hand a chunk's label array back as `&[u32]` without copying it.
+// `forbid` cannot be lifted by an inner attribute, and threading a lifetime
+// through every type that holds a loaded index is not worth avoiding one
+// documented cast. Everything else in this crate stays safe.
 // Portable SIMD (stable in neither channel yet, so the workspace pins a nightly
 // toolchain - see `rust-toolchain.toml`) keeps the `MaxSim` kernels safe code:
 // a tensor `MATCH` spends its time in `sum_q max_d dot(q, d)`, and `std::arch`
