@@ -289,7 +289,24 @@ block_map(table, root, id)            ← BlockId → 符号对象的解析 + �
 | `buffer_obj_ut.rs` 的 `buffer_used_bytes` 断言 | 改为断言 `mapped_bytes_of(table)` 归零 |
 | `index_combination_soak.rs` 注释 | 更新（失效机制仍在，实现变了） |
 
-#### 3.4 验收
+#### 3.4 实施记录（已完成）
+
+实际改动的与计划一致，另有一处**计划漏掉的真问题**：
+
+**符号缓存让映射永不空闲。** `BlockMapCache` 持有 `Arc<MappedBlock>`，`MappedBlock` 持有 `MappedFile` 的 `Arc` —— 于是 `MappedFile` 的引用计数永不归零，`handles` 永远 > 0，回收阶梯的 `unmap_idle` 一个映射也撤不掉。**回收完全失效，比原来的 LRU 更糟。** `a_tick_over_the_ceiling_gives_the_block_mappings_back` 直接抓到（`mapped_of_table` 前后不变、`idle=0`）。
+
+修法：`release_idle_mappings` 先按表**丢符号**（`drop_block_symbols_for_reclaim`，按 `mapped_bytes_by_table` 从大到小），再 `unmap_idle_mappings`。下一次读重新解析块（每块一次目录遍历），这是拿回地址空间的代价。计划 §3.1 里"符号与映射分离"的说法漏了这一步，已在此补记。
+
+其余改动：
+- `BlockMapCache` 只留 `entries` + `generations`（+ `get`/`insert`/`remove`/`retain_table`/`blocks`，`len` 降为 `#[cfg(test)]`）。
+- `drop_block_maps` = `retain_table` + `unmap_idle_of`。
+- `shrink_block_maps` → `release_idle_mappings`（`memory.rs` 回收阶梯第 4 步）。
+- `buffer_used_bytes()` 删除；`BufferPoolUsage` 改 `mapped_bytes()`；`BufferedObjectCount` 改 `mapping_count()`；`mem_bench` / `memory.rs` 诊断改 `mapped_bytes()`。
+- 测试：`the_block_map_evicts_the_least_recently_used_mapping` → `the_block_map_keeps_one_symbol_per_block`；两个预算测试 → `dropping_a_table_releases_only_its_own_mappings`；`buffer_obj_ut` 的 LRU 断言改为"去重 + 上限"。
+
+**测试串行化**：映射表是进程级的，断言精确值的测试会互相干扰。新增 `storage::mapped::test_guard()`（`#[cfg(debug_assertions)]`——`cfg(test)` 传不到依赖 crate），并改用**增量**断言而非绝对值：表 id 只在单个引擎内唯一，跨引擎同 id 会串。
+
+#### 3.5 验收
 
 ① 块重写后立即读到新内容（generation 仍生效）② `index_combination_soak` 通过 ③ drop 表后该表映射归零 ④ `SHOW BUFFERS` 三个字段有数据且语义如 3.2 ⑤ 并发读同一块只产生一个 VMA
 

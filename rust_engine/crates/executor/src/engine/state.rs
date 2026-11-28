@@ -6594,17 +6594,28 @@ pub(crate) fn scalar_only(types: &[String]) -> bool {
     })
 }
 
-/// The process's shared map of sealed blocks, bounded by the buffer budget.
+/// `BlockId` → the block's symbol object, and the rewrite generation per id.
 ///
-/// A sealed block's files never change, so one mapping can serve every reader
-/// in the process - but "can be shared" is not "must stay mapped". A table
-/// larger than the budget would otherwise keep one mapping per block for the
-/// life of the process: address space that never shrinks, plus a resident page
-/// for every page ever read. The reference bounds the same structure with its
-/// buffer manager's LRU; here the entry *is* the mapping, so evicting it
-/// unmaps the block and that is what actually gives the memory back. Readers
-/// already holding the `Arc` keep reading their mapping: the file is immutable
-/// and only the cache's reference goes away.
+/// **This is not a mapping cache.** A `MappedBlock` holds `MappedFile`
+/// handles, whose mapping lifetime, dedup and reclaim belong to
+/// `storage::mapped` (`docs/MAP_MANAGER_PLAN.md` §3.0): that layer keys by
+/// `(dev, ino)`, holds one VMA per file and decides what to give back, per
+/// table. What is left here is the part only the engine can answer - *which
+/// block object is `BlockId`* - and the part only the write path can answer -
+/// *has this id been rewritten since a reader started opening it*.
+///
+/// The two layers cannot be one: a `BlockId` maps to **two inodes at once**
+/// while a rewrite is in flight. A reader that started before it holds the old
+/// `MappedBlock` (old inode) while a new reader needs the new one, so the
+/// mapping table has both objects and this map has only the newest symbol. A
+/// table keyed by `BlockId` cannot express that, which is the whole reason
+/// `generations` exists.
+///
+/// So an entry leaves for exactly two reasons: its block was rewritten or
+/// deleted (`remove` / `retain_table`), or nothing. There is no budget and no
+/// clock hand - unmapping is a reclaim decision about a *table*, made one layer
+/// down, and the address space an idle block holds is already bounded there by
+/// `IDLE_MAPPING_LIMIT`.
 pub(crate) struct BlockMapCache {
     entries: std::collections::HashMap<storage::format::BlockId, CachedBlock>,
     /// One counter per block that has ever been rewritten, bumped **after** the
@@ -6617,28 +6628,14 @@ pub(crate) struct BlockMapCache {
     /// writes - from being cached and served forever. Without it a rewrite
     /// could be invisible to the live process until the next restart, while the
     /// files on disk were already correct.
+    ///
+    /// It matters **more** now that entries are no longer evicted: a bad entry
+    /// used to live until the next eviction, and there are no more evictions.
     generations: std::collections::HashMap<storage::format::BlockId, u64>,
-    /// Insertion order, the clock hand's track: eviction walks it from the
-    /// front, giving an entry that was used since its last visit a second
-    /// chance (CLOCK). A full sort by timestamp on every eviction would be
-    /// `O(n log n)` per block on a table larger than the budget - the scan this
-    /// cache exists to serve would then be quadratic.
-    order: std::collections::VecDeque<storage::format::BlockId>,
-    /// Sum of the entries' charges (mapped bytes plus the heap the decoded
-    /// `version` costs), kept in step with every insert/remove so a budget check
-    /// is one load, not a walk.
-    bytes: usize,
 }
 
 struct CachedBlock {
     block: Arc<MappedBlock>,
-    /// Set by [`BlockMapCache::get`]; cleared when the clock hand passes it.
-    referenced: bool,
-    /// What this entry is charged to the budget: [`MappedBlock::bytes`] plus
-    /// [`MappedBlock::heap_bytes`]. The version's `deleted` array alone is
-    /// 64 KiB per block, so charging the mapping's length only would let the
-    /// heap grow to a multiple of the budget.
-    charge: usize,
 }
 
 impl BlockMapCache {
@@ -6646,8 +6643,6 @@ impl BlockMapCache {
         Self {
             entries: std::collections::HashMap::new(),
             generations: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            bytes: 0,
         }
     }
 
@@ -6657,8 +6652,8 @@ impl BlockMapCache {
         self.generations.get(id).copied().unwrap_or(0)
     }
 
-    /// Marks `id` as rewritten: bumps its generation and drops the mapping the
-    /// cache holds, so the next read maps the files the write just landed.
+    /// Marks `id` as rewritten: bumps its generation and drops the symbol the
+    /// cache holds, so the next read resolves the files the write just landed.
     ///
     /// Called **after** the files are written: a reader that opened the
     /// directory while the write was in flight discovers the bump when it tries
@@ -6671,146 +6666,58 @@ impl BlockMapCache {
         next
     }
 
-    /// The mapping for `id`, marked as used since the clock hand last passed.
+    /// The symbol for `id`, if the process already holds one.
     pub(crate) fn get(&mut self, id: &storage::format::BlockId) -> Option<Arc<MappedBlock>> {
-        let entry = self.entries.get_mut(id)?;
-        entry.referenced = true;
-        Some(entry.block.clone())
+        self.entries.get(id).map(|entry| entry.block.clone())
     }
 
-    /// Installs `block` unless another reader got there first (one mapping per
-    /// block), then evicts down to `budget`. Returns the mapping the process
-    /// keeps - which is `block` itself when it was evicted immediately (a
-    /// budget smaller than the block), so the caller always has a valid handle.
+    /// Installs `block` unless another reader got there first, and returns the
+    /// symbol the process keeps.
+    ///
+    /// First writer wins because both readers opened the same inode: the
+    /// second `Arc` would wrap the same mapping a second time, and two symbols
+    /// for one block would diverge on the next `retain_table`. The caller's own
+    /// `block` is still valid when it loses - it just is not the one cached.
     pub(crate) fn insert(
         &mut self,
         id: storage::format::BlockId,
         block: Arc<MappedBlock>,
-        budget: usize,
     ) -> Arc<MappedBlock> {
-        if let Some(existing) = self.entries.get_mut(&id) {
-            existing.referenced = true;
-            return existing.block.clone();
-        }
-        let charge = block.bytes() + block.heap_bytes();
-        self.bytes += charge;
-        self.entries.insert(
-            id,
-            CachedBlock {
-                block: block.clone(),
-                referenced: false,
-                charge,
-            },
-        );
-        self.order.push_back(id);
-        self.shrink_to(budget);
-        // A block dropped by name (`drop_block_map` on a rewrite) leaves its id
-        // on the track; compact once the stale entries outnumber the live ones
-        // so the hand never walks a mostly-dead queue.
-        if self.order.len() > 2 * self.entries.len() + 64 {
-            self.order.retain(|id| self.entries.contains_key(id));
-        }
-        match self.entries.get(&id) {
-            Some(entry) => entry.block.clone(),
-            None => block,
-        }
-    }
-
-    /// Evicts entries until `want` bytes have been dropped, returning how many
-    /// the cache no longer holds.
-    pub(crate) fn shrink_by(&mut self, want: usize) -> usize {
-        if want == 0 {
-            return 0;
-        }
-        let before = self.bytes;
-        let target = before.saturating_sub(want);
-        self.shrink_to(target);
-        before - self.bytes
-    }
-
-    /// Evicts down to a (new) budget, returning what the cache gave up.
-    ///
-    /// A budget that shrinks has to be applied at once: the blocks mapped while
-    /// the engine opened its catalog are hits from then on, and a hit never
-    /// inserts, so waiting for the next miss would leave the old, larger
-    /// footprint resident indefinitely.
-    pub(crate) fn trim_to(&mut self, budget: usize) -> usize {
-        let before = self.bytes;
-        self.shrink_to(budget);
-        before - self.bytes
-    }
-
-    /// Drops entries until the cache covers at most `budget` bytes.
-    fn shrink_to(&mut self, budget: usize) {
-        while self.bytes > budget {
-            if !self.evict_one() {
-                // Every entry was given its second chance and re-queued; the
-                // next round evicts the ones the hand now finds unreferenced.
-                if !self.evict_one() {
-                    break;
-                }
+        match self.entries.entry(id) {
+            std::collections::hash_map::Entry::Occupied(existing) => existing.get().block.clone(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(CachedBlock {
+                    block: block.clone(),
+                });
+                block
             }
         }
-    }
-
-    /// One turn of the clock hand: pops entries from the front, re-queues the
-    /// ones used since their last turn, and removes the first stale one.
-    fn evict_one(&mut self) -> bool {
-        let turns = self.order.len();
-        for _ in 0..turns {
-            let Some(id) = self.order.pop_front() else {
-                return false;
-            };
-            match self.entries.get_mut(&id) {
-                // A stale order entry: the mapping was dropped by name.
-                None => continue,
-                Some(entry) if entry.referenced => {
-                    entry.referenced = false;
-                    self.order.push_back(id);
-                }
-                Some(_) => {
-                    self.remove(&id);
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     pub(crate) fn remove(&mut self, id: &storage::format::BlockId) -> Option<Arc<MappedBlock>> {
-        let entry = self.entries.remove(id)?;
-        self.bytes -= entry.charge;
-        Some(entry.block)
+        self.entries.remove(id).map(|entry| entry.block)
     }
 
-    /// Drops every mapping of one table: its block files were rewritten,
-    /// compacted or deleted, so the mappings no longer describe them.
+    /// Drops every symbol of one table: its block files were rewritten,
+    /// compacted or deleted, so the ids no longer name the same blocks.
+    ///
+    /// The underlying mappings are released separately, by the table-level
+    /// reclaim one layer down (`storage::mapped::unmap_idle_of`) - a symbol
+    /// going away does not have to unmap anything, it only means the next read
+    /// resolves the block again.
     pub(crate) fn retain_table(&mut self, table_id: u64) {
-        let stale: Vec<storage::format::BlockId> = self
-            .entries
-            .keys()
-            .filter(|id| id.table_id == table_id)
-            .copied()
-            .collect();
-        for id in stale {
-            self.remove(&id);
-        }
+        self.entries.retain(|id, _| id.table_id != table_id);
         // A table that is being dropped (or rebuilt under new block ids) has no
         // generation worth remembering.
         self.generations.retain(|id, _| id.table_id != table_id);
-        // Keep the hand's track from filling with ids that no longer resolve.
-        self.order.retain(|id| self.entries.contains_key(id));
     }
 
+    /// How many block symbols the process holds. Read by tests and by nothing
+    /// on the hot path - `SHOW BUFFERS` reports the mapping count instead
+    /// (`docs/MAP_MANAGER_PLAN.md` §3.2).
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    /// Bytes the cache is charged for - the mappings plus the heap their
-    /// decoded versions occupy. This is the number `buffer_pool_usage` reports
-    /// against the budget.
-    pub(crate) fn bytes(&self) -> usize {
-        self.bytes
     }
 
     pub(crate) fn blocks(&self) -> impl Iterator<Item = &Arc<MappedBlock>> {
@@ -6824,10 +6731,11 @@ impl BlockMapCache {
 /// configuration, buffer manager and service handles. `Engine` composes it
 /// instead of owning these fields directly.
 pub(crate) struct Context {
-    /// One mapping per sealed block, shared by every reader in the process and
-    /// bounded by [`Self::buffer_budget`]. An entry goes when the block is
-    /// rewritten or deleted (`Engine::drop_block_maps`) or when it is the least
-    /// recently used one under pressure ([`BlockMapCache::shrink_to`]).
+    /// `BlockId` → the block's symbol object, plus the rewrite generation per
+    /// id. Not a mapping cache: the mappings behind it are owned and bounded by
+    /// `storage::mapped` (`docs/MAP_MANAGER_PLAN.md` §3.0). An entry goes when
+    /// the block is rewritten or its table is dropped or rebuilt
+    /// (`Engine::drop_block_maps`); there is no budget eviction.
     pub(crate) block_maps: Mutex<BlockMapCache>,
     /// The budget the block mappings and the decoded HNSW chunks are each held
     /// to (`memindex_memory_quota` for the dump trigger is separate). Built in

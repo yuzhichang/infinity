@@ -3093,15 +3093,10 @@ impl Engine {
         self.context
             .hnsw_budget
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
-        // Apply it to what is already mapped: opening the catalog maps every
-        // block's `version`, so a budget set after `open()` would otherwise
-        // only take effect when a *new* block is mapped - and those mappings
-        // are hits forever after.
-        self.context
-            .block_maps
-            .lock()
-            .unwrap()
-            .trim_to(bytes.max(1));
+        // No trim of `block_maps` here: it holds symbols, not mappings, and the
+        // mappings it used to bound are reclaimed per table
+        // (`docs/MAP_MANAGER_PLAN.md` §3.0). `buffer_budget` is still the
+        // ceiling on decoded index chunks, applied through `hnsw_budget` above.
     }
 
     /// Sets the process RSS ceiling (`0` = unset).

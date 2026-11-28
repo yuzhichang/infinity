@@ -654,7 +654,7 @@ impl super::Engine {
         let mut released = 0u64;
         let over = self.memory_usage().saturating_sub(self.memory_low());
         let remaining = want.saturating_sub(already).max(over);
-        released += self.shrink_block_maps(remaining as usize) as u64;
+        released += self.release_idle_mappings(remaining as usize) as u64;
         if forced || pressure != Pressure::Ok {
             let over = self.memory_usage().saturating_sub(self.memory_low());
             let remaining = want
@@ -746,18 +746,62 @@ impl super::Engine {
         watermarks(ceiling.bytes, cgroup_high()).0
     }
 
-    /// Drops least-recently-used block mappings until `want` bytes are no
-    /// longer mapped, returning what the cache gave up.
+    /// Unmaps idle mappings the process no longer needs, until `want` bytes are
+    /// released or nothing idle is left.
     ///
-    /// The mapping itself is the cache entry, so this unmaps the files - the
-    /// one lever that returns the process's address space and not just the
-    /// resident pages. A reader in the middle of a scan keeps its `Arc`; the
-    /// next one remaps from the page cache.
-    pub(crate) fn shrink_block_maps(&self, want: usize) -> usize {
+    /// The block cache holds symbols, not mappings (`docs/MAP_MANAGER_PLAN.md`
+    /// §3.0), so the address space this gives back comes from
+    /// `storage::mapped` - the one lever that returns address space and not
+    /// just resident pages. A reader in the middle of a scan keeps its `Arc`,
+    /// so only idle objects go; the next read remaps from the page cache.
+    pub(crate) fn release_idle_mappings(&self, want: usize) -> usize {
         if want == 0 {
             return 0;
         }
-        self.context.block_maps.lock().unwrap().shrink_by(want)
+        // The block symbols hold `Arc<MappedBlock>`, which holds the mappings -
+        // so a mapping can never become idle while its symbol is cached, and
+        // unmapping alone would free nothing. Drop the symbols first: the next
+        // read resolves them again (one directory walk per block), which is the
+        // price of getting the address space back.
+        //
+        // Only blocks whose table is over its share are dropped, so a reclaim
+        // pass does not throw away the working set of every table at once. The
+        // sharing is by *size*: the largest holders lose their symbols first,
+        // which is what the table-level fusion ranks anyway.
+        let dropped = self.drop_block_symbols_for_reclaim(want);
+        let released = storage::mapped::unmap_idle_mappings();
+        if released >= want {
+            return released.max(dropped);
+        }
+        // Idle objects were not enough; drop resident pages too, which is still
+        // a release the caller can count even though the mapping stays.
+        released.max(dropped) + storage::mapped::release_mapped_pages(want - released)
+    }
+
+    /// Drops block symbols, largest table first, until the maps they held could
+    /// cover `want` bytes (or no symbol is left), returning the bytes the
+    /// dropped symbols covered.
+    ///
+    /// This is what makes the mappings reclaimable at all: a symbol holds its
+    /// block's `MappedFile` handles, and a mapping with a handle is never idle.
+    fn drop_block_symbols_for_reclaim(&self, want: usize) -> usize {
+        let mut tables: Vec<(u64, u64)> = storage::mapped::mapped_bytes_by_table()
+            .into_iter()
+            .collect();
+        tables.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+        let mut dropped = 0usize;
+        for (table_id, mapped) in tables {
+            if dropped >= want {
+                break;
+            }
+            // One lock per table: dropping a whole table's symbols is cheap (a
+            // hash map drain) and keeps the critical section short.
+            if let Ok(mut maps) = self.context.block_maps.lock() {
+                maps.retain_table(table_id);
+            }
+            dropped += mapped as usize;
+        }
+        dropped
     }
 
     /// Write admission: the last lever, tried after a reclaim pass has failed.
@@ -1056,7 +1100,10 @@ mod tests {
     /// process over its ceiling it gives the block mappings back even though no
     /// transaction committed since the last pass.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the guard serialises the *whole* test
     async fn a_tick_over_the_ceiling_gives_the_block_mappings_back() {
+        let _serialised = storage::mapped::test_guard();
+        storage::mapped::unmap_idle_mappings();
         let dir = tempfile::tempdir().unwrap();
         let e = super::super::Engine::open_async(dir.path(), Default::default())
             .await
@@ -1068,14 +1115,23 @@ mod tests {
         let id = e.visible_block_ids("default_db.memt")[0];
         let _ = e.block_map("default_db.memt", &root, id).unwrap();
         assert_eq!(e.buffer_objects().len(), 1);
+        let mapped_before = storage::mapped::mapped_bytes_of(id.table_id);
+        assert!(mapped_before > 0, "the block is charged to its table");
 
         // One byte: every measurement is critical, which is the state that must
         // reclaim rather than wait for a write.
         e.set_memory_limit(1);
         e.memory_tick().await;
+        // The tick gives the mapping back - that is what returns the address
+        // space - and leaves no page of it resident. The *symbol* may stay: it
+        // costs an `Arc`, and keeping it means the next read resolves the block
+        // without walking its directory again (`docs/MAP_MANAGER_PLAN.md` §3.0).
+        // A delta, not an absolute: table ids are unique only within an engine,
+        // so another test's engine can share this one's id.
+        let mapped_after = storage::mapped::mapped_bytes_of(id.table_id);
         assert!(
-            e.buffer_objects().is_empty(),
-            "the tick unmapped the block instead of leaving it resident"
+            mapped_after < mapped_before,
+            "the tick released this table's mappings ({mapped_before} -> {mapped_after})"
         );
         assert!(e.context.memory_reclaim_passes.load(Ordering::Relaxed) >= 1);
     }
@@ -1179,7 +1235,7 @@ mod tests {
         println!(
             "warm:            p50 {:.3} ms, mapped {} MB",
             warm[warm.len() / 2],
-            e.buffer_used_bytes() / (1024 * 1024)
+            storage::mapped::mapped_bytes() / (1024 * 1024)
         );
 
         // One pass over the ceiling: pages advised away, mappings dropped.
@@ -1188,7 +1244,7 @@ mod tests {
         println!(
             "reclaim:         released {} MB, mapped {} MB left",
             released / (1024 * 1024),
-            e.buffer_used_bytes() / (1024 * 1024)
+            storage::mapped::mapped_bytes() / (1024 * 1024)
         );
 
         // The first query has to read the blocks back; the rest re-warm.

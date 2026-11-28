@@ -287,7 +287,7 @@ fn main() {
         "budget {budget_mb} MB, rss {} MB, blocks {} mapped {} MB",
         rss_kb() / 1024,
         e.buffer_objects().len(),
-        e.buffer_used_bytes() / (1024 * 1024)
+        storage::mapped::mapped_bytes() / (1024 * 1024)
     );
 
     let (knn, spann, ft) = queries(rows, dim);
@@ -303,6 +303,6 @@ fn main() {
         "  after:  rss {} MB, blocks {} mapped {} MB",
         rss_kb() / 1024,
         e.buffer_objects().len(),
-        e.buffer_used_bytes() / (1024 * 1024)
+        storage::mapped::mapped_bytes() / (1024 * 1024)
     );
 }

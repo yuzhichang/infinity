@@ -118,19 +118,24 @@ async fn global_variables_report_real_counts() {
     engine.flush().await.unwrap();
     engine.read_blocks_pruned("gv", &[], &[]).await.unwrap();
 
-    // Reading the block mirror populates the engine's block cache, so the
-    // buffer counters must see the blocks the test itself created.
+    // Reading the block mirror maps the test's blocks, so the buffer counters
+    // must see them. `buffer_object_count` counts **map objects** - one per
+    // distinct file, blocks and index chunks alike - so it is at least one per
+    // block read (a block maps its column files and its `version`).
     let buffered = number(&engine, "buffer_object_count");
     assert!(
         buffered >= 1,
-        "reading the block mirror must buffer at least one block"
+        "reading the block mirror must map at least one file"
     );
-    // Every cached block is owned by the cache alone right after the read.
+    // Nothing waits for a GC: a mapping is either referenced or gone.
     assert!(number(&engine, "unused_buffer_object") <= buffered);
-    // The cache saw the requests the read issued.
+    // The block path saw the requests the read issued. The counts are over
+    // `BlockId` resolutions (hits + misses), which is a different total from
+    // the map objects above - one resolution may map several files - so this
+    // only asserts that the read was counted at all.
     let misses = global(&engine, "memory_cache_miss");
     let (miss, requests) = misses.split_once('/').expect("misses/requests");
-    assert!(requests.parse::<u64>().unwrap() >= buffered);
+    assert!(requests.parse::<u64>().unwrap() >= 1);
     assert!(miss.parse::<u64>().unwrap() >= 1);
 
     // A live transaction is counted while it exists and its rollback is

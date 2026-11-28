@@ -4620,23 +4620,15 @@ impl Engine {
         // fusion. Done here because every block read passes through, on both the
         // hit and the miss path.
         self.note_table_access(table);
-        // One load per call, whether the block is cached or not: the budget can
-        // be lowered after mappings were made (a config applied to a running
-        // engine maps the catalog's blocks during open), and a hit never
-        // inserts, so insert-time enforcement alone would leave an over-budget
-        // cache resident for the life of the process.
-        let budget = self
-            .context
-            .buffer_budget
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .max(1);
+        // No budget here: the symbols in this cache cost an `Arc` each, and the
+        // mappings behind them are bounded by the table-level reclaim one layer
+        // down (`docs/MAP_MANAGER_PLAN.md` §3.0).
         let mut generation = {
             let mut maps = self.context.block_maps.lock().unwrap();
             if let Some(block) = maps.get(&id) {
                 self.context
                     .block_map_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                maps.trim_to(budget);
                 return Ok(block);
             }
             maps.generation(&id)
@@ -4662,15 +4654,13 @@ impl Engine {
                 }
                 None => Arc::new(MappedBlock::open(root, id)?),
             };
-            // Another reader may have mapped the block while this one did the
-            // I/O: keep the first mapping, so a block has exactly one in the
-            // process. The insert also enforces the buffer budget - a block
-            // beyond it evicts the least recently used mappings rather than
-            // staying mapped forever.
+            // Another reader may have resolved the block while this one did the
+            // I/O: keep the first symbol, so a block has exactly one in the
+            // process. (The mapping itself is deduped a layer down, by inode.)
             let mut maps = self.context.block_maps.lock().unwrap();
             let current = maps.generation(&id);
             if current == generation {
-                return Ok(maps.insert(id, block, budget));
+                return Ok(maps.insert(id, block));
             }
             generation = current;
         }
@@ -4689,15 +4679,22 @@ impl Engine {
         maps.bump_generation(id);
     }
 
-    /// Drops the mappings of every block of `table_id`: the block files under
-    /// it changed (a rewrite, a compaction, a delete), so the mappings no
-    /// longer describe them.
+    /// Drops every block symbol of `table_id` and gives the table's idle
+    /// mappings back: the block files under it changed (a rewrite, a
+    /// compaction, a delete), so neither the ids nor the page cache describe
+    /// the table any more.
+    ///
+    /// Two actions, not one atomic step (`docs/MAP_MANAGER_PLAN.md` §3.1): the
+    /// symbols live here, the mappings one layer down. That is fine - with the
+    /// symbols gone the next reader resolves the block again, so a mapping that
+    /// outlives the call only holds address space a moment longer.
     pub(crate) fn drop_block_maps(&self, table_id: u64) {
         self.context
             .block_maps
             .lock()
             .unwrap()
             .retain_table(table_id);
+        storage::mapped::unmap_idle_of(table_id);
     }
 
     /// Drops the mapping of one block, for a rewrite that only touches that

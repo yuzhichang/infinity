@@ -1161,19 +1161,19 @@ mod tests {
         Arc::new(MappedBlock::open(root, id).unwrap())
     }
 
-    /// The shared block map is a cache, not a registry: a table larger than the
-    /// buffer budget would otherwise keep one mapping per block for the life of
-    /// the process, and that address space (with the resident pages behind it)
-    /// is exactly what a long-running server must not accumulate.
+    /// The block map answers "which object is `BlockId`" and nothing more: it
+    /// does not hold mappings, so it has no budget to enforce
+    /// (`docs/MAP_MANAGER_PLAN.md` §3.0).
     ///
-    /// The budget here is one byte short of the three blocks' total: two always
-    /// fit, three never do, so exactly the least recently used mapping goes.
+    /// What must still hold is the pairing it *does* own: one symbol per id,
+    /// first writer wins, and a rewrite drops the symbol while bumping the
+    /// generation a reader compares against.
     #[test]
-    fn the_block_map_evicts_the_least_recently_used_mapping() {
+    fn the_block_map_keeps_one_symbol_per_block() {
         use crate::engine::state::BlockMapCache;
 
         let dir = tempdir().unwrap();
-        let ids: Vec<storage::format::BlockId> = (0..3u16)
+        let ids: Vec<storage::format::BlockId> = (0..2u16)
             .map(|block_id| storage::format::BlockId {
                 db_id: 1,
                 table_id: 2,
@@ -1185,85 +1185,96 @@ mod tests {
             .iter()
             .map(|id| sealed_block(dir.path(), *id, 4))
             .collect();
-        let charge = |b: &Arc<MappedBlock>| b.bytes() + b.heap_bytes();
-        let budget = blocks.iter().map(charge).sum::<usize>() - 1;
 
         let mut cache = BlockMapCache::new();
-        cache.insert(ids[0], blocks[0].clone(), budget);
-        cache.insert(ids[1], blocks[1].clone(), budget);
-        // Touch the first, so the second is now the least recently used.
-        assert!(cache.get(&ids[0]).is_some());
-        cache.insert(ids[2], blocks[2].clone(), budget);
-
-        assert_eq!(cache.len(), 2, "the third mapping evicted one entry");
-        assert!(cache.get(&ids[0]).is_some(), "the touched block stays");
-        assert!(cache.get(&ids[2]).is_some(), "the newest block stays");
+        assert!(Arc::ptr_eq(
+            &cache.insert(ids[0], blocks[0].clone()),
+            &blocks[0]
+        ));
+        assert!(cache
+            .get(&ids[0])
+            .is_some_and(|b| Arc::ptr_eq(&b, &blocks[0])));
+        // A second insert of the same id keeps the symbol already there: both
+        // callers opened the same inode, so two symbols would diverge when one
+        // of them is dropped.
         assert!(
-            cache.get(&ids[1]).is_none(),
-            "the least recently used mapping is the one unmapped"
+            Arc::ptr_eq(&cache.insert(ids[0], blocks[1].clone()), &blocks[0]),
+            "the first symbol wins"
         );
-        assert_eq!(cache.bytes(), charge(&blocks[0]) + charge(&blocks[2]));
+        assert_eq!(cache.len(), 1);
 
-        // A rewrite/compaction drops a whole table's mappings.
+        // A rewrite drops the symbol and moves the generation forward, which is
+        // what makes a reader that started before it re-open.
+        let before = cache.generation(&ids[0]);
+        let after = cache.bump_generation(ids[0]);
+        assert!(after > before, "the generation advanced");
+        assert!(
+            cache.get(&ids[0]).is_none(),
+            "the rewritten block's symbol is gone"
+        );
+
+        // A whole-table drop clears both halves.
+        cache.insert(ids[1], blocks[1].clone());
         cache.retain_table(2);
         assert_eq!(cache.len(), 0);
-        assert_eq!(cache.bytes(), 0);
+        assert_eq!(cache.generation(&ids[1]), 0);
     }
 
-    /// A budget that **shrinks** applies to what is already mapped. Opening a
-    /// directory maps every block's `version`, and those entries are cache hits
-    /// from then on - a hit never inserts, so enforcement at insert time alone
-    /// would keep the old footprint for the life of the process.
+    /// A block's mappings belong to the table that owns it, and dropping the
+    /// table's symbols gives that table's address space back without touching
+    /// another table's.
+    ///
+    /// This is what replaced the buffer budget: reclamation is a decision about
+    /// a *table* (`docs/MAP_MANAGER_PLAN.md` §3.1), not a per-block LRU.
     #[tokio::test]
-    async fn lowering_the_budget_evicts_what_is_already_mapped() {
+    #[allow(clippy::await_holding_lock)] // the guard serialises the *whole* test
+    async fn dropping_a_table_releases_only_its_own_mappings() {
+        // The table is process-wide, so this asserts on exact bytes only while
+        // no other test is mapping files.
+        let _serialised = storage::mapped::test_guard();
+        storage::mapped::unmap_idle_mappings();
         let dir = tempdir().unwrap();
         let e = Engine::open_async(dir.path(), Default::default())
             .await
             .unwrap();
-        e.execute("CREATE TABLE bml (id INT);").await.unwrap();
-        e.execute("INSERT INTO bml VALUES (1);").await.unwrap();
+        for name in ["bmd_a", "bmd_b"] {
+            e.execute(&format!("CREATE TABLE {name} (id INT);"))
+                .await
+                .unwrap();
+            e.execute(&format!("INSERT INTO {name} VALUES (1),(2),(3);"))
+                .await
+                .unwrap();
+        }
         e.flush().await.unwrap();
         let root = e.blocks_root();
-        let id = e.visible_block_ids("default_db.bml")[0];
-        let _ = e.block_map("default_db.bml", &root, id).unwrap();
-        assert_eq!(e.buffer_objects().len(), 1);
+        let a = e.visible_block_ids("default_db.bmd_a")[0];
+        let b = e.visible_block_ids("default_db.bmd_b")[0];
+        let _ = e.block_map("default_db.bmd_a", &root, a).unwrap();
+        let _ = e.block_map("default_db.bmd_b", &root, b).unwrap();
+        // Both blocks are mapped. The figures are compared as deltas: table ids
+        // are unique only within an engine, so another test's engine with the
+        // same id would be counted by an absolute lookup.
+        assert_eq!(e.buffer_objects().len(), 2);
+        let mapped_before = storage::mapped::mapped_bytes_of(a.table_id);
+        assert!(mapped_before > 0, "the block is charged to its table");
 
-        // No insert follows: only the hit path can react.
-        e.set_buffer_budget(1);
+        // Dropping one table's symbols releases that table's idle mappings and
+        // leaves the other table's alone.
+        e.drop_block_maps(a.table_id);
+        let mapped_after = storage::mapped::mapped_bytes_of(a.table_id);
         assert!(
-            e.buffer_objects().is_empty(),
-            "a lowered budget is applied without waiting for a miss"
+            mapped_after < mapped_before,
+            "dropping the table released its mappings ({mapped_before} -> {mapped_after})"
         );
-    }
-
-    /// A budget smaller than any block keeps the shared map empty, and the
-    /// reader still gets a live mapping for the call that asked for it - the
-    /// budget bounds what the process *keeps*, not what one statement may read.
-    #[tokio::test]
-    async fn a_tiny_buffer_budget_keeps_the_block_map_empty() {
-        let dir = tempdir().unwrap();
-        let e = Engine::open_async(dir.path(), Default::default())
-            .await
-            .unwrap();
-        e.execute("CREATE TABLE bmb (id INT);").await.unwrap();
-        e.execute("INSERT INTO bmb VALUES (1),(2),(3);")
-            .await
-            .unwrap();
-        e.flush().await.unwrap();
-        let root = e.blocks_root();
-        let id = e.visible_block_ids("default_db.bmb")[0];
-        e.set_buffer_budget(1);
-        e.drop_block_maps(id.table_id);
-
-        let block = e.block_map("default_db.bmb", &root, id).unwrap();
-        assert!(block.bytes() > 1);
-        assert!(
-            e.buffer_objects().is_empty(),
-            "a mapping larger than the budget is not retained"
-        );
-        // The rows still read: each block is mapped for the scan and released.
         assert_eq!(
-            row_strings(&e, "SELECT COUNT(*) FROM bmb;").await,
+            e.buffer_objects().len(),
+            1,
+            "only the other table's block stays"
+        );
+
+        // The rows are still readable: the symbols went, the files did not.
+        assert_eq!(
+            row_strings(&e, "SELECT COUNT(*) FROM bmd_a;").await,
             vec![vec!["3".to_string()]]
         );
     }

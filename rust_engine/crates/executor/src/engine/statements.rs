@@ -7529,14 +7529,6 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Bytes the block cache is charged for: the mapped files plus the heap
-    /// their decoded `version`s occupy. The mappings are the page-cache
-    /// footprint the buffer budget used to approximate for blocks (index
-    /// chunks are mapped too, and counted process-wide by `storage::mapped`).
-    pub fn buffer_used_bytes(&self) -> usize {
-        self.context.block_maps.lock().unwrap().bytes()
-    }
-
     /// Begins a table restore that is only applied by
     /// [`PendingRestore::commit`].
     pub fn begin_restore_table_snapshot(&self, name: &str) -> Result<PendingRestore<'_>> {
@@ -12736,19 +12728,24 @@ impl Engine {
             G::SessionCount => "1".to_string(),
             // Mapped bytes over the configured budget: the reference reports
             // what its buffer objects charge the pool, the port reports what
-            // the mappings cover (nothing is copied out of them).
+            // the mappings cover (nothing is copied out of them). This is the
+            // process's whole mapping footprint - every block and index chunk,
+            // deduped by file identity - not just what the block symbol cache
+            // happens to hold (`docs/MAP_MANAGER_PLAN.md` §3.2).
             G::BufferPoolUsage => format!(
                 "{}/{}",
-                self.buffer_used_bytes(),
+                storage::mapped::mapped_bytes(),
                 self.buffer_memory_limit()
             ),
             G::SchedulePolicy => "round robin".to_string(),
             G::NextTxnId => self.txn.current_transaction_id().to_string(),
-            // C++ `BufferManager::BufferedObjectCount`: the reference counts
-            // the payloads it holds; the port counts the block mappings it
-            // shares (index chunks are mapped too, but they belong to the
-            // index structures, not to this pool).
-            G::BufferedObjectCount => self.context.block_maps.lock().unwrap().len().to_string(),
+            // C++ `BufferManager::BufferedObjectCount`: the reference reports
+            // `buffer_map_.size()` - the objects its buffer manager holds. The
+            // equivalent here is the mapping table: one entry per distinct file
+            // the process has mapped, blocks and index chunks alike. Counting
+            // only the block symbols would undercount by every index chunk, and
+            // those are the mappings a search actually keeps resident.
+            G::BufferedObjectCount => storage::mapped::mapping_count().to_string(),
             // C++ `BufferManager::WaitingGCObjectCount`: a mapping is either in
             // use or gone, so nothing waits for the GC.
             G::UnusedBufferObjectCount => "0".to_string(),

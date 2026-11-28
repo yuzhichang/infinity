@@ -634,6 +634,23 @@ impl std::fmt::Debug for MappedFile {
     }
 }
 
+/// A guard a test takes before asserting on exact mapping counts.
+///
+/// The table is process-wide, so two tests that map files at the same time
+/// cannot both see exact numbers. `cargo test` runs a binary's tests in parallel
+/// threads, so this serialises the ones that need exactness - the alternative is
+/// a flaky `left: 573, right: 0`.
+// `cfg(test)` would not reach a dependent crate's tests (that flag is per
+// crate), so this is gated on debug assertions instead - a test binary always
+// has them, and a release build drops the function.
+#[cfg(debug_assertions)]
+pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// How many files this process has mapped.
 pub fn mapping_count() -> usize {
     MAPPINGS.load(Ordering::Relaxed)
