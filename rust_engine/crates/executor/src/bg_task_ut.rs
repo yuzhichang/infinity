@@ -162,6 +162,56 @@ async fn start_background_tasks_sets_processor() {
     drop(engine);
 }
 
+/// The memory chain keeps ticking while the storage chain is busy.
+///
+/// The three chains exist so that one long step cannot stop the others: a
+/// checkpoint takes minutes on a large table, and while it runs the memory
+/// governor must still measure the ceiling and the drain must still be able to
+/// start. With one tick loop that was not true - everything waited behind
+/// whatever was in front of it (`docs/MAP_MANAGER_PLAN.md` §13.4).
+///
+/// `memory_checked_at` is written by `memory_tick` on every tick, so it is the
+/// observable "the memory chain ran". The storage chain's interval is zero here
+/// (it does nothing), which is enough: what this asserts is that the chain is a
+/// task of its own, not a step behind another chain's work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_memory_chain_ticks_independently_of_the_others() {
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap(),
+    );
+    engine
+        .start_background_tasks(
+            std::time::Duration::ZERO, // no checkpoint: nothing on the storage chain
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    let first = engine
+        .context
+        .memory_checked_at
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // The chain sleeps a second between ticks, so a couple of seconds proves it
+    // is running on its own rather than being driven by a statement.
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let now = engine
+            .context
+            .memory_checked_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now > first {
+            engine.drain_background_tasks().await;
+            drop(engine);
+            return;
+        }
+    }
+    panic!("the memory chain never ticked");
+}
+
 #[tokio::test]
 async fn set_config_pauses_and_resumes_periodic_checkpoint() {
     use std::time::Duration;

@@ -589,27 +589,42 @@ impl super::Engine {
     ///
     /// `want` is the target for the whole pass; `forced` turns on the steps that
     /// are expensive to redo and is the critical watermark.
+    /// One reclaim pass: the levers that need no drain, then - only if the
+    /// process is still over - the unsealed drain.
+    ///
+    /// The drain runs **once** and only when the cheap levers did not get the
+    /// process under the high watermark. It used to run on every pass that found
+    /// `budget_bytes() > 0`, which meant a tick could drain twice: once from
+    /// here and once from the tick's own `reclaim_unsealed`, and both queued on
+    /// `unsealed_reclaim_lock` (`docs/MAP_MANAGER_PLAN.md` §13.4).
+    ///
+    /// The two steps also read different thresholds and that is deliberate -
+    /// this one compares the process's resident size against the ceiling, the
+    /// drain compares the unsealed ledger against half its quota. A pass that
+    /// satisfies neither is what leaves a table holding memory while the process
+    /// looks fine.
     pub(crate) async fn reclaim_memory(&self, want: u64, forced: bool) -> u64 {
         let mut released = self.reclaim_cheap_levers(want, forced);
 
-        // The one step that has to await. Guarded on the same condition the
-        // cheap steps escalate under: a pass that already met `want` while still
-        // under `high` has nothing to gain from writing blocks to disk.
         let (_, cgroup) = cgroup_snapshot();
         let over = forced || self.measure_pressure(cgroup.as_ref()) != Pressure::Ok;
-        if over && self.budget_bytes() > 0 {
-            let before = self.memory_usage();
-            let dumped = self
-                .reclaim_unsealed_under_pressure(self.memory_low())
-                .await;
-            if dumped > 0 {
-                // The drain freed rows and index tails; what is left is now
-                // memory the earlier steps can reach, so escalate once more from
-                // scratch rather than reusing the pre-drain figures.
-                released += self.reclaim_cheap_levers(0, forced);
-                let after = self.memory_usage();
-                released = released.saturating_add(before.saturating_sub(after));
-            }
+        if !over {
+            return released;
+        }
+        // Under pressure the unsealed rows are the largest reachable figure, so
+        // the drain is worth a pass even when the cheap levers met `want`: it is
+        // what returns the heap, and the levers above only return pages.
+        let before = self.memory_usage();
+        let dumped = self
+            .reclaim_unsealed_under_pressure(self.memory_low())
+            .await;
+        if dumped > 0 {
+            // The drain freed rows and index tails; what is left is now memory
+            // the earlier steps can reach, so run them once more rather than
+            // reusing the pre-drain figures.
+            released += self.reclaim_cheap_levers(0, forced);
+            let after = self.memory_usage();
+            released = released.saturating_add(before.saturating_sub(after));
         }
         released
     }
@@ -837,6 +852,13 @@ impl super::Engine {
         let (generation, cgroup) = cgroup_snapshot();
         let ceiling = self.ceiling_from(cgroup.as_ref());
         if ceiling.bytes == 0 {
+            // No ceiling: nothing to govern, but the tick still *ran*, and the
+            // stamp says so. Leaving it unset made an ungoverned engine look
+            // like one whose tick had stopped - which is exactly what a
+            // "is the memory chain alive" probe reads.
+            self.context
+                .memory_checked_at
+                .store(elapsed_millis(), Ordering::Relaxed);
             return 0;
         }
         let usage = self.usage_against(cgroup.as_ref());
