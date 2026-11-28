@@ -346,6 +346,13 @@ block_map(table, root, id)            ← BlockId → 符号对象的解析 + �
 | 改造 | `release_mapped_pages` 的遍历：阶段 1 已改为按对象快照后锁外 `madvise`，此处只做收尾核对 |
 | 验收 | ① `cargo clippy --workspace --all-targets` 干净 ② 全量测试 ③ L 场景 RSS 曲线对比 |
 
+**实施记录（阶段 5 已完成）**
+
+- `secondary_lowcard::open_with_kind` 与 `secondary_segment_pgm` 的读取改为 `MappedFile::open_path`：原来各自 `Mmap::map`，拿不到 inode，同一 secondary chunk 被打开两次就是两个 VMA。改后按文件身份去重。
+- `MappedFile::from_mmap` **删除**：两处调用点改完后它没有调用者，按 §7.13 删掉，`ObjectKey` 的文档同步改成"只有 path 映射 + 一个元数据读取失败的兜底键"。
+- `release_mapped_pages` 的遍历核对通过：阶段 1 已改成"先锁内快照 `Arc`、锁外 `madvise`"，本次未再变动。
+- `BlockMapCache` 的外壳**按 §3.0 保留**（`entries` + `generations`），不是删除项。
+
 ---
 
 ## 5. 验收标准

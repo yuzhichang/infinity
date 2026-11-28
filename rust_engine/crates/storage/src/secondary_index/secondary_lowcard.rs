@@ -42,9 +42,7 @@
 //! format is the [RoaringFormatSpec] CRoaring implements.
 
 use crate::mapped::MappedFile;
-use memmap2::Mmap;
 use roaring::RoaringBitmap;
-use std::fs::File;
 use std::path::Path;
 
 use crate::format::FormatError;
@@ -220,14 +218,13 @@ impl LowCardReader {
         Self::open_with_kind(path, KeyKind::U64)
     }
 
-    #[allow(unsafe_code)]
     pub fn open_with_kind(path: &Path, kind: KeyKind) -> Result<Self, FormatError> {
-        let file =
-            File::open(path).map_err(|e| FormatError::Io(format!("{}: {e}", path.display())))?;
-        // SAFETY: read-only mapping of an immutable chunk file.
-        let map = MappedFile::from_mmap(
-            unsafe { Mmap::map(&file) }.map_err(|e| FormatError::Io(e.to_string()))?,
-        );
+        // `open_path` rather than a hand-rolled `Mmap::map`: it registers the
+        // mapping under the file's own identity, so a second open of the same
+        // chunk reuses the mapping instead of adding a VMA
+        // (`docs/MAP_MANAGER_PLAN.md` §4 stage 5).
+        let map = MappedFile::open_path(path)
+            .map_err(|e| FormatError::Io(format!("{}: {e}", path.display())))?;
         if map.len() < 4 {
             return Err(FormatError::Truncated {
                 need: 4,

@@ -50,11 +50,12 @@ static PAGES_RELEASED: AtomicUsize = AtomicUsize::new(0);
 /// file and renames it over the target (`definition::format::write_parts`), so a
 /// stale mapping can never be handed out under the new name.
 ///
-/// The second field is a **disambiguator**, not a size: `(0, n)` for a file
-/// mapped through `open_path`, and `(1, n)` for an `Mmap` a caller built itself
-/// (`from_mmap`), where no inode is known. Keeping the two apart means a
-/// caller-made mapping can never be confused with a file whose device happens to
-/// be `0`.
+/// The first field is a **kind tag**, not part of the identity: `0` identifies a
+/// mapping made from a path, `(u64::MAX, n)` a fallback for a descriptor whose
+/// metadata could not be read (a unique key, so the mapping is never shared by
+/// mistake). Every engine reader now goes through [`MappedFile::open_path`], so
+/// the fallback exists only for that error path - there is no longer a
+/// caller-supplied `Mmap` to invent a second kind for.
 type ObjectKey = (u8, u64, u64);
 
 /// One mapped object and the readers holding it.
@@ -478,46 +479,6 @@ impl MappedFile {
             range: offset..end,
             key: Some(key),
         })
-    }
-
-    /// Takes an already-created mapping (a reader that mapped its own file hands
-    /// the result here, so every mapping in the process is counted the same
-    /// way).
-    ///
-    /// The caller's `Mmap` was built from a descriptor this function never sees,
-    /// so there is no inode to share by: each call is its own object. Prefer
-    /// [`Self::open_path`], which dedups.
-    pub fn from_mmap(map: Mmap) -> Self {
-        let len = map.len();
-        MAPPINGS.fetch_add(1, Ordering::Relaxed);
-        MAPPED_BYTES.fetch_add(len, Ordering::Relaxed);
-        let map = std::sync::Arc::new(map);
-        // A key no `open_path` can produce: the disambiguator is 1.
-        static UNIQUE: AtomicUsize = AtomicUsize::new(1);
-        let key = (1u8, u64::MAX, UNIQUE.fetch_add(1, Ordering::Relaxed) as u64);
-        let Ok(mut registry) = REGISTRY.lock() else {
-            return Self {
-                map: Some(map),
-                range: 0..len,
-                key: None,
-            };
-        };
-        registry.entries.insert(
-            key,
-            Entry {
-                map: std::sync::Arc::clone(&map),
-                handles: 1,
-                bytes: len,
-                tables: Vec::new(),
-            },
-        );
-        // No idle stamp: this handle is the object's first reference, and the
-        // queue is filled on release.
-        Self {
-            map: Some(map),
-            range: 0..len,
-            key: Some(key),
-        }
     }
 
     /// Asks the kernel to drop the resident pages of this mapping.

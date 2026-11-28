@@ -57,9 +57,7 @@
 //! key array, which is what makes it correct for a chunk the reference wrote.
 
 use crate::mapped::MappedFile;
-use memmap2::Mmap;
 use std::cmp::Ordering;
-use std::fs::File;
 use std::path::Path;
 
 /// libstdc++'s `std::hash<std::string_view>` (`_Hash_bytes`, MurmurHash64A with
@@ -1997,12 +1995,12 @@ impl SecondarySegmentReader {
                 "a JSON secondary chunk is low-cardinality only".to_string(),
             ));
         }
-        let file =
-            File::open(path).map_err(|e| FormatError::Io(format!("{}: {e}", path.display())))?;
-        // SAFETY: read-only mapping of an immutable chunk file.
-        let map = MappedFile::from_mmap(
-            unsafe { Mmap::map(&file) }.map_err(|e| FormatError::Io(e.to_string()))?,
-        );
+        // `open_path` rather than a hand-rolled `Mmap::map`: it registers the
+        // mapping under the file's own identity, so a second open of the same
+        // chunk reuses the mapping instead of adding a VMA
+        // (`docs/MAP_MANAGER_PLAN.md` §4 stage 5).
+        let map = MappedFile::open_path(path)
+            .map_err(|e| FormatError::Io(format!("{}: {e}", path.display())))?;
         let min = kind.empty_tail_len();
         if map.len() < min {
             return Err(FormatError::Truncated {
