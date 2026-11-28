@@ -633,6 +633,47 @@ impl Engine {
         Ok(())
     }
 
+    /// One block's fast rough filter, read out of the block and never written
+    /// back.
+    ///
+    /// A segment sealed by a write owes every one of its blocks a
+    /// `blk|…|fast_rough_filter`, but a block the write did not touch has no
+    /// reason to be re-encoded for it: the filter is a fold over the block's
+    /// values, so reading them is enough. This is the port of the reference's
+    /// `BuildFastRoughFilterTask::ExecuteOnNewSealedSegment`, which walks the
+    /// segment's blocks through `NewCatalog::GetColumnVector(..., kReadOnly, …)`
+    /// and writes only the filter records.
+    ///
+    /// `None` when the block cannot be mapped or decoded; the caller then leaves
+    /// that block without a record, which the prefilter reads as "cannot prune"
+    /// - the same answer a filter that was never built gives.
+    fn block_filters_read_only(
+        &self,
+        table: &str,
+        meta: &catalog::TableMeta,
+        types: &[i32],
+        id: BlockId,
+    ) -> Option<crate::fast_rough_filter::Filters> {
+        let root = self.blocks_root();
+        let block = self.block_map(table, &root, id).ok()?;
+        let rows = Self::decode_rows_of_values(
+            &meta.ids,
+            &meta.types,
+            types,
+            id,
+            block.version(),
+            block.as_ref(),
+            None,
+            None,
+            None,
+        )?;
+        let mut filters = crate::fast_rough_filter::Filters::new(&meta.types);
+        for (_, cells) in &rows {
+            filters.add_row(cells);
+        }
+        Some(filters)
+    }
+
     /// `full` rewrites every block; otherwise only the blocks this commit
     /// touched - the ones `extra`'s row ids land in and the ones that hold a
     /// slot the table's delete log marks (`AppendInBlock` / `DeleteInBlock`,
@@ -1020,13 +1061,23 @@ impl Engine {
                 || seg_rows_total as usize == Self::SEGMENT_ROW_CAPACITY;
             // A segment that is sealed by *this* write needs the prefilter of
             // every one of its blocks (`ExecuteOnNewSealedSegment` walks the
-            // whole segment), so that write falls back to rewriting the
-            // segment. "Sealed by this write" is the segment-level record
-            // being absent: a segment sealed by an import may have had its
-            // first blocks mirrored by an earlier checkpoint, and if this write
-            // only touches the last one, the incremental path would leave those
-            // blocks without a `blk|…|fast_rough_filter` record the reference
+            // whole segment), and a segment sealed by an import may have had its
+            // first blocks mirrored by an earlier checkpoint - so this write
+            // owes those blocks a `blk|…|fast_rough_filter` record the reference
             // has.
+            //
+            // What it does **not** owe them is a re-encode. The reference reads
+            // each block back (`NewCatalog::GetColumnVector(..., kReadOnly, …)`
+            // in `BuildFastRoughFilterTask::ExecuteOnNewSealedSegment`) and never
+            // writes a column file a second time. Forcing the incremental path
+            // off here made a sealing write rewrite every block of the segment -
+            // for an `INSERT` that fills a segment, 838 rows of blocks re-encoded
+            // to add one row, and a full second pass over the segment's bytes.
+            //
+            // So the incremental path stays on, and the filter half is what the
+            // seal adds: the block arm below folds an untouched block's bounds
+            // into the segment's, reading them from the block instead of
+            // re-encoding it.
             let last_block = block_count.saturating_sub(1) as u16;
             let already_recorded = self
                 .storage
@@ -1038,8 +1089,16 @@ impl Engine {
                 )?
                 .is_some();
             let seals_now = sealed && !already_recorded;
+            // The whole-segment rewrite retires here. A segment sealed **now**
+            // still keeps the incremental path: the seal is a filter record, not
+            // a rewrite. The remaining term is the one case that genuinely needs
+            // the whole segment re-encoded - a segment that is *already* sealed
+            // and whose last block this write touches: the reference's
+            // `CommitBottomAppend` rebuilds the segment filter from every block
+            // when its tail moves, and the block arm alone would leave the
+            // segment-level min/max stale.
             let seg_partial =
-                partial && !seals_now && !(sealed && touched.contains(&(segment_id, last_block)));
+                partial && !(sealed && !seals_now && touched.contains(&(segment_id, last_block)));
             // The segment's block records are **not** swept here. Deleting them
             // before the rewrite republishes them leaves a window in which the
             // table has a segment and no blocks, and a concurrent query reads
@@ -1086,6 +1145,55 @@ impl Engine {
                         .unwrap_or(CPP_MIRROR_TS);
                     if block_index == 0 {
                         seg_create_ts = ts;
+                    }
+                    // A segment sealed by *this* write owes every block a
+                    // `blk|…|fast_rough_filter` record, and owes the segment
+                    // filter the fold over all of them. Neither needs the block
+                    // re-encoded: the record is a fold over the block's values,
+                    // so reading them - exactly what
+                    // `ExecuteOnNewSealedSegment` does through
+                    // `GetColumnVector(..., kReadOnly, …)` - produces the same
+                    // bounds. A block written before an earlier seal already
+                    // carries a record; that one is reused, since a block's
+                    // contents never change once written.
+                    if seals_now && sealed && !seg_filters.tracks_nothing() {
+                        let block_id = BlockId {
+                            db_id,
+                            table_id: meta.id,
+                            segment_id,
+                            block_id: block_index as u16,
+                        };
+                        let key = format!(
+                            "blk|{}|{}|{}|{}|fast_rough_filter",
+                            db_id, meta.id, segment_id, block_index
+                        );
+                        let existing = self
+                            .storage
+                            .catalog
+                            .store()
+                            .get(key.as_bytes())?
+                            .and_then(|record| crate::fast_rough_filter::Filters::decode(&record));
+                        let filters = match existing {
+                            Some(filters) => Some(filters),
+                            None => {
+                                let build_time = seg_create_ts.saturating_sub(1);
+                                self.block_filters_read_only(&table, &encode_meta, &types, block_id)
+                                    .inspect(|filters| {
+                                        let _ = self
+                                            .storage
+                                            .catalog
+                                            .store()
+                                            .put(key.as_bytes(), &filters.encode(build_time));
+                                    })
+                            }
+                        };
+                        // A block whose bytes cannot be read keeps no record; the
+                        // prefilter then answers "cannot prune" for it, which is
+                        // the same answer a missing record already gives. It must
+                        // still be published as a block, so this does not `continue`.
+                        if let Some(filters) = filters {
+                            seg_filters.merge(&filters);
+                        }
                     }
                     blocks.push(BlockRecord {
                         block_id: block_index as u16,
@@ -1418,7 +1526,14 @@ impl Engine {
             } else {
                 UNCOMMIT_TS
             };
-            if !seg_partial && sealed && seg_create_ts != CPP_MIRROR_TS {
+            // The segment filter is the record the seal exists to publish, so it
+            // is written whenever this write seals an unsealed segment - not only
+            // when the whole segment was re-encoded. `seg_filters` was folded
+            // from the blocks this write encoded and, for the untouched ones,
+            // from their own `blk|…|fast_rough_filter` records (the block arm
+            // above), which is the same answer `ExecuteOnNewSealedSegment` gets
+            // by reading those blocks.
+            if sealed && seg_create_ts != CPP_MIRROR_TS && (seals_now || !seg_partial) {
                 let _ = self.storage.catalog.store().put(
                     format!("seg|{}|{}|{}|fast_rough_filter", db_id, meta.id, segment_id)
                         .as_bytes(),

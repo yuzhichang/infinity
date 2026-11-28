@@ -1889,6 +1889,193 @@ mod tests {
         }
     }
 
+    /// A segment that a write **seals** must build its fast rough filter from
+    /// the blocks already on disk, not by re-encoding them.
+    ///
+    /// A sealed segment carries a `blk|…|fast_rough_filter` and a
+    /// `seg|…|fast_rough_filter` record. An import gets them for free: it stages
+    /// each complete block while the statement is still reading, and the staging
+    /// record lets the commit skip the re-encode (`staged` arm). A plain
+    /// `INSERT` has no staging record, so when it is the write that seals the
+    /// segment the loop falls through to the full re-encode for blocks the
+    /// statement never touched.
+    ///
+    /// The reference reads those blocks instead
+    /// (`BuildFastRoughFilterTask::ExecuteOnNewSealedSegment` ->
+    /// `NewCatalog::GetColumnVector(..., kReadOnly, ...)`) and never writes a
+    /// column file a second time.
+    ///
+    /// This is proved without timing anything: every `.col` file is published
+    /// through a sibling temp file and a rename, so a re-encode gives the path a
+    /// **new inode**. A block the sealing write did not touch keeps its inode if
+    /// nothing re-encoded it.
+    #[tokio::test]
+    async fn a_seal_does_not_re_encode_blocks_it_did_not_write() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let e = Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+        e.execute("CREATE TABLE sr (id INTEGER, body VARCHAR)")
+            .await
+            .unwrap();
+        // Two blocks of rows, written by plain `INSERT`s: no staging record, so
+        // each block's `.col` files come from the commit that wrote it.
+        let cap = storage::definition::format::DEFAULT_BLOCK_CAPACITY;
+        for batch in 0..8 {
+            let mut sql = String::from("INSERT INTO sr VALUES ");
+            for i in 0..(cap / 4) {
+                let id = batch * (cap / 4) + i;
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({id}, 'row{id}')"));
+            }
+            sql.push(';');
+            e.execute(&sql).await.unwrap();
+        }
+        e.flush().await.unwrap();
+        let segment = e.segments("sr")[0].0;
+        let rows = e.row_count("sr").unwrap();
+        assert_eq!(rows, 2 * cap);
+
+        // inode of every `.col` file, keyed by its block directory name.
+        let seg_dir = e
+            .blocks_root()
+            .join("db_1")
+            .join("tbl_0")
+            .join(format!("seg_{segment}"));
+        let inodes = |dir: &std::path::Path| -> std::collections::BTreeMap<String, u64> {
+            let mut out = std::collections::BTreeMap::new();
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return out;
+            };
+            for block in rd.flatten() {
+                let bdir = block.path();
+                if !bdir.is_dir() {
+                    continue;
+                }
+                let bname = bdir.file_name().unwrap().to_string_lossy().to_string();
+                let Ok(files) = std::fs::read_dir(&bdir) else {
+                    continue;
+                };
+                for f in files.flatten() {
+                    let p = f.path();
+                    if p.extension().and_then(|x| x.to_str()) == Some("col") {
+                        let key = format!("{bname}/{}", p.file_name().unwrap().to_string_lossy());
+                        out.insert(key, f.metadata().unwrap().ino());
+                    }
+                }
+            }
+            out
+        };
+        let before = inodes(&seg_dir);
+        assert_eq!(
+            before.len(),
+            4,
+            "two blocks x two columns expected: {before:?}"
+        );
+        assert!(
+            before.keys().any(|k| k.starts_with("blk_0/")),
+            "no block 0 column files: {before:?}"
+        );
+
+        // Give this segment an extent covering every row *and* take away the
+        // segment-level filter record, so the next write is the one that seals
+        // it (`sealed && !already_recorded`). An ordinary `INSERT` never sets
+        // the extent, which is why this state cannot be reached by inserts
+        // alone at this size.
+        let table_id = e
+            .storage
+            .catalog
+            .get_table_by_name("default_db.sr")
+            .unwrap()
+            .unwrap()
+            .id
+            .to_string();
+        let seg_record = format!("seg|1|{table_id}|{segment}|fast_rough_filter");
+        let had = e
+            .storage
+            .catalog
+            .store()
+            .get(seg_record.as_bytes())
+            .unwrap()
+            .is_some();
+        if had {
+            e.storage
+                .catalog
+                .store()
+                .delete(seg_record.as_bytes())
+                .unwrap();
+        }
+        // One more row, in the last block: this is the write that must be the
+        // sealing one, and it has to see the extent equal to the row count the
+        // segment holds *after* it lands (`imported_extent` compares them for
+        // equality). So the extent is recorded after the row is in.
+        e.execute("INSERT INTO sr VALUES (99999, 'seal');")
+            .await
+            .unwrap();
+        let rows_after = e.row_count("sr").unwrap() as u64;
+        e.note_import_rows("sr", segment, rows_after);
+        // The next checkpoint is the write that sees `sealed && !recorded`.
+        e.flush().await.unwrap();
+
+        let after = inodes(&seg_dir);
+        // The record the seal exists to produce is there, and it covers the
+        // whole segment: block 0 holds ids 0..8192 and blocks 1-2 the rest, so a
+        // filter folded only from the sealing write's own block would say
+        // "min = 16384" and prune a query for id 0.
+        let record = e
+            .storage
+            .catalog
+            .store()
+            .get(seg_record.as_bytes())
+            .unwrap()
+            .expect("the sealing write did not publish the segment filter");
+        let seg_filter = crate::fast_rough_filter::Filters::decode(&record)
+            .expect("the published segment filter does not decode");
+        // Every block has one too: the reference's `SetFilter` writes a
+        // `blk|…|fast_rough_filter` per block when a segment seals, and a query
+        // that prunes a block reads exactly that record.
+        for block in 0..3u16 {
+            let key = format!("blk|1|{table_id}|{segment}|{block}|fast_rough_filter");
+            let record = e
+                .storage
+                .catalog
+                .store()
+                .get(key.as_bytes())
+                .unwrap()
+                .unwrap_or_else(|| panic!("block {block} has no filter record"));
+            crate::fast_rough_filter::Filters::decode(&record)
+                .unwrap_or_else(|| panic!("block {block} filter does not decode"));
+        }
+        for id in [0i64, 8191, 8192, 16383, 16384] {
+            assert!(
+                seg_filter.may_contain(
+                    0,
+                    crate::fast_rough_filter::PruneOp::Eq,
+                    &expression::Value::Int(id)
+                ),
+                "the segment filter does not cover id {id}"
+            );
+        }
+        // Every block but the sealing write's own is untouched by it, so none
+        // of them may be re-encoded.
+        for (key, ino) in &before {
+            if key.starts_with("blk_2/") {
+                continue;
+            }
+            assert_eq!(
+                Some(ino),
+                after.get(key),
+                "{key} was re-encoded by the seal (inode {} -> {:?})",
+                ino,
+                after.get(key)
+            );
+        }
+    }
+
     /// An `fvecs` record's direct slot is what the text path would have
     /// encoded from the same digits.
     ///
