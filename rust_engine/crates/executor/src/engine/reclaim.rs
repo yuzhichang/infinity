@@ -389,20 +389,42 @@ impl Engine {
     /// Half, not the quota itself: with no headroom the next batch of writes
     /// crosses the line again immediately and the loop chases the write path
     /// forever.
+    /// The unsealed half of the round's goal: **half the quota**.
+    ///
+    /// The round wants the buffered rows and index tails down to half, not to
+    /// zero - stopping at zero reruns on the next tick and thrashes the working
+    /// set (`memory.rs`'s `LOW_PERCENT` reasoning, one level down).
     pub(crate) fn reclaim_target(&self) -> u64 {
         self.context.unsealed_memory_quota.load(Ordering::Relaxed) / 2
     }
 
-    /// Whether the round's goal is reached.
-    /// Whether the round has done enough.
+    /// Whether the round has done enough: **both** halves of the goal.
     ///
-    /// The figure is the ledger **plus the bytes the engine has mapped**: a
-    /// table whose rows are all on disk still charges the process for the pages
-    /// a scan left resident, and leaving that out would call a round finished
-    /// while a large mapping footprint remained
-    /// (`docs/MAP_MANAGER_PLAN.md` §4 stage 4).
+    /// Two constraints, two quantities, and they are not interchangeable
+    /// (`docs/MAP_MANAGER_PLAN.md` §4):
+    ///
+    /// 1. `budget_bytes() <= reclaim_target()` - the unsealed ledger is down to
+    ///    half the quota. This is what the drain drives.
+    /// 2. `mapped + unsealed <= rss_quota` - the process's own accounting fits
+    ///    the RSS ceiling. This is what releasing mappings drives.
+    ///
+    /// Mixing them was a defect: comparing `mapped_bytes` against
+    /// `unsealed_quota / 2` pits a gigabyte-scale figure against a threshold
+    /// derived from a different budget, so a round either never terminates or
+    /// quits while the process is still over its ceiling. Each arm is judged
+    /// against its own budget here.
     pub(crate) fn reclaim_target_met(&self, target: u64) -> bool {
-        (self.budget_bytes() as u64 + storage::mapped::mapped_bytes() as u64) <= target
+        let unsealed_ok = self.budget_bytes() as u64 <= target;
+        let rss_ok = match self.rss_quota() {
+            0 => true,
+            quota => self.budget_bytes() as u64 + storage::mapped::mapped_bytes() as u64 <= quota,
+        };
+        unsealed_ok && rss_ok
+    }
+
+    /// The RSS ceiling (`[buffer] buffer_manager_size`), `0` when ungoverned.
+    pub(crate) fn rss_quota(&self) -> u64 {
+        self.context.memory_limit.load(Ordering::Relaxed)
     }
 
     /// Whether a table should enter this round's candidate set.

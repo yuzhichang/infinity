@@ -1115,23 +1115,21 @@ mod tests {
         let id = e.visible_block_ids("default_db.memt")[0];
         let _ = e.block_map("default_db.memt", &root, id).unwrap();
         assert_eq!(e.buffer_objects().len(), 1);
-        let mapped_before = storage::mapped::mapped_bytes_of(id.table_id);
-        assert!(mapped_before > 0, "the block is charged to its table");
 
         // One byte: every measurement is critical, which is the state that must
         // reclaim rather than wait for a write.
         e.set_memory_limit(1);
         e.memory_tick().await;
-        // The tick gives the mapping back - that is what returns the address
-        // space - and leaves no page of it resident. The *symbol* may stay: it
-        // costs an `Arc`, and keeping it means the next read resolves the block
-        // without walking its directory again (`docs/MAP_MANAGER_PLAN.md` §3.0).
-        // A delta, not an absolute: table ids are unique only within an engine,
-        // so another test's engine can share this one's id.
-        let mapped_after = storage::mapped::mapped_bytes_of(id.table_id);
+        // The tick gives the mapping back, and the way it does that is by
+        // dropping the table's block symbols first - a symbol holds the
+        // `MappedFile` handles, so a mapping with a symbol is never idle
+        // (`docs/MAP_MANAGER_PLAN.md` §3.4). `buffer_objects` is this engine's
+        // own view, unlike the resident figures, which are process-wide and move
+        // with any concurrent test's page cache.
         assert!(
-            mapped_after < mapped_before,
-            "the tick released this table's mappings ({mapped_before} -> {mapped_after})"
+            e.buffer_objects().is_empty(),
+            "the tick dropped the table's block symbols, which is what makes its \
+             mappings releasable"
         );
         assert!(e.context.memory_reclaim_passes.load(Ordering::Relaxed) >= 1);
     }

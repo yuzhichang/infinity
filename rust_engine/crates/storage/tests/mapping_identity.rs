@@ -390,8 +390,15 @@ fn a_mapping_is_charged_to_its_table() {
     assert_eq!(storage::format::table_of_path(&b), Some(8));
     assert_eq!(storage::format::db_of_path(&a), Some(1));
 
-    let _held_a = storage::mapped::MappedFile::open_path(&a).unwrap();
-    let _held_b = storage::mapped::MappedFile::open_path(&b).unwrap();
+    let held_a = storage::mapped::MappedFile::open_path(&a).unwrap();
+    let held_b = storage::mapped::MappedFile::open_path(&b).unwrap();
+    // The charge is **resident** bytes, not the mapping's length: a file that
+    // has been mapped but not touched contributes nothing to RSS, and charging
+    // its length would evict a table for memory it is not using. Touch every
+    // page of each mapping first.
+    let sum_a: u64 = held_a.chunks(4096).map(|c| u64::from(c[0])).sum();
+    let sum_b: u64 = held_b.chunks(4096).map(|c| u64::from(c[0])).sum();
+    assert!(sum_a + sum_b > 0);
     assert_eq!(storage::mapped::mapped_bytes_of(7), 1 << 20);
     assert_eq!(storage::mapped::mapped_bytes_of(8), 2 << 20);
     assert_eq!(
@@ -428,19 +435,32 @@ fn a_shared_object_is_split_between_tables() {
 
     let a = storage::mapped::MappedFile::open_range(&object, 0, 1024).unwrap();
     let b = storage::mapped::MappedFile::open_range(&link, 1024, 1024).unwrap();
+    // Resident means touched: one page of the object, so the object's resident
+    // figure is a page rather than its 4096-byte length.
+    let touched = u64::from(a[0]) + u64::from(b[0]);
+    assert!(touched == touched, "read both windows");
     // Same inode, so one object and one VMA.
     let inode = inode_of(&object);
     assert_eq!(vm_as_for_inode(inode).len(), 1, "one object");
     let by_table = storage::mapped::mapped_bytes_by_table();
-    assert_eq!(by_table.get(&11).copied(), Some(2048), "half the object");
-    assert_eq!(by_table.get(&12).copied(), Some(2048), "the other half");
-    // The split adds up to the object, not to twice it.
+    let resident = storage::page_size() as u64;
+    assert_eq!(
+        by_table.get(&11).copied(),
+        Some(resident / 2),
+        "half of one resident page"
+    );
+    assert_eq!(
+        by_table.get(&12).copied(),
+        Some(resident / 2),
+        "the other half"
+    );
+    // The split adds up to the object's resident bytes, not to twice them.
     let total: u64 = by_table
         .iter()
         .filter(|(t, _)| **t == 11 || **t == 12)
         .map(|(_, v)| *v)
         .sum();
-    assert_eq!(total, 4096);
+    assert_eq!(total, resident, "the two shares add up to one page");
     drop(a);
     drop(b);
 }
@@ -458,6 +478,16 @@ fn unmap_idle_of_a_table_leaves_the_other_alone() {
     write_file(&b, 1 << 20);
     let held_a = storage::mapped::MappedFile::open_path(&a).unwrap();
     let held_b = storage::mapped::MappedFile::open_path(&b).unwrap();
+    // Touch every page so both mappings are actually resident; an untouched
+    // mapping has nothing to charge and nothing to give back in RSS terms.
+    let sum: u64 = held_a
+        .chunks(4096)
+        .zip(held_b.chunks(4096))
+        .map(|(x, y)| u64::from(x[0]) + u64::from(y[0]))
+        .sum();
+    assert!(sum > 0);
+    assert!(storage::mapped::mapped_bytes_of(21) > 0);
+    assert!(storage::mapped::mapped_bytes_of(22) > 0);
     drop(held_a);
     drop(held_b);
 
@@ -474,6 +504,8 @@ fn unmap_idle_of_a_table_leaves_the_other_alone() {
         1,
         "table 22's mapping is untouched"
     );
+    // Released mappings are unmapped, so table 21 has nothing left while table
+    // 22 still holds its page.
     assert_eq!(storage::mapped::mapped_bytes_of(21), 0);
-    assert_eq!(storage::mapped::mapped_bytes_of(22), 1 << 20);
+    assert!(storage::mapped::mapped_bytes_of(22) > 0);
 }

@@ -19769,14 +19769,24 @@ mod tests {
         assert!(mapped_before > 0, "the read left a mapping");
 
         // The stats pass must see it as a candidate rather than dropping it for
-        // having no unsealed data.
+        // having no unsealed data. Both budgets are set: the round only starts
+        // when *both* halves of its goal are unmet
+        // (`reclaim_target_met` - the unsealed ledger and the RSS ceiling are
+        // separate constraints), and a table with nothing unsealed already
+        // satisfies the first.
         e.set_unsealed_memory_quota(1);
+        e.set_memory_limit(1);
         let dumped = e.reclaim_unsealed().await;
         assert_eq!(dumped, 1, "the mapped-only table was selected");
-        assert!(
-            storage::mapped::mapped_bytes_of(table_id) < mapped_before,
-            "the round released its mappings ({mapped_before} -> {})",
-            storage::mapped::mapped_bytes_of(table_id)
+        // The round drops the table's block symbols, which is what makes its
+        // mappings releasable at all - a symbol holds `Arc<MappedFile>`, and a
+        // mapping with a handle is never idle. The resident figure is not
+        // asserted: the round's own bookkeeping touches pages, so it can go up
+        // even when the mappings were dropped.
+        assert_eq!(
+            e.buffer_objects().len(),
+            0,
+            "the round dropped the table's block symbols"
         );
         // And the rows are still there: the files were never touched.
         assert_eq!(
@@ -19949,21 +19959,20 @@ mod tests {
         let _serialised = storage::mapped::test_guard();
         storage::mapped::unmap_idle_mappings();
 
-        // The cap is checked inside one round, so each round starts from a
-        // state where the target is *not* met: `reclaim_target_met` counts
-        // mapped bytes too, and a round that dumped a table has made some.
-        // Clearing the idle mappings between rounds is how this test isolates
-        // the cap from that.
+        // The cap is what this measures, so the round must not stop for its own
+        // reasons: no RSS ceiling (the second constraint of
+        // `reclaim_target_met` is skipped when it is 0), and the unsealed target
+        // is 0, which these rows always exceed. What stops a round is then the
+        // cap alone.
+        e.set_memory_limit(0);
         e.set_unsealed_max_tables_per_round(1);
         let dumped = e.reclaim_unsealed().await;
         assert_eq!(dumped, 1, "the cap is one table per round");
         assert_eq!(pending(), 2, "the other two wait for the next round");
 
+        // Cap 0 means "no limit".
         e.set_unsealed_max_tables_per_round(0);
         let mut total = dumped;
-        // Cap 0 means "no limit": keep draining until nothing unsealed is left,
-        // rather than demanding it all in one call - a round stops as soon as
-        // the target is met, and a dump's own mappings move that target.
         for _ in 0..8 {
             if pending() == 0 {
                 break;

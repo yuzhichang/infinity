@@ -91,24 +91,6 @@ impl Entry {
             None => self.tables.push((table, 1)),
         }
     }
-
-    /// This table's share of the object: `bytes * mine / total`.
-    fn share_of(&self, table: u64) -> usize {
-        let mine = self
-            .tables
-            .iter()
-            .find(|(id, _)| *id == table)
-            .map(|(_, count)| *count)
-            .unwrap_or(0);
-        if mine == 0 {
-            return 0;
-        }
-        let total: usize = self.tables.iter().map(|(_, count)| *count).sum();
-        if total == 0 {
-            return 0;
-        }
-        self.bytes * mine / total
-    }
 }
 
 /// Idle mappings kept after their last handle lets go, derived once from
@@ -651,22 +633,15 @@ pub fn idle_mapping_limit() -> usize {
 /// Bytes the mapping table holds on `table`'s behalf.
 ///
 /// The size arm of the table-level reclaim fusion: a table's footprint is what
-/// it holds unsealed **plus** what it has mapped, because a scan over a large
-/// index leaves the pages resident and dropping the table's mappings is one of
-/// the ways to get them back.
+/// it holds unsealed **plus** how much of its mappings is **resident**, because
+/// a scan over a large index leaves those pages in RSS and dropping the
+/// table's mappings is one of the ways to get them back.
 ///
 /// Sums each object's [`Entry::share_of`], so an object shared by two tables
 /// (a persistence object holding both their chunks) is split between them
 /// instead of counted twice.
 pub fn mapped_bytes_of(table: u64) -> u64 {
-    let Ok(registry) = REGISTRY.lock() else {
-        return 0;
-    };
-    registry
-        .entries
-        .values()
-        .map(|entry| entry.share_of(table) as u64)
-        .sum()
+    resident_totals().get(&table).copied().unwrap_or(0)
 }
 
 /// Every table with at least one live mapping, and what it holds.
@@ -675,22 +650,214 @@ pub fn mapped_bytes_of(table: u64) -> u64 {
 /// needs the mapped size of every candidate, and a per-table query would walk
 /// the registry once per table.
 pub fn mapped_bytes_by_table() -> std::collections::HashMap<u64, u64> {
-    let Ok(registry) = REGISTRY.lock() else {
-        return std::collections::HashMap::new();
+    resident_totals()
+}
+
+/// Resident bytes per table.
+///
+/// The per-region answer where the platform has one (**Linux** `smaps`,
+/// **macOS** `proc_pidinfo`). On **Windows** there is none short of walking every
+/// page with `QueryWorkingSetEx`, so the answer is *zero*: a table is charged
+/// for nothing it has mapped, which means the reclaim decision falls back to the
+/// unsealed ledger alone on that platform. That is honest - "we do not know" -
+/// and it costs no code. An apportioned estimate was considered and rejected:
+/// spreading one process-wide figure by mapped length gives every table a share
+/// that is not its own, so a reclaim pass would rank tables by an artefact of
+/// the split rather than by what they hold.
+///
+/// **Snapshot the maps first, read residency outside the lock.** Parsing `smaps`
+/// for a process with thousands of VMAs is not free, and holding the table's
+/// lock across it would stall every reader that is opening a file. The `Arc`s
+/// keep each mapping alive while the lock is not held; a mapping opened in
+/// between is simply not counted this pass.
+fn resident_totals() -> std::collections::HashMap<u64, u64> {
+    /// One mapping taken out of the registry: the mapping itself and the tables
+    /// holding it.
+    type Snapshot = (std::sync::Arc<Mmap>, Vec<(u64, usize)>);
+    let snapshot: Vec<Snapshot> = {
+        let Ok(registry) = REGISTRY.lock() else {
+            return std::collections::HashMap::new();
+        };
+        registry
+            .entries
+            .values()
+            .map(|entry| (std::sync::Arc::clone(&entry.map), entry.tables.clone()))
+            .collect()
     };
+
     let mut out: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    for entry in registry.entries.values() {
-        // The total shares of one object add up to its bytes exactly, so the
-        // per-table figures sum to `mapped_bytes()`.
-        let total: usize = entry.tables.iter().map(|(_, count)| *count).sum();
-        if total == 0 {
+    // The whole `smaps` file is read once and reused for every mapping: one
+    // parse, not one per mapping (a table can hold thousands).
+    #[cfg(target_os = "linux")]
+    let ranges = lin_smaps_ranges();
+    for (map, tables) in &snapshot {
+        let resident = resident_from_snapshot(
+            map,
+            #[cfg(target_os = "linux")]
+            ranges.as_ref(),
+        ) as u64;
+        let live: usize = tables.iter().map(|(_, count)| *count).sum();
+        if live == 0 {
             continue;
         }
-        for (table, count) in &entry.tables {
-            *out.entry(*table).or_default() += (entry.bytes * count / total) as u64;
+        for (table, count) in tables {
+            *out.entry(*table).or_default() += resident * *count as u64 / live as u64;
         }
     }
     out
+}
+
+/// One mapping's resident bytes, given an already-parsed `smaps` where the
+/// platform has one.
+///
+/// `None` from the parser means `smaps` could not be read at all; the mapping's
+/// length is then the best available upper bound.
+#[cfg(target_os = "linux")]
+fn resident_from_snapshot(map: &Mmap, ranges: Option<&Vec<(usize, usize, usize)>>) -> usize {
+    let Some(ranges) = ranges else {
+        return map.len();
+    };
+    let start = map.as_ptr() as usize;
+    let end = start.saturating_add(map.len());
+    let mut total = 0usize;
+    for (lo, hi, rss) in ranges {
+        if *lo < end && *hi > start {
+            // A VMA partially inside the mapping contributes its whole `Rss`,
+            // which over-counts at a boundary. That errs toward freeing.
+            total += rss;
+        }
+    }
+    total
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident_from_snapshot(map: &Mmap, _unused: ()) -> usize {
+    resident_of(map)
+}
+
+/// `proc_regioninfo` from `<libproc.h>`, up to `pri_pages_resident`.
+///
+/// Only the leading fields are declared. `proc_pidinfo` fills the whole struct
+/// and this prefix is enough to read the one figure needed. The layout is a
+/// stable public ABI - it is what `vmmap` reads - and `repr(C)` states it rather
+/// than relying on field-order luck.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Default)]
+struct ProcRegionInfo {
+    pri_protection: u32,
+    pri_max_protection: u32,
+    pri_inheritance: u32,
+    pri_flags: u32,
+    pri_offset: u64,
+    pri_behavior: u32,
+    pri_user_wired_count: u32,
+    pri_user_tag: u32,
+    /// Pages of this region that are resident - the figure wanted here.
+    pri_pages_resident: u32,
+    /// The rest of the kernel's struct, never read. Kept so the buffer passed to
+    /// `proc_pidinfo` is at least as large as the call writes.
+    _rest: [u8; 128],
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn resident_of(map: &Mmap) -> usize {
+    // `PROC_PIDREGIONINFO` = 7: the region containing the given address.
+    use libc::{c_int, c_void, pid_t};
+    const PROC_PIDREGIONINFO: c_int = 7;
+    let pid = std::process::id() as pid_t;
+    let page = crate::page_size();
+    let start = map.as_ptr() as usize;
+    let end = start.saturating_add(map.len());
+    let mut cursor = start;
+    let mut total = 0usize;
+    let mut any = false;
+    while cursor < end {
+        let mut info = ProcRegionInfo::default();
+        // SAFETY: `info` is a local of exactly the size passed, and the call
+        // writes at most that many bytes into it.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDREGIONINFO,
+                cursor as u64,
+                &mut info as *mut _ as *mut c_void,
+                std::mem::size_of::<ProcRegionInfo>() as c_int,
+            )
+        };
+        if written <= 0 {
+            break;
+        }
+        // `pri_offset` is the region's start address in this struct's ABI.
+        let len = (info.pri_offset as usize).max(page);
+        total += info.pri_pages_resident as usize * page;
+        any = true;
+        let next = cursor.saturating_add(len);
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+    }
+    if any {
+        total
+    } else {
+        // The walk failed (a sandbox without the entitlement). The mapping's
+        // length over-charges rather than under-charges, which is the safe
+        // direction for a reclaim decision.
+        map.len()
+    }
+}
+
+/// No per-region residency on Windows short of walking every page with
+/// `QueryWorkingSetEx`, so this reports **zero**.
+///
+/// An apportioned estimate (spread one process-wide figure by mapped length) was
+/// considered and rejected: the share a table gets is then an artefact of the
+/// split rather than something it holds, and a reclaim pass would rank tables by
+/// that. Reporting zero says "unknown" plainly, costs no code, and leaves the
+/// reclaim decision on the unsealed ledger - which is what that platform had
+/// before any of this.
+#[cfg(windows)]
+fn resident_of(_map: &Mmap) -> usize {
+    0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn resident_of(_map: &Mmap) -> usize {
+    0
+}
+
+/// Every VMA's `(start, end, rss)` from `/proc/self/smaps`, parsed once.
+#[cfg(target_os = "linux")]
+fn lin_smaps_ranges() -> Option<Vec<(usize, usize, usize)>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open("/proc/self/smaps").ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut out: Vec<(usize, usize, usize)> = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some((range, _)) = line.split_once(' ') {
+            if let Some((lo, hi)) = range.split_once('-') {
+                if let (Ok(lo), Ok(hi)) =
+                    (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+                {
+                    out.push((lo, hi, 0));
+                    continue;
+                }
+            }
+        }
+        if let Some(rest) = line.strip_prefix("Rss:") {
+            if let Some(last) = out.last_mut() {
+                last.2 = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|kb| kb.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    * 1024;
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Unmaps every idle mapping that belongs to `table`, returning the bytes

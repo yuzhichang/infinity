@@ -35,6 +35,35 @@
 // (which would need `unsafe`) nor a bit-at-a-time scalar loop.
 #![feature(portable_simd)]
 
+/// The system's page size in bytes.
+///
+/// Needed wherever a residency figure is reported in pages rather than bytes -
+/// `mach_vm_region`'s `pages_resident` is the one in this crate. Not a constant:
+/// Apple silicon uses 16 KiB pages while x86_64 uses 4 KiB, and a hardcoded
+/// 4096 would undercount a mapping's footprint by 4x on arm64.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn page_size() -> usize {
+    // SAFETY: `sysconf` takes a constant key and does not touch caller memory.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(size).unwrap_or(4096)
+}
+
+#[cfg(windows)]
+pub fn page_size() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // SAFETY: `info` is a local the API fills in; it has no other requirement.
+    let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: as above - a valid, writable, correctly sized out pointer.
+    unsafe { GetSystemInfo(&mut info) };
+    info.dwPageSize as usize
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn page_size() -> usize {
+    4096
+}
+
 /// Total physical memory reported by the operating system, in bytes.
 #[cfg(unix)]
 #[allow(unsafe_code)]
