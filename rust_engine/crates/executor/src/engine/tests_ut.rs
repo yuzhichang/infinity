@@ -19724,6 +19724,70 @@ mod tests {
     /// Before this the candidate set was "has unsealed rows or index tails", so
     /// a read-only table was never looked at and its pages stayed resident for
     /// the life of the process.
+    /// The mapped arm of the reclaim goal stops at the **low watermark**, not at
+    /// the ceiling: `mapped + unsealed <= rss_quota * LOW_PERCENT / 100`.
+    ///
+    /// Stopping at the ceiling would leave the engine one tick away from
+    /// refusing writes, so a pass that quit there would rerun immediately. This
+    /// builds a real mapped footprint between the two thresholds and checks the
+    /// verdict flips where the ratio says it does - a test of the constants
+    /// alone would not prove the comparison uses them.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the guard serialises the *whole* test
+    async fn the_mapped_arm_stops_at_the_low_watermark() {
+        let _serialised = storage::mapped::test_guard();
+        storage::mapped::unmap_idle_mappings();
+        let dir = tempdir().unwrap();
+        let e = Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+        e.execute("CREATE TABLE lw (id INT, body VARCHAR);")
+            .await
+            .unwrap();
+        // Enough rows that their resident pages are a measurable share.
+        let csv = dir.path().join("lw.csv");
+        let text: String = (0..2000).map(|i| format!("{i},row-{i}\n")).collect();
+        std::fs::write(&csv, text).unwrap();
+        e.execute(&format!(
+            "COPY lw FROM '{}' WITH (DELIMITER ',', FORMAT CSV);",
+            csv.display()
+        ))
+        .await
+        .unwrap();
+        e.flush().await.unwrap();
+        // Read the table so its block pages are resident.
+        assert_eq!(
+            rows(&e, "SELECT COUNT(*) FROM lw WHERE id >= 0;").await,
+            vec![vec!["2000".to_string()]]
+        );
+
+        // The engine's own accounting: what the mapped arm is judged on.
+        let used = e.budget_bytes() as u64 + storage::mapped::mapped_bytes() as u64;
+        assert!(used > 0, "the read left resident pages");
+
+        // A quota whose low watermark sits *below* `used`: the mapped arm is
+        // unmet because the engine is between low and the ceiling.
+        e.set_unsealed_memory_quota(0);
+        // A quota whose low watermark is *strictly below* `used`. `used` itself
+        // as the low mark would satisfy `<=`, so go one unit past it.
+        let just_over_low = (used - 1) * 100 / crate::memory::LOW_PERCENT;
+        e.set_memory_limit(just_over_low);
+        assert!(
+            !e.reclaim_target_met(0),
+            "between the low watermark and the ceiling the goal is unmet \
+             (used {used}, quota {just_over_low}, low {})",
+            just_over_low * crate::memory::LOW_PERCENT / 100
+        );
+
+        // A quota large enough that `used` is under its low watermark: met.
+        let generously = used * 100 / crate::memory::LOW_PERCENT * 2;
+        e.set_memory_limit(generously);
+        assert!(
+            e.reclaim_target_met(0),
+            "under the low watermark the goal is met (used {used}, quota {generously})"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // the guard serialises the *whole* test
     async fn a_table_that_only_holds_mappings_is_still_a_candidate() {

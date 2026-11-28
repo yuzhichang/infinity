@@ -336,6 +336,21 @@ block_map(table, root, id)            ← BlockId → 符号对象的解析 + �
 
 `MEMORY_RECLAIM.md` §4.0 / §4.5 已同步（验收项 ③）。
 
+### 阶段 4.1：回收目标的两个约束（已实现）
+
+原 `reclaim_target_met` 把两个不同量纲的预算混用：拿 `mapped + unsealed` 去比 `unsealed_quota / 2`。GiB 级的映射量对一个由**另一个**配额推出的阈值，结果是"要么永远不达标、要么提前退出"。
+
+现在两条臂各对自己的预算：
+
+```
+unsealed ledger <= unsealed_quota / 2                    ← drain 驱动
+mapped + unsealed <= rss_quota * LOW_PERCENT / 100       ← 释放映射驱动
+```
+
+`rss_quota` 即 `[buffer] buffer_manager_size`；`LOW_PERCENT` 是 `memory.rs` 里既有的 70，回收通道本来的目标就是把占用压到该水位，而不是压到天花板——压到天花板会让引擎下一 tick 就面临拒写，通道等于立刻重跑。
+
+`the_mapped_arm_stops_at_the_low_watermark` 构造一个介于 low 与 quota 之间的真实映射占用，断言判定在比例处翻转；把实现改回 `<= quota` 时该测试失败，确认它有鉴别力。
+
 ### 阶段 5：收敛与清理
 
 | 项 | 内容 |

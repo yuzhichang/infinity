@@ -417,7 +417,13 @@ impl Engine {
         let unsealed_ok = self.budget_bytes() as u64 <= target;
         let rss_ok = match self.rss_quota() {
             0 => true,
-            quota => self.budget_bytes() as u64 + storage::mapped::mapped_bytes() as u64 <= quota,
+            // The low watermark, not the ceiling: `LOW_PERCENT` of the quota is
+            // the share a pass aims to leave in use (`memory_low`). Stopping at
+            // the ceiling would leave the engine one tick from refusing writes.
+            quota => {
+                self.budget_bytes() as u64 + storage::mapped::mapped_bytes() as u64
+                    <= quota * crate::memory::LOW_PERCENT / 100
+            }
         };
         unsealed_ok && rss_ok
     }
