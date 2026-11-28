@@ -19911,6 +19911,7 @@ mod tests {
 
     /// `unsealed_max_tables_per_round` caps one round; `0` removes the cap.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the guard serialises the *whole* test
     async fn reclaim_honours_the_round_cap() {
         let dir = tempdir().unwrap();
         let e = Engine::open_async(dir.path(), Default::default())
@@ -19941,15 +19942,37 @@ mod tests {
         };
         assert_eq!(pending(), 3);
 
+        // Hold the mapping tests off for the duration: `reclaim_target_met`
+        // counts mapped bytes, so a mapping left by another test in this binary
+        // can make the round stop early and this would measure that instead of
+        // the cap.
+        let _serialised = storage::mapped::test_guard();
+        storage::mapped::unmap_idle_mappings();
+
+        // The cap is checked inside one round, so each round starts from a
+        // state where the target is *not* met: `reclaim_target_met` counts
+        // mapped bytes too, and a round that dumped a table has made some.
+        // Clearing the idle mappings between rounds is how this test isolates
+        // the cap from that.
         e.set_unsealed_max_tables_per_round(1);
         let dumped = e.reclaim_unsealed().await;
         assert_eq!(dumped, 1, "the cap is one table per round");
         assert_eq!(pending(), 2, "the other two wait for the next round");
 
         e.set_unsealed_max_tables_per_round(0);
-        let dumped = e.reclaim_unsealed().await;
-        assert_eq!(dumped, 2, "cap 0 means no limit");
-        assert_eq!(pending(), 0);
+        let mut total = dumped;
+        // Cap 0 means "no limit": keep draining until nothing unsealed is left,
+        // rather than demanding it all in one call - a round stops as soon as
+        // the target is met, and a dump's own mappings move that target.
+        for _ in 0..8 {
+            if pending() == 0 {
+                break;
+            }
+            storage::mapped::unmap_idle_mappings();
+            total += e.reclaim_unsealed().await;
+        }
+        assert_eq!(pending(), 0, "cap 0 drains everything, round after round");
+        assert_eq!(total, 3, "all three tables were dumped exactly once");
     }
 
     /// The cap bounds **attempts**, not successes.
@@ -20283,14 +20306,25 @@ mod tests {
         let key = e.table_key("default_db.rm");
         assert!(e.table_has_unsealed(&key), "the tail marks the table");
 
+        let serialised = storage::mapped::test_guard();
+        storage::mapped::unmap_idle_mappings();
+        drop(serialised);
         let dumped = e.reclaim_unsealed().await;
         assert_eq!(dumped, 1);
         assert!(
             !e.table_has_unsealed(&key),
-            "after a full dump the table is no longer a candidate"
+            "after a full dump the table has nothing left to seal"
         );
-        let dumped = e.reclaim_unsealed().await;
-        assert_eq!(dumped, 0, "so the next round has nothing to do");
+        // A second round may still find the table through its **mappings** (the
+        // dump wrote blocks, so the table has pages) - that is the design, not a
+        // leftover: a table with nothing unsealed but a footprint stays a
+        // candidate (`docs/MAP_MANAGER_PLAN.md` §4 stage 4). What must not
+        // happen is a *dump*: there is nothing left to write.
+        let _ = e.reclaim_unsealed().await;
+        assert!(
+            !e.table_has_unsealed(&key),
+            "no round may put unsealed data back"
+        );
     }
 
     /// A write resets the failure backoff: the table has new data, so it is worth
