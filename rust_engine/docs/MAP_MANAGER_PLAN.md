@@ -639,6 +639,26 @@ Linux 上 `the_resident_split_adds_up_where_the_platform_has_one` 断言 `Anon +
 
 性能项：`heap_bytes() == 0`（`a_sealed_block_is_mapped_once_and_shared`、`a_mapped_version_answers_like_an_owned_one`）；「只有映射的表也进候选集」（`a_table_that_only_holds_mappings_is_still_a_candidate`）。
 
+### 关于「服务端静默退出」的定位结论
+
+L 场景跑了几次都在中途看到服务端消失、无 panic、无 core、无内核记录。定位结果是**两个不同的问题被混在一起**：
+
+**1. 我自己的 shell 会话清理把它杀了。** 用 `setsid` 起同一个二进制、同一个配置，服务端稳定运行 460+ 秒；用 `nohup ... &` 起的那些在一次命令超时/中断时被连带终止。证据：连 `echo "EXIT=$?"` 那一行都没写出来，说明写它的子 shell 也被同一信号终止 —— 整个进程组都没了。这不是引擎的问题，跑长任务要 `setsid`（或 systemd-run）而不是 `nohup ... &`。
+
+**2. 早期真正的失败是 `RssAnon` 涨满。** 稳态读一次 `/proc/<pid>/status`：
+
+```
+VmRSS   = 10296 MiB
+RssAnon = 10267 MiB   ← 99.7%
+RssFile =    28 MiB
+```
+
+**内存几乎全在匿名堆里，不在映射页缓存里。** 这一点很关键：它说明在本轮改动之前，回收器盯着 `mapped`（映射长度）和 `unsealed`，而真正吃掉 10 GiB 的堆**不在任何一臂里**。`earlyoom -M 2000000`（可用低于 2 GB 就杀）于是先动手，表现为"无日志、无 core 的静默退出"。
+
+顺带确认了本轮改动的价值：`RssFile` 只有 28 MiB，说明那台机器上映射页缓存不是内存主体 —— 之前把 `mapped` 当作 `RssAnon` 的代理是错的，把它换成就地读的驻留量（`§11.5`）才对得上物理事实。
+
+**仍未解释的部分**：10 GiB 的匿名堆属于哪个结构（每表约 50 MiB，59 个索引 × 未到 `mem_index_capacity` 的 tail？）没有查证。它是本计划范围之外的一个独立问题（索引 tail 的内存上界），但会决定 L 场景能否在 30 GiB 机器上跑完。
+
 ### 未做
 
 **L 场景 RSS 曲线**（§5.2 最后两行）没有重跑。此前几次都在 17–20 GiB 被 earlyoom 杀掉，且本轮的改动需要真实负载才能看出差别。这是唯一遗留的验收项，不是遗漏——它需要一次独立的压测窗口。
