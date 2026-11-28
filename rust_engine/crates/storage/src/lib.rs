@@ -314,6 +314,22 @@ pub fn trim_allocator() {
     }
 }
 
+/// What mimalloc says it is holding: `(allocated, committed, resident)` bytes,
+/// or `None` where the allocator is not mimalloc.
+///
+/// The three figures answer different questions and that is the point:
+///
+/// * **allocated** - bytes currently handed out to live objects. This is what
+///   the engine's own ledgers try to sum.
+/// * **committed** - bytes mimalloc has obtained from the OS, including free
+///   blocks inside its arenas that it is keeping for reuse.
+/// * **resident** - the pages of that commitment actually in RAM.
+///
+/// A gap between `allocated` and `resident` is the allocator holding memory the
+/// engine has already freed, which RSS reports and no ledger of ours can see.
+/// Reading it separates "the engine holds ten gigabytes" from "the engine freed
+/// them and mimalloc has not given them back", which is the difference between a
+/// design problem and a trim that is missing.
 /// Pins the calling OS thread to the given logical CPU indices on Linux.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]

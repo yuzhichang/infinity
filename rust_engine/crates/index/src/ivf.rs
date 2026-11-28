@@ -397,6 +397,62 @@ pub enum IvfSegment {
 }
 
 impl IvfSegment {
+    /// Heap bytes this segment holds: its centroid tables, code words and
+    /// per-part offsets - everything decoded out of the chunk, not the chunk
+    /// itself.
+    ///
+    /// A reclaim pass reports this to say what its `evict_table_caches` lever
+    /// has to work with; without it the only way to see that the lever acted is
+    /// the process's resident size, which cannot attribute the change to a
+    /// structure.
+    pub fn heap_bytes(&self) -> usize {
+        // Every member is a `Vec` whose length is its byte count, so the sum is
+        // exact rather than an estimate with header fudge.
+        let vec_bytes = |len: usize, width: usize| len * width;
+        match self {
+            Self::Plain(index) => {
+                vec_bytes(index.centroids.len(), 4)
+                    + index
+                        .parts
+                        .iter()
+                        .map(|part| {
+                            vec_bytes(part.len(), std::mem::size_of::<(u32, Vec<f32>)>())
+                                + part
+                                    .iter()
+                                    .map(|(_, v)| vec_bytes(v.len(), 4))
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+            Self::Scalar(index) => {
+                vec_bytes(index.centroids.len(), 4)
+                    + vec_bytes(index.a.len(), 4)
+                    + vec_bytes(index.b.len(), 4)
+                    + index
+                        .parts
+                        .iter()
+                        .map(|part| {
+                            vec_bytes(part.offsets.len(), 4)
+                                + vec_bytes(part.codes.len(), 1)
+                                + vec_bytes(part.dot_v_e.len(), 4)
+                        })
+                        .sum::<usize>()
+            }
+            Self::Product(index) => {
+                vec_bytes(index.centroids.len(), 4)
+                    + vec_bytes(index.codewords.len(), 4)
+                    + vec_bytes(index.norms_neg_half.len(), 4)
+                    + index
+                        .parts
+                        .iter()
+                        .map(|part| {
+                            vec_bytes(part.offsets.len(), 4) + vec_bytes(part.codes.len(), 1)
+                        })
+                        .sum::<usize>()
+            }
+        }
+    }
+
     /// Top-k candidate row offsets for `query`.
     pub fn candidates(&self, query: &[f32], k: usize, nprobe: usize, metric: &str) -> Vec<u32> {
         self.candidates_filtered(query, k, nprobe, metric, None)

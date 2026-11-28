@@ -623,13 +623,37 @@ impl super::Engine {
     /// want these. It is deliberately *not* named or shaped as a complete pass:
     /// the unsealed drain is the step that frees the most, and it is not here.
     fn reclaim_cheap_levers(&self, want: u64, forced: bool) -> u64 {
+        // Each lever reports what it freed, and the report is logged rather than
+        // inferred. The alternative - reading the process's resident size before
+        // and after - cannot tell a lever that worked from one that did nothing
+        // while another moved the same pages, and cannot tell either from an
+        // allocator that simply returned them late.
+        let mut released = 0u64;
         storage::trim_allocator();
-        let mut released = storage::mapped::release_mapped_pages(want as usize) as u64;
+        let pages = storage::mapped::release_mapped_pages(want as usize) as u64;
+        released += pages;
+        if pages > 0 {
+            eprintln!(
+                "info: reclaim lever: dropped resident pages of {} of mappings",
+                crate::engine::reclaim::human_bytes(pages)
+            );
+        }
         if forced {
-            released += self.spann_release_pages_forced() as u64;
+            let spann = self.spann_release_pages_forced() as u64;
+            released += spann;
+            if spann > 0 {
+                eprintln!(
+                    "info: reclaim lever: dropped {} of SPANN pages",
+                    crate::engine::reclaim::human_bytes(spann)
+                );
+            }
             // Pure copies: a query that needs them recomputes them.
+            let cached = self.result_cache.lock().unwrap().len();
             self.result_cache.lock().unwrap().clear();
             self.plan_cache.clear();
+            if cached > 0 {
+                eprintln!("info: reclaim lever: cleared {cached} result-cache entries");
+            }
         }
         // The page advice reports the mappings' length, which is an upper bound
         // on what was actually resident (and a cgroup keeps charging a page

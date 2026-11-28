@@ -2952,6 +2952,68 @@ impl Engine {
 
     /// The engine-wide total: one atomic load. It is what the quota compares
     /// against, and it never takes the table lock or an index lock.
+    /// Bytes the append buffers hold across every table.
+    ///
+    /// The row half of the unsealed ledger (`budget_bytes` adds the index tails
+    /// to it). Reported separately so a reclaim plan can say which of the two
+    /// it is looking at: a dump moves both, but only the buffers hold decoded
+    /// `Value`s, which is the expensive shape.
+    pub(crate) fn row_buffer_bytes(&self) -> u64 {
+        let tables = self.tables.lock().unwrap();
+        tables
+            .values()
+            .map(|entry| entry.unsealed_bytes() as u64)
+            .sum()
+    }
+
+    /// Bytes held by decoded block `version`s and column payload copies.
+    ///
+    /// `MappedBlock` keeps its bytes in the mapping (`heap_bytes() == 0` since
+    /// the version sections moved into the mapping), so this reports what the
+    /// block cache charges beyond page cache - currently nothing, which is the
+    /// point of reporting it: a non-zero figure would mean a copy came back.
+    pub(crate) fn decoded_block_bytes(&self) -> u64 {
+        let maps = self.context.block_maps.lock().unwrap();
+        maps.blocks().map(|block| block.heap_bytes() as u64).sum()
+    }
+
+    /// Heap bytes of the decoded index chunks the buffer budget holds.
+    ///
+    /// These are `Arc<LoadedVectorIndex>` values - decoded graphs and IVF
+    /// segments, not their mappings. `evict_table_caches` is the lever that
+    /// drops them, so this is the figure that says whether that lever has
+    /// anything to do.
+    pub(crate) fn decoded_chunk_bytes(&self) -> u64 {
+        let tables = self.tables.lock().unwrap();
+        tables
+            .values()
+            .map(|entry| {
+                entry
+                    .vector
+                    .values()
+                    .flatten()
+                    .map(|chunk| chunk.bytes as u64)
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// Heap bytes of the decoded IVF segments a forced pass can drop.
+    pub(crate) fn decoded_ivf_bytes(&self) -> u64 {
+        let tables = self.tables.lock().unwrap();
+        tables
+            .values()
+            .map(|entry| {
+                entry
+                    .ivf
+                    .values()
+                    .flatten()
+                    .map(|segment| segment.heap_bytes() as u64)
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
     pub(crate) fn memindex_bytes(&self) -> usize {
         self.context
             .memindex_total

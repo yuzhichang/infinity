@@ -65,7 +65,7 @@ pub(crate) fn monotonic_now_ms() -> u64 {
 ///
 /// MiB alone would print every sub-megabyte figure as `0 MiB`, and a reclaim
 /// plan whose per-table numbers all read zero says nothing.
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * 1024;
     if bytes >= MIB {
@@ -587,6 +587,27 @@ impl Engine {
                 );
             }
         }
+        // The heap, broken down by the structures that account for it. This is
+        // the line that answers "what is `RssAnon`": the resident split says
+        // *how much* is anonymous, this says *whose*. Without it a ten-gigabyte
+        // heap can only be guessed at from the outside, and a guess cannot
+        // distinguish "the index tails are holding ten gigabytes" from "the
+        // accounting misses ten gigabytes".
+        //
+        // Each figure is the ledger the engine keeps, not an estimate of the
+        // allocator's own view, so `sum` versus `RssAnon` is itself the check:
+        // a large gap means memory is held by something outside these ledgers.
+        let ledger = self.budget_bytes() as u64;
+        eprintln!(
+            "info: reclaim plan: heap breakdown: row buffer={} index tails={} \
+             (ledger total={}) | decoded blocks={} decoded chunks={} ivf segments={}",
+            human_bytes(self.row_buffer_bytes()),
+            human_bytes(self.memindex_bytes() as u64),
+            human_bytes(ledger),
+            human_bytes(self.decoded_block_bytes()),
+            human_bytes(self.decoded_chunk_bytes()),
+            human_bytes(self.decoded_ivf_bytes()),
+        );
         // The two thresholds the round is judged against, so the numbers above
         // can be read without knowing the configuration.
         eprintln!(
@@ -691,6 +712,10 @@ impl Engine {
     /// would report "nothing released" for a table it just emptied.
     async fn dump_table(&self, key: &str) -> bool {
         let before = self.unsealed_live_of(key);
+        // The process's resident split, taken so this table's dump can be
+        // attributed: the round-level "before/after" in `reclaim result` is the
+        // sum of many dumps and cannot say which one moved what.
+        let rss_before = crate::engine::state::process_rss_split();
         // Phase 1: fold the buffered rows into the block files, under the gate.
         //
         // The bound is the table's own newest append ts, not `checkpoint_ts()`.
@@ -747,6 +772,27 @@ impl Engine {
 
         let after = self.unsealed_live_of(key);
         let released = after < before;
+        // What this one table's dump actually did, in the same terms the plan
+        // used: its own ledgers and the process's resident split. A dump that
+        // reports `released` but leaves RSS unchanged is either the allocator
+        // holding the arenas or the pages being page cache rather than heap -
+        // and the split tells which, because only `Anon` is the allocator.
+        let rss_after = crate::engine::state::process_rss_split();
+        eprintln!(
+            "info: reclaim dump: {key} unsealed {} -> {} (released={released}); \
+             RssAnon {} -> {} ({}), RssFile {} -> {}",
+            human_bytes(before as u64),
+            human_bytes(after as u64),
+            human_bytes(rss_before.rss_anon),
+            human_bytes(rss_after.rss_anon),
+            if rss_after.rss_anon <= rss_before.rss_anon {
+                format!("-{}", human_bytes(rss_before.rss_anon - rss_after.rss_anon))
+            } else {
+                format!("+{}", human_bytes(rss_after.rss_anon - rss_before.rss_anon))
+            },
+            human_bytes(rss_before.rss_file),
+            human_bytes(rss_after.rss_file),
+        );
         let still_unsealed = self.table_has_unsealed(key);
         if let Some(entry) = self.tables.lock().unwrap().get_mut(key) {
             if released {

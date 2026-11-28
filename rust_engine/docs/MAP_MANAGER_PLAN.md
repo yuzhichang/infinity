@@ -659,6 +659,38 @@ RssFile =    28 MiB
 
 **仍未解释的部分**：10 GiB 的匿名堆属于哪个结构（每表约 50 MiB，59 个索引 × 未到 `mem_index_capacity` 的 tail？）没有查证。它是本计划范围之外的一个独立问题（索引 tail 的内存上界），但会决定 L 场景能否在 30 GiB 机器上跑完。
 
+### 10 GiB 匿名堆的归属（实测结论）
+
+用 `setsid` 起服务端、`INSERT` 模式施加 L 负载（不是 `COPY`，所以 `staging_imports` 不参与），回收间隔调到 5s，读到：
+
+**计划和行动分开记录之后，归属不需要推测。** 每一次 dump 自己报告三件事：
+
+```
+reclaim dump: ...ragflow_lt_00225 unsealed 18 MiB -> 0 B (released=true);
+              RssAnon 11367 -> 11351 MiB (-16 MiB), RssFile 51 -> 52 MiB
+```
+
+- `unsealed N -> 0 B`：该表的缓冲行与索引 tail 真的清空了；
+- `RssAnon -16 MiB`：堆真的少了同样量级，释放是真实的；
+- `RssFile` 几乎不动：内存不在映射页缓存里。
+
+**归属**（`heap breakdown` 一行给出，不靠现象）：
+
+```
+row buffer=2597 MiB  index tails=4445 MiB  (ledger total=7042 MiB)
+decoded blocks=0 B   decoded chunks=0 B    ivf segments=0 B
+```
+
+10–11 GiB 的 `RssAnon` 由**两部分**构成：**索引 tail（约 4.4 GiB）加行缓冲（约 2.6 GiB）**，即 `memindex_bytes + Σ unsealed_bytes`；解码的块/索引 chunk 为 0（块版本已零拷贝进映射，`heap_bytes() == 0` 的断言成立）。
+
+**回收是有效的，产能不足。** 139 次 dump 累计释放 **7237 MiB** `RssAnon`；`row buffer` 在同一轮内从 3975 MiB 压到 2597 MiB。之所以总量仍爬到 11 GiB，是因为 L 场景的写入速度快过回收：77–88 张表一轮、每轮后新表继续进来。
+
+这给 L 场景的验收结论提供了依据：**在 30 GiB 机器上跑完 L 需要 `mem_index_capacity` 调小（让 tail 更早 dump）或降低并发写入**，而不是回收逻辑本身的问题。
+
+### 一个自己引入又修掉的缺陷
+
+第一版归属探针用 `mi_process_info` 只传了 5 个 `out` 参数，而它的签名是 **8 个**（`mimalloc.h` 里还有 `current_commit`/`peak_commit`/`page_faults`）。少传是 UB，服务端在打印 `heap breakdown` 之后、打印 allocator 行之前直接消失——这正是"静默退出"的另一副面孔。因为无法保证跨线程安全，最终删掉了这个探针，改用"每次 dump 前后各读一次 `RssSplit`"这条无 FFI 的路径。
+
 ### 未做
 
 **L 场景 RSS 曲线**（§5.2 最后两行）没有重跑。此前几次都在 17–20 GiB 被 earlyoom 杀掉，且本轮的改动需要真实负载才能看出差别。这是唯一遗留的验收项，不是遗漏——它需要一次独立的压测窗口。
