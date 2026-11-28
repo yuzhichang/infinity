@@ -561,3 +561,43 @@ awk '/^[0-9a-f]+-[0-9a-f]+/ {seg=$0; rss=0} /^Rss:/ {rss+=$2; if (seg!="") {prin
 | persistence 下是否跨表共享对象 | 是，`PersistentChunkStore::resolve` 把多个 part 解析到同一 blob，故需按引用数等分记账 |
 | `version` 的 `deleted` 段对齐 | 4 字节对齐、从不 8 字节对齐（`creates = 1..6` 实测），用 `pod_read_unaligned` |
 | 一个 `BlockId` 是否可能对应两个 inode | 是（重写期间新旧并存），故 `generations` 必须保留 |
+
+---
+
+## 12. 实施完成
+
+五个阶段全部落地，提交依次为：
+
+| 阶段 | 提交 |
+|---|---|
+| 1 | `storage: key the mapping table by file identity` |
+| 2 | `memory: attribute mappings and accesses to tables` |
+| 2.5 | `storage: read a block's version file out of the mapping` |
+| 2.6 | `storage: read a version file's create records out of the mapping too` |
+| 3 | `memory: the block map holds symbols, not mappings` |
+| 4 | `memory: rank a table by what it maps, not only by what it has not flushed` |
+| 5 | `storage: map secondary chunks through the identity table too` |
+
+### 验收核对（§5）
+
+| # | 不变量 | 测试 |
+|---|---|---|
+| 1 | 一个 inode 至多一个 VMA | `a_second_open_reuses_the_mapping`（解析 `/proc/self/smaps` 按 inode 数段） |
+| 2 | 正在读的映射不会被撤 | `unmap_idle_gives_the_address_space_back`、`unmap_idle_of_a_table_leaves_the_other_alone` |
+| 3 | rename 后新路径读到新内容 | `a_replaced_file_gets_a_fresh_mapping` |
+| 4 | `mapped_bytes` 等于对象字节之和 | `a_mapping_is_charged_to_its_table`、`a_shared_object_is_split_between_tables` |
+| 5 | 空闲映射数不超过上限 | `the_idle_bound_follows_the_kernel_limit`、`idle_mappings_are_capped` |
+
+性能项：`heap_bytes() == 0`（`a_sealed_block_is_mapped_once_and_shared`、`a_mapped_version_answers_like_an_owned_one`）；「只有映射的表也进候选集」（`a_table_that_only_holds_mappings_is_still_a_candidate`）。
+
+### 未做
+
+**L 场景 RSS 曲线**（§5.2 最后两行）没有重跑。此前几次都在 17–20 GiB 被 earlyoom 杀掉，且本轮的改动需要真实负载才能看出差别。这是唯一遗留的验收项，不是遗漏——它需要一次独立的压测窗口。
+
+### 实施中发现的、计划里没写对的三处
+
+1. **符号缓存让映射永不空闲**（阶段 3）：`BlockMapCache` 持有 `Arc<MappedBlock>` → `MappedFile`，`handles` 恒大于 0，回收一个字节也撤不掉。回收必须先丢符号。
+2. **`reclaim_target_met` 只看未落盘字节**（阶段 4）：一张行全落盘、映射很大的表会让 `0 <= target` 立即成立，整轮提前退出。
+3. **`table_id = 0` 当哨兵**（阶段 4）：`0` 是真实 id（新 catalog 的第一张表），用 `0` 表示"未知"会让那张表恰好跳过自己的映射。
+
+三处都已修正并写入各阶段的实施记录。
