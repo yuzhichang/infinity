@@ -704,20 +704,10 @@ impl super::Engine {
             return 0;
         }
         let mut freed = 0usize;
-        let mut dropped_rows = Vec::new();
         let mut dropped_vectors = Vec::new();
         let mut dropped_ivf = Vec::new();
         {
             let mut tables = self.tables.lock().unwrap();
-            for entry in tables.values_mut() {
-                if freed >= want {
-                    break;
-                }
-                if let Some(cache) = entry.row_cache.take() {
-                    freed = freed.saturating_add(cache.bytes);
-                    dropped_rows.push(cache);
-                }
-            }
             for entry in tables.values_mut() {
                 if freed >= want {
                     break;
@@ -751,7 +741,6 @@ impl super::Engine {
             }
         }
         let had_ivf = !dropped_ivf.is_empty();
-        drop(dropped_rows);
         drop(dropped_vectors);
         drop(dropped_ivf);
         if freed == 0 && had_ivf {

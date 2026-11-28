@@ -13341,7 +13341,6 @@ mod tests {
         e.flush().await.unwrap();
         // The flush moved every row into a block; a projection now reads the
         // block's columns (`decode_block_column`) instead of the buffer.
-        e.invalidate_row_cache("n");
         let items = [SelectItem::Column("name".to_string())];
         let projected = e
             .try_projection("n", &items)
@@ -13381,7 +13380,6 @@ mod tests {
         // builds the block with `block_of`. The `INSERT` left a decoded row
         // cache behind and a projection would rather use that, so invalidate it
         // the way a write does.
-        e.invalidate_row_cache("q");
         let only_b = [SelectItem::Column("b".to_string())];
         let projected = e
             .try_projection("q", &only_b)
@@ -15708,7 +15706,6 @@ mod tests {
         e.flush().await.unwrap();
         // The scalar row cache would answer first; drop it so the test proves
         // the block path.
-        e.invalidate_row_cache("default_db.bm");
         // No row record exists anywhere in the KV: the blocks are the table.
         assert!(e.store().scan_prefix(b"row:").unwrap().is_empty());
         let rows = e.fetch_rows("default_db.bm").await.unwrap();
@@ -15730,7 +15727,6 @@ mod tests {
             .await
             .unwrap();
         e.flush().await.unwrap();
-        e.invalidate_row_cache("default_db.bmu");
         e.execute("DELETE FROM bmu WHERE id = 2;").await.unwrap();
         e.execute("UPDATE bmu SET name = 'u' WHERE id = 3;")
             .await
@@ -15747,49 +15743,6 @@ mod tests {
             rows.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
             vec![0, 3]
         );
-    }
-
-    #[tokio::test]
-    async fn scalar_tables_use_the_row_cache() {
-        let dir = tempdir().unwrap();
-        let e = Engine::open_async(dir.path(), Default::default())
-            .await
-            .unwrap();
-        e.execute("CREATE TABLE rc (id INT, name VARCHAR);")
-            .await
-            .unwrap();
-        e.execute("INSERT INTO rc VALUES (1,'a'),(2,'b');")
-            .await
-            .unwrap();
-        assert_eq!(rows(&e, "SELECT * FROM rc;").await.len(), 2);
-        let key = e.table_key("rc");
-        assert!(e
-            .tables
-            .lock()
-            .unwrap()
-            .get(&key)
-            .and_then(|t| t.row_cache.as_ref())
-            .is_some());
-        assert_eq!(
-            rows(&e, "SELECT id FROM rc WHERE id = 2;").await,
-            vec![vec!["2".to_string()]]
-        );
-
-        e.execute("CREATE TABLE av (id INT, v EMBEDDING(FLOAT,2));")
-            .await
-            .unwrap();
-        e.execute("INSERT INTO av VALUES (1,[0.0,0.0]);")
-            .await
-            .unwrap();
-        assert_eq!(rows(&e, "SELECT * FROM av;").await.len(), 1);
-        let key = e.table_key("av");
-        assert!(e
-            .tables
-            .lock()
-            .unwrap()
-            .get(&key)
-            .and_then(|t| t.row_cache.as_ref())
-            .is_none());
     }
 
     /// Row-id allocation creates segments; `SHOW SEGMENTS` reports their ids

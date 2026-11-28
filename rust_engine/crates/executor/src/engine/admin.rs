@@ -653,7 +653,6 @@ impl Engine {
         // `batch_gate`, so the batch gate alone does not exclude them.
         let compact_gate = self.bottom_gate(table);
         let compact_turn = compact_gate.lock().await;
-        self.invalidate_row_cache(table);
         // Compaction moves rows between segments without changing how many are
         // live, so the counter survives even though the mirror's row-id
         // snapshot does not (it stops matching the moment the first row moves).
@@ -777,8 +776,6 @@ impl Engine {
                             },
                         );
                     }
-                    // Compaction renumbered every row.
-                    entry.row_cache = None;
                     // Every structure keyed by a row id refers to the old ids now:
                     // block-level indexes, the in-memory secondary tails, the full-text
                     // inverted index, the sparse documents and the vector buffers.

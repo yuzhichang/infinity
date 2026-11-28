@@ -5535,7 +5535,6 @@ impl Default for TableEntry {
             mirror_dirty: false,
             mirror_epoch: 0,
             mirror_rows: None,
-            row_cache: None,
         }
     }
 }
@@ -6089,10 +6088,6 @@ pub(crate) struct TableEntry {
     /// count is what tells "everything else is already on disk" apart from
     /// "another transaction reserved ids that are not".
     pub(crate) mirror_rows: Option<u64>,
-    /// Decoded rows of a **scalar-only** table (the reference's in-memory
-    /// `DataBlock`s). Served by `fetch_rows_with_ids` while it covers every
-    /// live row; any mutation that rewrites rows drops it.
-    pub(crate) row_cache: Option<RowCache>,
 }
 
 /// One segment of a table: its id and the highest row offset ever allocated.
@@ -6442,14 +6437,6 @@ impl PendingRows {
     }
 }
 
-/// A table's decoded rows, bounded by [`ROW_CACHE_BUDGET_BYTES`].
-pub(crate) struct RowCache {
-    pub(crate) rows: Vec<(usize, Vec<Value>)>,
-    pub(crate) bytes: usize,
-}
-
-pub(crate) const ROW_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
-
 thread_local! {
     /// [`READ_TS`] for a **pool thread**.
     ///
@@ -6565,33 +6552,6 @@ pub(crate) fn value_bytes(v: &Value) -> usize {
         Value::Str(s) => s.len() + 24,
         _ => 24,
     }
-}
-
-impl RowCache {
-    pub(crate) fn push(&mut self, seq: usize, row: Vec<Value>) {
-        self.bytes += 24 + row.iter().map(value_bytes).sum::<usize>();
-        self.rows.push((seq, row));
-    }
-}
-
-/// Only scalar columns are cached: array/tensor/sparse cells have several
-/// textual representations, so their decoded form is not stable enough to
-/// reuse across write and scan paths.
-pub(crate) fn scalar_only(types: &[String]) -> bool {
-    types.iter().all(|t| {
-        let t = t.trim().to_ascii_uppercase();
-        !is_blob_type(&t)
-            && !t.contains("ARRAY")
-            && (t.starts_with("INT")
-                || t.starts_with("BIGINT")
-                || t.starts_with("SMALLINT")
-                || t.starts_with("TINYINT")
-                || t.starts_with("FLOAT")
-                || t.starts_with("DOUBLE")
-                || t.starts_with("REAL")
-                || t.starts_with("VARCHAR")
-                || t.starts_with("BOOL"))
-    })
 }
 
 /// `BlockId` → the block's symbol object, and the rewrite generation per id.
@@ -7402,30 +7362,6 @@ pub(crate) async fn run_bottom(
         }
         engine.bump_writes(table);
         engine.note_live_rows(table, append.rows.len() as isize);
-        // The frame's rows are already decoded (`buffer_attributed_rows` took
-        // them), so the cache takes them as they are - no second parse. They are
-        // narrowed to the column's storage width first: `Literal::Int(300)` in
-        // a TINYINT column is stored as 44 by the block encoder, and a cache
-        // that kept 300 answered a latest-state read differently from the file.
-        let coercions: Vec<crate::blocks::engine::Coercion> = engine
-            .column_types(table)
-            .unwrap_or_default()
-            .iter()
-            .map(|ty| crate::blocks::engine::coercion_of(ty))
-            .collect();
-        let replay_rows: Vec<(usize, Vec<Value>)> = append
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(k, row)| {
-                let values: Vec<Value> = row.iter().map(Value::from_literal).collect();
-                (
-                    append.seq_at(k),
-                    crate::blocks::engine::coerce_row(&values, &coercions),
-                )
-            })
-            .collect();
-        engine.note_row_cache(table, &replay_rows);
     }
     // A delete is a mark in the block version (`DeleteInBlock`): the rows keep
     // their index entries, which a reader drops by the version (or the delete
@@ -7802,7 +7738,6 @@ impl<'a> EngineTxn<'a> {
             *delete_counts.entry(table.clone()).or_default() += 1;
         }
         for (table, count) in &delete_counts {
-            self.engine.invalidate_row_cache(table);
             self.engine.note_live_rows(table, -(*count as isize));
         }
         // Same-table bottom halves take their turn in commit order; different

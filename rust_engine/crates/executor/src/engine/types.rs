@@ -941,12 +941,6 @@ pub(crate) fn is_multivector_kind(index_type: &str) -> bool {
         || t.eq_ignore_ascii_case("MULTIVECTOR")
 }
 
-/// Wide values of these columns are kept in the row sidecar instead of the KV
-/// row (Gate C memory).
-pub(crate) fn is_blob_type(t: &str) -> bool {
-    is_embedding_type(t) || is_tensor_type(t) || is_sparse_type(t)
-}
-
 /// Inner product over the shared indices of two sparse vectors.
 pub(crate) fn sparse_dot(q: &[(usize, f64)], v: &[(usize, f64)]) -> f64 {
     let mut sum = 0.0;

@@ -197,49 +197,6 @@ impl Engine {
         entry.secondary.chunk_meta.insert(index_id, meta);
     }
 
-    /// Appends an already-decoded batch to the row cache, if the table has one.
-    ///
-    /// `rows` is what `publish_encoded_rows` just parsed: the cache used to
-    /// parse the same stored text a second time, which doubled the parse for
-    /// every insert on a scalar table.
-    pub(crate) fn note_row_cache(&self, table: &str, rows: &[(usize, Vec<Value>)]) {
-        if rows.is_empty() {
-            return;
-        }
-        let key = self.table_key(table);
-        {
-            let tables = self.tables.lock().unwrap();
-            let Some(entry) = tables.get(&key) else {
-                return;
-            };
-            if entry.row_cache.is_none() {
-                return;
-            }
-        }
-        let mut tables = self.tables.lock().unwrap();
-        let Some(entry) = tables.get_mut(&key) else {
-            return;
-        };
-        let Some(cache) = entry.row_cache.as_mut() else {
-            return;
-        };
-        // The cache is a `Vec` readers binary-search by row id, so it only takes
-        // a batch that starts after everything it already holds. Two commits
-        // whose bottoms finished out of order would otherwise leave it unsorted;
-        // dropping it costs one cache miss, not a wrong answer.
-        let first = rows[0].0;
-        if cache.rows.last().is_some_and(|(last, _)| *last >= first) {
-            entry.row_cache = None;
-            return;
-        }
-        for (seq, values) in rows {
-            cache.push(*seq, values.clone());
-        }
-        if cache.bytes > ROW_CACHE_BUDGET_BYTES {
-            entry.row_cache = None;
-        }
-    }
-
     /// Applies `delta` to the cached live-row count of `table`.
     pub(crate) fn note_live_rows(&self, table: &str, delta: isize) {
         let key = self.table_key(table);
@@ -883,19 +840,6 @@ impl Engine {
         let gate = self.batch_gate(table);
         let phase = std::time::Instant::now();
         self.note_index_insert(table, rows.len());
-        // A scalar table's first batch in this process starts an empty decoded
-        // row cache; the batch is appended after the commit.
-        {
-            let key = self.table_key(table);
-            let mut tables = self.tables.lock().unwrap();
-            let entry = tables.entry(key).or_default();
-            if entry.row_cache.is_none() && entry.write_batches == 0 && scalar_only(&types) {
-                entry.row_cache = Some(RowCache {
-                    rows: Vec::new(),
-                    bytes: 0,
-                });
-            }
-        }
         // one transaction -> one WAL record + one KV batch (batched durability)
         let mut t = self.txn.begin();
         // `NewTxn::Append` / `NewTxn::Import`: the conflict matrix compares the
@@ -1102,10 +1046,9 @@ impl Engine {
                     &bottom_rows,
                     &bottom_cells,
                     range_seq,
-                    |table, batch| {
-                        engine.note_row_cache(table, batch);
-                        Ok(())
-                    },
+                    // Nothing to keep in step: rows are read back from the
+                    // block mirror (`docs/MAP_MANAGER_PLAN.md` §13).
+                    |_, _| Ok(()),
                 )?;
                 // The rows are readable now (`AppendInBlock`), so the record may
                 // carry this transaction's ts (`BlockVersion::Append(commit_ts, …)`).
@@ -1229,7 +1172,6 @@ impl Engine {
         // cached `SELECT` results too.
         self.result_cache.lock().unwrap().clear();
         self.plan_cache.clear();
-        self.invalidate_row_cache(table);
         self.note_live_rows(table, -(deletes.len() as isize));
         // The block mirror keeps its snapshot: deleted row ids are hidden by
         // the tombstones written here, and rows an UPDATE re-inserted arrive
@@ -1324,7 +1266,6 @@ impl Engine {
     {
         self.result_cache.lock().unwrap().clear();
         self.plan_cache.clear();
-        self.invalidate_row_cache(table);
         self.note_live_rows(table, -(deletes.len() as isize));
         let mut txn = txn;
         for seq in deletes {

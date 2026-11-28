@@ -1410,7 +1410,6 @@ impl Engine {
                 Ok(QueryResult::values(vec![], Vec::new()))
             }
             Statement::AlterTableDropColumn { table, column } => {
-                self.invalidate_row_cache(table);
                 // Dropping a column that does not exist is `COLUMN_NOT_EXIST`.
                 let schema = self.table_schema(table)?;
                 if !schema.iter().any(|c| c == column) {
@@ -1432,7 +1431,6 @@ impl Engine {
                 // writes a marker per block and leaves every `{column_id}.col`
                 // where it is (`Cleanup` removes it later), so the rows are not
                 // re-encoded and the ids do not move.
-                self.invalidate_row_cache(table);
                 self.invalidate_block_mirror(table);
                 let dc_cmd = self.drop_columns_command(table, column)?;
                 // `GetBlockIDs1`: the blocks the column files live in. Read
@@ -1517,7 +1515,6 @@ impl Engine {
             }
             Statement::AlterTableAdd { table, columns } => {
                 // Rows cached before the new columns lack their defaults.
-                self.invalidate_row_cache(table);
                 self.invalidate_block_mirror(table);
                 // A column may not be added twice (`DUPLICATE_COLUMN_NAME`).
                 let existing = self.table_schema(table)?;

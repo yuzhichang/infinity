@@ -1474,13 +1474,6 @@ impl Engine {
         Arc::clone(gates.entry(key).or_default())
     }
 
-    pub(crate) fn invalidate_row_cache(&self, table: &str) {
-        let key = self.table_key(table);
-        if let Some(entry) = self.tables.lock().unwrap().get_mut(&key) {
-            entry.row_cache = None;
-        }
-    }
-
     /// The live-row count, using the incremental counter when available.
     pub(crate) fn live_row_count(&self, table: &str) -> Result<usize> {
         let key = self.table_key(table);
@@ -4017,22 +4010,6 @@ impl Engine {
         if prune.is_empty() && wanted.is_none() {
             return self.fetch_rows_with_ids(table).await;
         }
-        if crate::read_ts() == u64::MAX && prune.is_empty() {
-            let key = self.table_key(table);
-            let (cached, live) = {
-                let tables = self.tables.lock().unwrap();
-                let entry = tables.get(&key);
-                (
-                    entry.and_then(|e| e.row_cache.as_ref().map(|c| c.rows.clone())),
-                    entry.and_then(|e| e.live_rows),
-                )
-            };
-            if let Some(rows) = cached {
-                if live == Some(rows.len()) {
-                    return Ok(rows);
-                }
-            }
-        }
         if let Some(rows) = self.try_rows_pruned_wanted(table, prune, wanted).await? {
             return Ok(rows);
         }
@@ -4098,36 +4075,12 @@ impl Engine {
         &self,
         table: &str,
     ) -> Result<Vec<(usize, Vec<Value>)>> {
-        let key = self.table_key(table);
-        let (cached, live) = {
-            let tables = self.tables.lock().unwrap();
-            let entry = tables.get(&key);
-            (
-                entry.and_then(|e| e.row_cache.as_ref().map(|c| (c.rows.clone(), c.bytes))),
-                entry.and_then(|e| e.live_rows),
-            )
-        };
-        // The cache holds the latest state; a reader pinned to a timestamp has
-        // to see the rows as of then, so it goes to the table itself.
-        if crate::read_ts() == u64::MAX {
-            if let Some((rows, bytes)) = cached {
-                // The cache is authoritative only while it covers every live row.
-                if live == Some(rows.len()) {
-                    return Ok(rows);
-                }
-                let mut tables = self.tables.lock().unwrap();
-                if let Some(entry) = tables.get_mut(&key) {
-                    if entry.row_cache.as_ref().map(|c| c.bytes) == Some(bytes) {
-                        entry.row_cache = None;
-                    }
-                }
-            }
-        }
-        let rows = self.row_set_from(table).await?;
-        if crate::read_ts() == u64::MAX {
-            self.cache_row_set(table, key, &rows);
-        }
-        Ok(rows)
+        // No decoded-row cache: a scan reads the block mirror, whose pages are
+        // the page cache behind an mmap (`docs/MAP_MANAGER_PLAN.md` §13). The
+        // cache this replaced cloned every row out on each hit, so it paid a
+        // full `Vec<Value>` per row to avoid decoding - and the pages it saved
+        // re-reading were already resident.
+        self.row_set_from(table).await
     }
 
     /// Every live row of `table`, as a scan reads them.
@@ -4152,30 +4105,6 @@ impl Engine {
 
     /// Keeps a decoded row set for the next scan, when it is small and scalar.
     ///
-    /// The cache is only ever consulted while it covers every live row, so it
-    /// can be dropped at any point without changing an answer.
-    pub(crate) fn cache_row_set(&self, table: &str, key: String, rows: &[(usize, Vec<Value>)]) {
-        let types = self.column_types(table).unwrap_or_default();
-        if !scalar_only(&types) {
-            return;
-        }
-        let bytes: usize = 24
-            + rows
-                .iter()
-                .map(|(_, r)| r.iter().map(value_bytes).sum::<usize>())
-                .sum::<usize>();
-        if bytes > ROW_CACHE_BUDGET_BYTES {
-            return;
-        }
-        let mut tables = self.tables.lock().unwrap();
-        let entry = tables.entry(key).or_default();
-        entry.live_rows = Some(rows.len());
-        entry.row_cache = Some(RowCache {
-            rows: rows.to_vec(),
-            bytes,
-        });
-    }
-
     pub(crate) fn fetch_rows_including_deleted(
         &self,
         table: &str,
@@ -4391,24 +4320,6 @@ impl Engine {
         };
         let table = table.as_str();
         let schema = self.table_schema(table)?;
-        // A decoded row cache answers a projection faster than decoding the
-        // block mirror; leave the scan to it.
-        let key = self.table_key(table);
-        let cached = if crate::read_ts() == u64::MAX {
-            self.tables
-                .lock()
-                .unwrap()
-                .get(&key)
-                .and_then(|e| e.row_cache.as_ref().map(|c| c.rows.len()))
-        } else {
-            // A pinned reader cannot take the cache: it holds the latest state.
-            None
-        };
-        if let Some(len) = cached {
-            if len == self.live_row_count(table)? {
-                return Ok(None);
-            }
-        }
         let mut wanted: Vec<usize> = Vec::new();
         for item in items {
             match item {
