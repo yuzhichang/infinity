@@ -241,7 +241,14 @@ impl BlockVersion {
                 }
             })
             .collect();
-        (BlockVersionFile { created, deleted }.encode(), !is_modified)
+        (
+            BlockVersionFile {
+                created,
+                deleted: crate::format::DeletedSlots::Owned(deleted),
+            }
+            .encode(),
+            !is_modified,
+        )
     }
 
     /// C++: `BlockVersion::SpillToFile` — the serialized `version` file.
@@ -256,7 +263,7 @@ impl BlockVersion {
             .collect();
         BlockVersionFile {
             created,
-            deleted: self.deleted.clone(),
+            deleted: crate::format::DeletedSlots::Owned(self.deleted.clone()),
         }
         .encode()
     }
@@ -273,10 +280,11 @@ impl BlockVersion {
                 row_count: c.cumulative_row_count,
             })
             .collect();
+        let deleted = file.deleted.to_vec();
         Ok(Self {
+            latest_change_ts: deleted.iter().copied().max().unwrap_or(0),
             created,
-            latest_change_ts: file.deleted.iter().copied().max().unwrap_or(0),
-            deleted: file.deleted,
+            deleted,
         })
     }
 

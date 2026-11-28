@@ -3584,13 +3584,14 @@ impl Engine {
             // home, so nothing is written back to a row store.
             let base =
                 ((id.segment_id as usize) << 32) | (id.block_id as usize * DEFAULT_BLOCK_CAPACITY);
-            for (slot, ts) in version.deleted.iter().enumerate().take(row_count) {
-                if *ts == 0 {
+            for slot in 0..row_count.min(version.deleted.len()) {
+                let ts = version.deleted.stamp(slot);
+                if ts == 0 {
                     continue;
                 }
                 deletes.push((base + slot) as u64);
-                delete_ts.push(*ts);
-                newest = newest.max(*ts);
+                delete_ts.push(ts);
+                newest = newest.max(ts);
             }
         }
         // The journals are not written anywhere: they are derived from the same
@@ -4238,7 +4239,7 @@ impl Engine {
         if slot >= Self::visible_rows_of(version) {
             return false;
         }
-        version.deleted.get(slot).copied().unwrap_or(0) == 0
+        version.deleted.stamp(slot) == 0
     }
 
     /// Whether `seq` is in the table's append buffer. Scans it in place - no
@@ -4324,11 +4325,14 @@ impl Engine {
                 id.segment_id,
                 id.block_id,
             ));
-        BlockVersionFile::decode(
-            &storage::chunk_store::read_file(dir.join(storage::definition::format::VERSION_FILE))
-                .ok()?,
-        )
-        .ok()
+        // Mapped like every other block file: the delete section is 64 KiB per
+        // block, and this is called per block by the scans that walk a table.
+        let map =
+            storage::mapped::MappedFile::open(dir.join(storage::definition::format::VERSION_FILE))
+                .ok()?;
+        let backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = std::sync::Arc::new(map);
+        BlockVersionFile::decode_mapped(backing.as_ref().as_ref(), std::sync::Arc::clone(&backing))
+            .ok()
     }
 
     /// The rows a block's `version` makes visible: its created rows minus the
@@ -4354,7 +4358,7 @@ impl Engine {
         if slot >= created_at {
             return false;
         }
-        match version.deleted.get(slot).copied().unwrap_or(0) {
+        match version.deleted.stamp(slot) {
             0 => true,
             deleted => deleted > read_ts,
         }
@@ -4366,13 +4370,10 @@ impl Engine {
             .last()
             .map(|c| c.cumulative_row_count.max(0) as usize)
             .unwrap_or(0);
-        let deleted = version
-            .deleted
-            .iter()
-            .take(created)
-            .filter(|ts| **ts != 0)
+        let deleted = (0..created.min(version.deleted.len()))
+            .filter(|slot| version.deleted.stamp(*slot) != 0)
             .count();
-        created - deleted
+        created.saturating_sub(deleted)
     }
 
     /// Rows reserved in each segment, read off the blocks: a segment's extent is
@@ -4777,7 +4778,7 @@ impl Engine {
             let base = ((id.segment_id as u64) << 32)
                 | (u64::from(id.block_id) * DEFAULT_BLOCK_CAPACITY as u64);
             for slot in 0..rows as usize {
-                if let Some(ts) = version.deleted.get(slot).copied().filter(|t| *t != 0) {
+                if let Some(ts) = Some(version.deleted.stamp(slot)).filter(|t| *t != 0) {
                     deletes.push(base | slot as u64);
                     delete_ts.push(ts);
                 }
@@ -5393,7 +5394,7 @@ impl Engine {
         let width = vector.dim.checked_mul(4)?;
         let mut slots: Vec<usize> = Vec::with_capacity(row_count.min(64));
         for slot in 0..row_count {
-            if version.deleted.get(slot).copied().unwrap_or(0) != 0 {
+            if version.deleted.stamp(slot) != 0 {
                 continue;
             }
             let null = body_null.len() > slot / 8 && body_null[slot / 8] & (1 << (slot % 8)) == 0;
@@ -5437,7 +5438,7 @@ impl Engine {
             storage::definition::format::split_body_refs(body, DEFAULT_BLOCK_CAPACITY, layout);
         let mut slots: Vec<usize> = Vec::with_capacity(row_count.min(64));
         for slot in 0..row_count {
-            if version.deleted.get(slot).copied().unwrap_or(0) != 0 {
+            if version.deleted.stamp(slot) != 0 {
                 continue;
             }
             if body_null.len() > slot / 8 && body_null[slot / 8] & (1 << (slot % 8)) == 0 {

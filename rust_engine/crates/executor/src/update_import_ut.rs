@@ -148,7 +148,7 @@ async fn update_multiple_blocks() {
         .iter()
         .filter(|path| path.file_name().is_some_and(|name| name == "version"))
         .map(|path| BlockVersionFile::decode(&std::fs::read(path).unwrap()).unwrap())
-        .map(|version| version.deleted.iter().filter(|ts| **ts != 0).count())
+        .map(|version| version.deleted.nonzero_count())
         .sum();
     assert_eq!(physical, 3 * 8192);
     assert_eq!(physical - deleted, 2 * 8192);

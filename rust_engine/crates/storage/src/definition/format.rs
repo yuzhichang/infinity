@@ -141,12 +141,183 @@ pub struct VersionCreate {
     pub cumulative_row_count: i64,
 }
 
+/// The per-slot delete stamps of a `version` file: `0` means a live row.
+///
+/// Stored two ways because the two paths need different things. A block **being
+/// written** mutates them, so it owns a `Vec`. A block **being read** needs the
+/// whole array only to answer `deleted(slot)`, and the file is already in a
+/// read-only mapping - so the bytes are borrowed and each slot is read where it
+/// lies.
+///
+/// A mapping keeps the 64 KiB of a block's delete array in the page cache
+/// instead of in the heap, and it does so with **no alignment requirement**:
+/// the array starts at `2 + 16 * creates + 2` in the file, which is 4-byte
+/// aligned but never 8 (measured for every `creates` from 1 to 6), so the reads
+/// are unaligned. That is free on x86-64; on a target where it is not, the fix
+/// is to align the section in the writer, not to copy here.
+#[derive(Clone)]
+pub enum DeletedSlots {
+    /// A block under construction: mutable, one `u64` per slot.
+    Owned(Vec<TxnTimeStamp>),
+    /// The delete section of a mapped `version` file, read in place.
+    Mapped(MappedSlots),
+}
+
+impl Default for DeletedSlots {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl std::fmt::Debug for DeletedSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(slots) => f.debug_tuple("Owned").field(slots).finish(),
+            Self::Mapped(slots) => write!(f, "Mapped(len = {})", slots.len),
+        }
+    }
+}
+
+/// Compares by content, so a mapped version equals the owned one it was read
+/// into - which is what a round-trip test asserts.
+impl PartialEq for DeletedSlots {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        (0..self.len()).all(|slot| self.stamp(slot) == other.stamp(slot))
+    }
+}
+
+impl Eq for DeletedSlots {}
+
+/// A window onto the delete section of a mapped `version` file.
+///
+/// `Debug` is hand-written below because the owner is a trait object.
+///
+/// Holds the mapping (so it stays alive) and where the section starts; the
+/// length is the block capacity the file declared.
+#[derive(Clone)]
+pub struct MappedSlots {
+    /// Keeps the mapping alive. `Arc<dyn AsRef<[u8]>>` for the same reason the
+    /// index chunk readers use it: the owner is a `MappedFile` or a caller's
+    /// `Mmap`, and neither is nameable here.
+    owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    /// Offset of slot 0 within the mapping.
+    at: usize,
+    /// Number of slots.
+    len: usize,
+}
+
+impl MappedSlots {
+    /// A window starting at `at`, `len` slots long, kept alive by `owner`.
+    ///
+    /// `None` when the window does not fit the mapping: a truncated `version`
+    /// file means the record and the bytes disagree, which the caller must not
+    /// paper over with a zero-filled tail.
+    pub fn new(
+        owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+        at: usize,
+        len: usize,
+    ) -> Option<Self> {
+        let end = at.checked_add(len.checked_mul(std::mem::size_of::<TxnTimeStamp>())?)?;
+        if end > owner.as_ref().as_ref().len() {
+            return None;
+        }
+        Some(Self { owner, at, len })
+    }
+
+    #[inline]
+    fn slot(&self, index: usize) -> Option<TxnTimeStamp> {
+        if index >= self.len {
+            return None;
+        }
+        let bytes = self.owner.as_ref().as_ref();
+        let at = self.at + index * std::mem::size_of::<TxnTimeStamp>();
+        // Unaligned on purpose: the delete section follows a 2-byte count and
+        // 16-byte create records, so its offset is 4-byte aligned at best. An
+        // unaligned `u64` load costs nothing on x86-64, and copying the section
+        // to get alignment would give up the whole point of mapping it.
+        Some(bytemuck::pod_read_unaligned::<TxnTimeStamp>(
+            &bytes[at..at + std::mem::size_of::<TxnTimeStamp>()],
+        ))
+    }
+}
+
+impl DeletedSlots {
+    /// The delete stamp of `slot`, `None` past the end.
+    ///
+    /// Unlike [`Self::stamp`] this returns a reference, which a mapped slot
+    /// cannot give - it is decoded from the mapping on demand. A mapped slot
+    /// therefore reports `Some` only through `stamp`; callers that need the
+    /// value (all of them) use `stamp`, and this exists for the `Vec`-shaped
+    /// call sites that predate the mapped form.
+    ///
+    /// **Do not use this for visibility checks**: `None` here means "past the
+    /// end" for an owned array but "cannot be returned" for a mapped one, and a
+    /// caller treating both as "live" is how a mapped block lost its tombstones.
+    /// Use [`Self::stamp`].
+    #[inline]
+    pub fn get(&self, slot: usize) -> Option<&TxnTimeStamp> {
+        match self {
+            Self::Owned(slots) => slots.get(slot),
+            Self::Mapped(_) => None,
+        }
+    }
+
+    /// The delete stamp of `slot`; `0` (live) past the end.
+    ///
+    /// The one accessor every visibility decision must go through: it answers
+    /// the same for an owned and a mapped section.
+    #[inline]
+    pub fn stamp(&self, slot: usize) -> TxnTimeStamp {
+        match self {
+            Self::Owned(slots) => slots.get(slot).copied().unwrap_or(0),
+            Self::Mapped(slots) => slots.slot(slot).unwrap_or(0),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(slots) => slots.len(),
+            Self::Mapped(slots) => slots.len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many slots carry a non-zero stamp (a tombstone).
+    ///
+    /// The count a test or a sanity check wants; it walks the slots without
+    /// copying them, so it is also what a mapped version should use instead of
+    /// materialising the array.
+    pub fn nonzero_count(&self) -> usize {
+        (0..self.len())
+            .filter(|slot| self.stamp(*slot) != 0)
+            .count()
+    }
+
+    /// The slots as a slice, materialising a mapped section first. Only a caller
+    /// that needs the whole array should use this; the per-slot accessors above
+    /// never copy.
+    pub fn to_vec(&self) -> Vec<TxnTimeStamp> {
+        match self {
+            Self::Owned(slots) => slots.clone(),
+            Self::Mapped(slots) => (0..slots.len)
+                .map(|slot| slots.slot(slot).unwrap_or(0))
+                .collect(),
+        }
+    }
+}
+
 /// The serialized form of a block's `version` file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockVersionFile {
     pub created: Vec<VersionCreate>,
     /// One entry per block slot (length = block capacity); `0` = live row.
-    pub deleted: Vec<TxnTimeStamp>,
+    pub deleted: DeletedSlots,
 }
 
 impl BlockVersionFile {
@@ -164,14 +335,19 @@ impl BlockVersionFile {
         }
         Self {
             created,
-            deleted: vec![0; capacity],
+            deleted: DeletedSlots::Owned(vec![0; capacity]),
         }
     }
 
     /// Marks `offset` deleted at `ts` (the block capacity already sized `deleted`).
+    ///
+    /// Only a block under construction is mutated, and that one owns its slots;
+    /// a mapped `version` is never written through, so this is a no-op there.
     pub fn delete(&mut self, offset: usize, ts: TxnTimeStamp) {
-        if offset < self.deleted.len() {
-            self.deleted[offset] = ts;
+        if let DeletedSlots::Owned(slots) = &mut self.deleted {
+            if offset < slots.len() {
+                slots[offset] = ts;
+            }
         }
     }
 
@@ -180,8 +356,13 @@ impl BlockVersionFile {
     /// 8192-slot blocks - and that is real allocator memory per cached block,
     /// not page cache behind a mapping.
     pub fn heap_bytes(&self) -> usize {
-        self.deleted.capacity() * std::mem::size_of::<TxnTimeStamp>()
-            + self.created.capacity() * std::mem::size_of::<VersionCreate>()
+        // A mapped delete section is page cache, not heap: only the created
+        // records and (for a block being written) the slot array cost memory.
+        let deleted = match &self.deleted {
+            DeletedSlots::Owned(slots) => slots.capacity() * std::mem::size_of::<TxnTimeStamp>(),
+            DeletedSlots::Mapped(_) => 0,
+        };
+        deleted + self.created.capacity() * std::mem::size_of::<VersionCreate>()
     }
 
     /// Serializes exactly as C++ `BlockVersion::SaveToFile` does.
@@ -195,14 +376,73 @@ impl BlockVersionFile {
         }
         // `BlockOffset capacity` (u16 LE) then one u64 per slot.
         out.extend_from_slice(&(self.deleted.len() as u16).to_le_bytes());
-        for ts in &self.deleted {
-            out.extend_from_slice(&ts.to_le_bytes());
+        match &self.deleted {
+            DeletedSlots::Owned(slots) => {
+                for ts in slots {
+                    out.extend_from_slice(&ts.to_le_bytes());
+                }
+            }
+            DeletedSlots::Mapped(slots) => {
+                // A mapped version is re-encoded only when a block is rewritten;
+                // the slots are read back out of the mapping for it.
+                for index in 0..slots.len {
+                    out.extend_from_slice(&slots.slot(index).unwrap_or(0).to_le_bytes());
+                }
+            }
         }
         out
     }
 
-    /// Parses a `version` file. Note there is no magic or checksum to validate.
+    /// Parses a `version` file into owned arrays. Note there is no magic or
+    /// checksum to validate.
+    ///
+    /// A reader that already holds the file in a mapping should call
+    /// [`Self::decode_mapped`] instead: this one copies the delete section into
+    /// the heap, which for an 8192-slot block is 64 KiB per block read.
     pub fn decode(buf: &[u8]) -> Result<Self, FormatError> {
+        let (created, deleted_at, capacity) = Self::parse_header(buf)?;
+        let mut deleted = Vec::with_capacity(capacity);
+        for slot in 0..capacity {
+            let at = deleted_at + slot * std::mem::size_of::<TxnTimeStamp>();
+            deleted.push(bytemuck::pod_read_unaligned::<TxnTimeStamp>(
+                &buf[at..at + std::mem::size_of::<TxnTimeStamp>()],
+            ));
+        }
+        Ok(Self {
+            created,
+            deleted: DeletedSlots::Owned(deleted),
+        })
+    }
+
+    /// Parses a `version` file that is **already mapped**, borrowing its delete
+    /// section instead of copying it.
+    ///
+    /// The created records are still decoded (they are a handful of 16-byte
+    /// entries), so this costs a small `Vec`; the 64 KiB per-slot array stays in
+    /// the page cache behind `backing`, which is what makes a cached block's
+    /// charge nearly all mapping rather than heap.
+    ///
+    /// `backing` must cover `buf` - the caller maps the file and passes its own
+    /// bytes, so the window holds the same owner the reader does.
+    pub fn decode_mapped(
+        buf: &[u8],
+        backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ) -> Result<Self, FormatError> {
+        let (created, deleted_at, capacity) = Self::parse_header(buf)?;
+        let deleted =
+            MappedSlots::new(backing, deleted_at, capacity).ok_or(FormatError::Truncated {
+                need: deleted_at + capacity * std::mem::size_of::<TxnTimeStamp>(),
+                got: buf.len(),
+            })?;
+        Ok(Self {
+            created,
+            deleted: DeletedSlots::Mapped(deleted),
+        })
+    }
+
+    /// Parses the header and the create records, returning them with where the
+    /// delete section starts and how many slots it holds.
+    fn parse_header(buf: &[u8]) -> Result<(Vec<VersionCreate>, usize, usize), FormatError> {
         let mut pos = 0usize;
         let take = |pos: &mut usize, n: usize| -> Result<usize, FormatError> {
             if buf.len() < *pos + n {
@@ -231,12 +471,22 @@ impl BlockVersionFile {
         }
         let at = take(&mut pos, 2)?;
         let capacity = u16::from_le_bytes(buf[at..at + 2].try_into().unwrap()) as usize;
-        let mut deleted = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            let at = take(&mut pos, 8)?;
-            deleted.push(u64::from_le_bytes(buf[at..at + 8].try_into().unwrap()));
+        // The slots themselves are not read here: the owned form copies them and
+        // the mapped form borrows them, and neither needs them parsed.
+        let deleted_at = pos;
+        let deleted_end = deleted_at
+            .checked_add(capacity * std::mem::size_of::<TxnTimeStamp>())
+            .ok_or(FormatError::Truncated {
+                need: deleted_at.saturating_add(1),
+                got: buf.len(),
+            })?;
+        if buf.len() < deleted_end {
+            return Err(FormatError::Truncated {
+                need: deleted_end,
+                got: buf.len(),
+            });
         }
-        Ok(Self { created, deleted })
+        Ok((created, deleted_at, capacity))
     }
 }
 
@@ -1818,6 +2068,64 @@ mod tests {
                     assert_eq!(got, expect, "code {code}");
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod deleted_slots_tests {
+        use super::*;
+
+        /// A mapped `version` answers exactly what the owned one does.
+        ///
+        /// This is the property the whole change rests on: the delete section
+        /// stays in the mapping and is read in place, so every slot must come
+        /// back identical - and via `stamp`, not `get`, which cannot return a
+        /// reference to a mapped slot.
+        #[test]
+        fn a_mapped_version_answers_like_an_owned_one() {
+            let mut version = BlockVersionFile::new(&[(10, 4), (20, 4)], 8);
+            version.delete(1, 77);
+            version.delete(6, 91);
+            let bytes = version.encode();
+
+            let owned = BlockVersionFile::decode(&bytes).unwrap();
+            let backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> =
+                std::sync::Arc::new(bytes.clone());
+            let mapped = BlockVersionFile::decode_mapped(&bytes, backing).unwrap();
+
+            assert_eq!(owned.created, mapped.created, "create records agree");
+            assert_eq!(owned.deleted.len(), mapped.deleted.len());
+            assert_eq!(
+                mapped.deleted.nonzero_count(),
+                2,
+                "both tombstones are readable through the mapping"
+            );
+            for slot in 0..8 {
+                assert_eq!(
+                    owned.deleted.stamp(slot),
+                    mapped.deleted.stamp(slot),
+                    "slot {slot} differs"
+                );
+            }
+            // Past the end reads as live through `stamp`, for both forms.
+            assert_eq!(owned.deleted.stamp(8), 0);
+            assert_eq!(mapped.deleted.stamp(8), 0);
+            // Re-encoding a mapped version reproduces the file.
+            assert_eq!(mapped.encode(), bytes);
+        }
+
+        /// A file shorter than its declared capacity is refused, not zero-filled.
+        #[test]
+        fn a_truncated_delete_section_is_an_error() {
+            let version = BlockVersionFile::new(&[(10, 4)], 8);
+            let mut bytes = version.encode();
+            bytes.truncate(bytes.len() - 8);
+            let backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> =
+                std::sync::Arc::new(bytes.clone());
+            assert!(
+                BlockVersionFile::decode_mapped(&bytes, backing).is_err(),
+                "a short delete section must not decode"
+            );
         }
     }
 }

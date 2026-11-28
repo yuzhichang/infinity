@@ -56,18 +56,6 @@ fn column(column_id: u64, values: &[i32]) -> BlockColumn {
     }
 }
 
-fn column_file_len(root: &std::path::Path, id: BlockId, column_id: u64) -> u64 {
-    let dir = root.join(storage::block_dir(
-        id.db_id,
-        id.table_id,
-        id.segment_id,
-        id.block_id,
-    ));
-    std::fs::metadata(dir.join(storage::column_file(column_id)))
-        .unwrap()
-        .len()
-}
-
 #[test]
 fn every_block_maps_only_its_own_files() {
     let dir = tempfile::tempdir().unwrap();
@@ -79,8 +67,19 @@ fn every_block_maps_only_its_own_files() {
             .create_block(id(0, b), b as usize, 4, &[column(0, &[b as i32; 4])], 1, 1)
             .unwrap();
     }
-    let file_lens: Vec<u64> = (0..4u16)
-        .map(|b| column_file_len(dir.path(), id(0, b), 0))
+    // Everything a block maps: its one column plus the `version` file, which is
+    // mapped too (its delete section is 64 KiB per 8192-slot block and copying
+    // it into the heap was the largest per-block charge).
+    let block_lens: Vec<u64> = (0..4u16)
+        .map(|b| {
+            let dir = dir.path().join(storage::block_dir(1, 2, 0, b));
+            std::fs::metadata(dir.join(storage::column_file(0)))
+                .unwrap()
+                .len()
+                + std::fs::metadata(dir.join(storage::format::VERSION_FILE))
+                    .unwrap()
+                    .len()
+        })
         .collect();
     {
         let mut mapped = Vec::new();
@@ -88,30 +87,30 @@ fn every_block_maps_only_its_own_files() {
             let (_, block) = index.get_block(&id(0, b)).unwrap();
             let (body, _) = block.column(0).unwrap();
             assert_eq!(i32::from_le_bytes(body[0..4].try_into().unwrap()), b as i32);
-            // The mapping covers this block's column file and nothing else.
-            assert_eq!(block.bytes() as u64, file_lens[b as usize]);
+            // The mapping covers this block's files and nothing else.
+            assert_eq!(block.bytes() as u64, block_lens[b as usize]);
             mapped.push(block);
         }
         assert_eq!(
             storage::mapped::mapping_count(),
-            before + 4,
-            "one mapping per block, shared while it is held"
+            before + 8,
+            "one mapping per file: four blocks, each with its column and version"
         );
         assert_eq!(
             storage::mapped::mapped_bytes(),
-            before_bytes + file_lens.iter().sum::<u64>() as usize,
+            before_bytes + block_lens.iter().sum::<u64>() as usize,
             "the counter covers the mapped files, not the address space"
         );
     }
     // Dropping the handles leaves the objects mapped: they are idle, not gone.
     assert_eq!(
         storage::mapped::mapping_count(),
-        before + 4,
+        before + 8,
         "an idle mapping is kept for the next open"
     );
     assert_eq!(
         storage::mapped::mapped_bytes(),
-        before_bytes + file_lens.iter().sum::<u64>() as usize,
+        before_bytes + block_lens.iter().sum::<u64>() as usize,
     );
     // The explicit reclaim is what gives the address space back.
     storage::mapped::unmap_idle_mappings();

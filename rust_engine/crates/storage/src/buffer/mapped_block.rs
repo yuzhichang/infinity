@@ -46,16 +46,29 @@ impl MappedBlock {
     ///
     /// The `version` file is read first: it is written **last** by the writer,
     /// so a directory whose `version` decodes is a complete block.
+    ///
+    /// Both it and the columns are **mapped**, never read into the heap. A
+    /// version file carries one `u64` per block slot - 64 KiB for an 8192-row
+    /// block - and copying that per block read was the largest single heap
+    /// charge a cached block had.
     pub fn open(root: &Path, id: BlockId) -> std::io::Result<Self> {
         let dir = root.join(block_dir(id.db_id, id.table_id, id.segment_id, id.block_id));
         // The `version` file is a data file like any other: a persistence
-        // profile may hold it only as an object part.
-        let version = BlockVersionFile::decode(
-            &crate::chunk_store::chunk_store().read(&dir.join(VERSION_FILE))?,
+        // profile may hold it only as an object part. `MappedFile::open` is the
+        // store-aware facade, so both backends work.
+        let version_map = MappedFile::open(dir.join(VERSION_FILE))?;
+        let version_backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> =
+            std::sync::Arc::new(version_map);
+        let version = BlockVersionFile::decode_mapped(
+            version_backing.as_ref().as_ref(),
+            std::sync::Arc::clone(&version_backing),
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut columns: Vec<(u64, MappedFile, Option<MappedFile>)> = Vec::new();
-        let mut bytes = 0usize;
+        // Every mapped file counts: the version's bytes are resident-capable
+        // page cache exactly like a column's, and leaving them out would make a
+        // block look smaller than the mapping it holds.
+        let mut bytes = version_backing.as_ref().as_ref().len();
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let name = entry.file_name();

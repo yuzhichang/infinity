@@ -323,7 +323,7 @@ impl<'a> BlockCursor<'a> {
             // A slot the version marks deleted has no row to return.
             wanted.retain(|seq| {
                 let slot = (*seq & 0xffff_ffff) % DEFAULT_BLOCK_CAPACITY;
-                version.deleted.get(slot).copied().unwrap_or(0) == 0
+                version.deleted.stamp(slot) == 0
             });
             if wanted.is_empty() {
                 continue;
@@ -553,7 +553,7 @@ impl<'a> BlockCursor<'a> {
                 continue;
             };
             for (seq, slot) in rows {
-                if version.deleted.get(slot).copied().unwrap_or(0) != 0 || self.dead.contains(seq) {
+                if version.deleted.stamp(slot) != 0 || self.dead.contains(seq) {
                     continue;
                 }
                 let at = slot * 8;
@@ -852,7 +852,7 @@ impl<'a> BlockCursor<'a> {
             let version = block.version();
             wanted.retain(|seq| {
                 let slot = (*seq & 0xffff_ffff) % DEFAULT_BLOCK_CAPACITY;
-                version.deleted.get(slot).copied().unwrap_or(0) == 0
+                version.deleted.stamp(slot) == 0
             });
             if wanted.is_empty() {
                 continue;
@@ -939,7 +939,7 @@ impl<'a> BlockCursor<'a> {
         }
         let (_, block) = self.block.as_ref().unwrap();
         let version = block.version();
-        if version.deleted.get(slot).copied().unwrap_or(0) != 0 {
+        if version.deleted.stamp(slot) != 0 {
             return Ok(None);
         }
         // Decode only the slot this call asked for. The full-block decode this
@@ -1090,19 +1090,39 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "the process holds one mapping per sealed block"
         );
-        // The mapping covers exactly the block's files; the column payload a
-        // decoder gets is a slice of them, not a copy out of them.
-        let column_bytes: usize = std::fs::read_dir(first.dir(&root))
+        // The mapping covers exactly the block's files - the `version` file
+        // included, since it is mapped too and its bytes are resident-capable
+        // page cache like a column's; the payload a decoder gets is a slice of
+        // them, not a copy out of them.
+        let mapped_bytes: usize = std::fs::read_dir(first.dir(&root))
             .unwrap()
             .map(|entry| entry.unwrap())
             .filter(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                name.ends_with(".col") || (name.starts_with("col_") && name.ends_with("_out"))
+                name == storage::format::VERSION_FILE
+                    || name.ends_with(".col")
+                    || (name.starts_with("col_") && name.ends_with("_out"))
             })
             .map(|entry| entry.metadata().unwrap().len() as usize)
             .sum();
-        assert_eq!(first.bytes(), column_bytes);
+        assert_eq!(first.bytes(), mapped_bytes);
         assert!(first.column(0).is_some() && first.column(1).is_some());
+        // The `version` is mapped, not decoded into the heap: an 8192-slot
+        // block's delete array alone is 64 KiB, and it used to be the largest
+        // per-block heap charge. What remains is the handful of create records.
+        assert!(
+            first.heap_bytes() < 4096,
+            "the version must stay in the mapping, not the heap: {} bytes",
+            first.heap_bytes()
+        );
+        // And the mapping really holds the delete array: a version whose slots
+        // were never readable would also report a small heap, so the slot count
+        // is checked too. Every slot starts live in a freshly written block.
+        assert!(
+            first.version().deleted.len() >= storage::format::DEFAULT_BLOCK_CAPACITY / 2,
+            "the mapped delete section is short: {} slots",
+            first.version().deleted.len()
+        );
         assert_eq!(e.buffer_objects().len(), 1);
 
         // A rewrite replaces the files, and the stale mapping goes with them.
@@ -1747,7 +1767,7 @@ mod tests {
         // block that holds the slot carries the tombstone.
         e.execute("DELETE FROM t WHERE id = 9000;").await.unwrap();
         let second = storage::definition::format::read_block(&e.blocks_root(), block(1)).unwrap();
-        assert_eq!(second.0.deleted.iter().filter(|ts| **ts != 0).count(), 0);
+        assert_eq!(second.0.deleted.nonzero_count(), 0);
         assert_eq!(
             row_strings(&e, "SELECT count(*) FROM t;").await,
             vec![vec!["8193"]]
@@ -1756,7 +1776,7 @@ mod tests {
         let first = storage::definition::format::read_block(&e.blocks_root(), block(0)).unwrap();
         assert_eq!(first.0.encode(), first_before);
         let second = storage::definition::format::read_block(&e.blocks_root(), block(1)).unwrap();
-        assert_eq!(second.0.deleted.iter().filter(|ts| **ts != 0).count(), 1);
+        assert_eq!(second.0.deleted.nonzero_count(), 1);
     }
 
     /// The block layout is the **row set**, not just the values: with the

@@ -192,6 +192,27 @@ impl MapManager {
 - **access clock 放在 `TableEntry`，不是全局 map**（见下方决策 4 的修正）。`Engine::note_table_access(table)` 写 `TableEntry::last_access_ts`，取 `current_ts()`（已提交时钟），单调更新。调用点在 `Engine::block_map`，覆盖块读的命中与未命中两条路径。
 - 测试：`mapping_identity.rs` 9 个用例（新增表归属、共享等分、按表 unmap 三个）；`reading_a_table_advances_its_access_clock` 验证读推进时钟。
 
+### 阶段 2.5：`version` 文件零拷贝（已完成）
+
+块缓存的堆开销里最大的一项不是列数据，而是 `version` 文件解码出来的 `deleted` 数组：`u64 × 8192` = **64 KiB/块**。它被 `BlockMapCache` 按 `heap_bytes()` 计入预算，于是"块在页缓存里"这个说法对每个块都不成立。
+
+改法：`BlockVersionFile::deleted` 从 `Vec<TxnTimeStamp>` 变成 `DeletedSlots` 枚举：
+
+| 形态 | 用于 | 存储 |
+|---|---|---|
+| `Owned(Vec<u64>)` | 正在写的块（可变） | 堆 |
+| `Mapped(MappedSlots)` | 读取的块 | 映射 + 偏移，按需读 |
+
+`MappedBlock::open` 与 `Engine::read_block_version` 都改用 `decode_mapped`：`version` 走 `MappedFile::open`（不再是 `chunk_store().read()`），`deleted` 段留在页缓存里。`heap_bytes()` 对映射形态报 0，块的 charge 于是几乎全是映射。
+
+**对齐**：`deleted` 段起点是 `2 + 16 × creates + 2`，实测 `creates = 1..6` 全部 4 字节对齐、**从不** 8 字节对齐，所以用 `bytemuck::pod_read_unaligned` 逐槽读。x86-64 上非对齐 `u64` 加载无惩罚；换到有惩罚的目标应改写入端补齐对齐，而不是在这里复制。
+
+**踩到的坑（重要）**：`DeletedSlots::get()` 对映射形态返回 `None`（拿不到引用），而 9 处可见性判断都写成 `deleted.get(slot).copied().unwrap_or(0) == 0` —— 于是映射块的墓碑全部读成"未删除"，`blocks_reconstruct_a_table_after_its_rows_are_deleted` 立刻抓到（删掉的行复活了）。现在所有可见性判断统一走 `stamp(slot)`，`get()` 的文档也写明它不能用于可见性判断。
+
+**实测收益**：每块堆占用从 64 KiB 降到 < 4 KiB（只剩 create 记录）；`a_sealed_block_is_mapped_once_and_shared` 断言了这两点，并额外断言映射里的槽位数，防止"读不到所以报得少"。
+
+---
+
 ### 阶段 3：区块缓存改由 MapManager 承载
 
 | 项 | 内容 |
