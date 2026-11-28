@@ -19987,18 +19987,22 @@ mod tests {
         assert_eq!(dumped, 1, "the cap is one table per round");
         assert_eq!(pending(), 2, "the other two wait for the next round");
 
-        // Cap 0 means "no limit".
+        // Cap 0 means "no limit": one round takes the remaining two, and the
+        // round stops there because the target is met (`quota / 2` is 0 at a
+        // quota of 1) - so this also asserts the round does not walk on.
+        //
+        // Drainedness, not the returned count: `reclaim_unsealed` also credits a
+        // table whose only release was a mapping (`unmap_idle_of`), and the
+        // mapping registry is keyed by table id alone. Ids 0/1/2 are what any
+        // engine's first three tables get, so a concurrent test in this binary
+        // that maps a block is enough to make this engine's `mapped` arm
+        // non-zero and its round report one more release than it made. What the
+        // cap controls is how many tables get drained, and `unsealed_bytes` is
+        // this engine's own ledger.
         e.set_unsealed_max_tables_per_round(0);
-        let mut total = dumped;
-        for _ in 0..8 {
-            if pending() == 0 {
-                break;
-            }
-            storage::mapped::unmap_idle_mappings();
-            total += e.reclaim_unsealed().await;
-        }
-        assert_eq!(pending(), 0, "cap 0 drains everything, round after round");
-        assert_eq!(total, 3, "all three tables were dumped exactly once");
+        storage::mapped::unmap_idle_mappings();
+        let _ = e.reclaim_unsealed().await;
+        assert_eq!(pending(), 0, "cap 0 drains every table in one round");
     }
 
     /// The cap bounds **attempts**, not successes.
