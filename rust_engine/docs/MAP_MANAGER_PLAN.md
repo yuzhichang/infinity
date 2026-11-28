@@ -233,17 +233,67 @@ impl MapManager {
 
 ---
 
-### 阶段 3：区块缓存改由 MapManager 承载
+### 阶段 3：区块缓存退化为纯符号缓存
+
+#### 3.0 两层的关系（先定边界，再动手）
+
+```
+block_map(table, root, id)            ← BlockId → 符号对象的解析 + 一致性
+  ├── BlockMapCache: HashMap<BlockId, Arc<MappedBlock>>   只答"在不在"
+  │     └── generations: HashMap<BlockId, u64>            只答"被重写过几次"
+  └── 未命中 → MappedBlock::open(root, id)
+        └── 每个文件 MappedFile::open → MapManager（按 inode 去重、持有、按表回收）
+```
+
+| 关注点 | 归谁 | 理由 |
+|---|---|---|
+| `BlockId` 对应哪个 `MappedBlock` | `block_map` | 逻辑块号是引擎概念，`MapManager` 不知情 |
+| 该 id 是否被重写过 | `block_map`（`generations`） | 与写入路径耦合，且只对块有意义 |
+| 一个文件有几个 VMA | `MapManager` | 文件身份问题 |
+| 映射占多少字节、何时回收 | `MapManager` | 回收按**表**决策，块级预算已废除 |
+| 映射生命周期 | `MapManager` | — |
+
+**两者不能合并的根本原因**：一个 `BlockId` 会同时对应两个 inode。块 3 被重写后 inode 从 100 变 101，读者 A 仍持有旧 `Arc<MappedBlock>`（inode 100），新读者要 inode 101——`MapManager` 里两个 inode 都在，`BlockMapCache` 只留最新的符号。按 `BlockId` 做键的映射表表达不了"同一逻辑块的两个物理版本共存"，而这正是 generation 存在的理由。
+
+**`MappedBlock` 是接缝**：它持有 `MappedFile`（`MapManager` 的句柄），自身是纯符号聚合。
+
+#### 3.1 改动清单
 
 | 项 | 内容 |
 |---|---|
-| 删除 | `BlockMapCache` 的 `order`、`bytes`、`shrink_by`、`trim_to`、`evict_one`（CLOCK 与预算） |
-| 保留 | `generations` 与 `bump_generation`——它防的是**半写映射被缓存**，与回收无关，删掉会让重写在进程内不可见（`state.rs:6596-6602` 记录了该缺陷） |
-| 改造 | `block_map` 不再查 `block_maps` 缓存；改为 `MapManager::open(table, path)`，命中即复用，未命中即映射 |
-| 改造 | `drop_block_map` / `drop_block_maps` → 改为「作废该表这些 inode 的条目」（`MapManager::invalidate(table, path)`），保留语义 |
-| 验收 | ① `index_combination_soak.rs:99` 记录的「写前未丢块映射」场景仍通过 ② 块重写后立即读到新内容 ③ `SHOW BUFFERS` / `buffer_pool_usage` 有新的数据源 |
+| 删除 | `BlockMapCache` 的 `order`、`bytes`、`CachedBlock::referenced`、`CachedBlock::charge`，以及 `shrink_by`、`trim_to`、`shrink_to`、`evict_one`、`bytes()`；`insert` 去掉 `budget` 参数 |
+| 保留 | `entries`、`generations`、`get`、`insert`（先到者胜）、`remove`、`retain_table`、`len`、`blocks` |
+| **原样保留** | `block_map` 里的 3 次重试与 `current == generation` 检查；`block_written` 必须**在文件落盘之后**调用 |
+| 改造 | `drop_block_maps(table_id)` 做两个动作：`retain_table(table_id)`（符号）+ `storage::mapped::unmap_idle_of(table_id)`（映射）。两者不是原子的，可接受：符号先没了，新读者会重新 `open`；旧映射短暂残留只多占一会儿地址空间 |
+| 改造 | `drop_block_map(id)`（单块）保留 `remove(&id)`；底层旧映射由 idle 队列自然回收 |
+| 改造 | `memory.rs` 回收阶梯第 4 步：`shrink_block_maps` → `storage::mapped::release_mapped_pages` / `unmap_idle_of` |
+| 改造 | `set_buffer_budget` 不再调 `trim_to`（`buffer_budget` 仍供 HNSW 用，字段保留） |
 
-> **本阶段是本计划中风险最高的一步**：`block_maps` 的 generation 检查与 `MappedBlock` 的 `Arc` 生命周期耦合很紧。建议先保留 `BlockMapCache` 的 `generations` 与 `get/insert` 外壳，只把「缓存条目」换成 `MapManager` 的句柄，等阶段 5 再彻底删外壳。
+**generation 在阶段 3 之后更重要**：预算淘汰消失后，缓存条目只由显式 drop 删除，一个坏条目可能存活很久。`index_combination_soak.rs:99-102` 记录的正是这个缺陷。
+
+#### 3.2 对外可见面（已确认）
+
+| 字段 | 处置 |
+|---|---|
+| `buffer_used_bytes()` | **删除**。`heap_bytes()` 已恒为 0，它实际等于"已缓存块映射字节之和"，被 `mapped_bytes()` 完整覆盖；`buffer_pool_usage` 在该仓库不存在 |
+| `BufferedObjectCount` | **保留**，数据源改为 `storage::mapped::mapping_count()`。C++ 对应 `BufferManager::BufferedObjectCount()` = `buffer_map_.size()`；把索引 chunk 计进来数值会变大，已确认接受 |
+| `MemoryCacheMiss` / `DiskCacheMiss` | 保留（命中率统计仍有意义） |
+| `buffer_objects()` / `SHOW OBJECT` | 保留，仍只列**块**（按块目录查，不扩到索引 chunk） |
+
+#### 3.3 测试
+
+| 测试 | 处置 |
+|---|---|
+| `the_block_map_evicts_the_least_recently_used_mapping` | **删除**（测的是被移除的 CLOCK） |
+| `a_tiny_buffer_budget_keeps_the_block_map_empty` | **改写**为"映射由 `MapManager` 持有、按表释放" |
+| `buffer_obj_ut.rs` 的 `buffer_used_bytes` 断言 | 改为断言 `mapped_bytes_of(table)` 归零 |
+| `index_combination_soak.rs` 注释 | 更新（失效机制仍在，实现变了） |
+
+#### 3.4 验收
+
+① 块重写后立即读到新内容（generation 仍生效）② `index_combination_soak` 通过 ③ drop 表后该表映射归零 ④ `SHOW BUFFERS` 三个字段有数据且语义如 3.2 ⑤ 并发读同一块只产生一个 VMA
+
+---
 
 ### 阶段 4：回收阶梯与 RRF 改造
 
@@ -259,9 +309,10 @@ impl MapManager {
 
 | 项 | 内容 |
 |---|---|
-| 删除 | `BlockMapCache` 剩余外壳、`Context::block_maps`、`shrink_block_maps` |
-| 改造 | `secondary_lowcard` / `secondary_segment_pgm` 的 `from_mmap` → `MapManager::open`（按 inode 去重） |
-| 改造 | `release_mapped_pages`（`madvise` 路径）改为只遍历 `by_object` 的 `Arc<Mmap>`，不再遍历 slot 表 |
+| **不删** | `BlockMapCache` 的 `entries` + `generations`。它是 `BlockId → 符号对象` 的解析与一致性层，与映射管理无关（§3.0）。`Context::block_maps` 保留，只是不再有预算语义 |
+| 删除 | `shrink_block_maps`（阶段 3 已改为 `release_mapped_pages`） |
+| 改造 | `secondary_lowcard` / `secondary_segment_pgm` 的 `from_mmap` → 走 `MappedFile::open`（按 inode 去重；这两个调用方自己 `Mmap::map`，拿不到 inode） |
+| 改造 | `release_mapped_pages` 的遍历：阶段 1 已改为按对象快照后锁外 `madvise`，此处只做收尾核对 |
 | 验收 | ① `cargo clippy --workspace --all-targets` 干净 ② 全量测试 ③ L 场景 RSS 曲线对比 |
 
 ---
@@ -448,24 +499,27 @@ awk '/^[0-9a-f]+-[0-9a-f]+/ {seg=$0; rss=0} /^Rss:/ {rss+=$2; if (seg!="") {prin
 
 ---
 
-## 9. 对外可见面（阶段 3 会改，需确认）
+## 9. 对外可见面（已确认，见 §3.2）
 
-三个输出读 `block_maps`，废除它必须给它们换数据源：
+三项已定：`buffer_used_bytes()` 删除（`buffer_pool_usage` 在该仓库不存在）；`BufferedObjectCount` 保留并改数 `mapping_count()`，数值变大已接受；`buffer_objects()` / `SHOW OBJECT` 仍只列块。
 
-| 输出 | 现在 | 废除后 |
-|---|---|---|
-| `SHOW BUFFERS` → `BufferedObjectCount` | `block_maps.len()`（`statements.rs:12727`） | `MapManager::object_count()`，且**语义扩大**：从「块数」变成「所有映射的对象数（含索引 chunk）」 |
-| `buffer_objects()`（`SHOW BUFFERS` 的行） | 遍历 `block_maps.blocks()`（`:12872-12892`） | 遍历 `by_object`，`object_path` 取 `paths` 反向表的第一条 |
-| `buffer_used_bytes()` → `buffer_pool_usage` | `block_maps.bytes()`（`:7513`） | `MapManager::mapped_bytes_all()`；**不再含解码 `version` 的堆**，那部分要另找归属（建议留在 `TableEntry`，因为它是表级堆内存） |
-
-`statements.rs:12722-12726` 的注释明确写了「index chunks are mapped too, but they belong to the index structures, not to this pool」——统一之后这句注释不再成立，必须改。这是**语义变更**，需要产品侧确认 `SHOW BUFFERS` 的数值可否变化。
+`statements.rs:12722-12726` 的注释「index chunks are mapped too, but they belong to the index structures, not to this pool」随 `BufferedObjectCount` 的语义变更一并改写。
 
 ---
 
-## 10. 待办（开始前需确认）
+## 10. 待办
 
-1. 决策 1–4 的取舍（§6）。
-2. `SHOW BUFFERS` 三个字段的语义变更可否接受（§9）。
-3. `buffer_used_bytes` 里「解码 version 的堆」的新归属。
+决策项已全部确定（§6 决策 1–4、§3.2 对外可见面）。已核对完成的条目见 §11。
 
-已核对完成、不再是待办的项：`current_ts` 的推进时机（§6 决策 4）、persistence 下是否存在跨表共享对象（§6 决策 2）、文件是否只经 rename 发布（§1.2）。
+---
+
+## 11. 已核对的事实（不必再查）
+
+| 事实 | 结论 |
+|---|---|
+| 数据文件是否就地编辑 | 否，全部 temp + rename（`format::write_parts`），故 `(dev, ino)` 是稳定身份 |
+| 索引 chunk 是否复用 id | 否，`take_next_chunk_id` 单调分配 |
+| `current_ts` 何时推进 | 提交底半完成时（`txn/src/lib.rs:843`）；checkpoint/cleanup 也各占一个 commit ts |
+| persistence 下是否跨表共享对象 | 是，`PersistentChunkStore::resolve` 把多个 part 解析到同一 blob，故需按引用数等分记账 |
+| `version` 的 `deleted` 段对齐 | 4 字节对齐、从不 8 字节对齐（`creates = 1..6` 实测），用 `pod_read_unaligned` |
+| 一个 `BlockId` 是否可能对应两个 inode | 是（重写期间新旧并存），故 `generations` 必须保留 |
