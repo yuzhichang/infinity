@@ -73,10 +73,21 @@ const TICK_MS: u64 = 1000;
 /// A table as the round's first pass sees it.
 struct TableStat {
     key: String,
-    /// Buffered rows plus index tails, for the size rank. Cached index bytes
-    /// only affect *ordering*, never the decision to reclaim.
+    /// The table's numeric id, which is what the mapping table is keyed by.
+    /// `None` when the catalog cannot name it.
+    table_id: Option<u64>,
+    /// What the table costs the process, for the size rank: buffered rows, index
+    /// tails **and the bytes it has mapped**. The mapped half is what a table
+    /// nobody has written in a while can still be holding - a scan leaves the
+    /// block and index pages resident, and dropping the table's mappings is one
+    /// of the ways the reclaim ladder gets them back
+    /// (`docs/MAP_MANAGER_PLAN.md` §6 decision 3).
+    ///
+    /// Cached index bytes only affect *ordering*, never the decision to reclaim.
     footprint: u64,
-    /// Commit ts of the table's last append, or 0 when it has none this process.
+    /// The table's last touch: the newer of its last append and its last block
+    /// read, in commit ts. A table under constant read load is not idle even
+    /// when nothing is written, which a write-only clock would report as idle.
     last_ts: u64,
     /// When the loop last tried and failed, in **monotonic milliseconds**. The
     /// per-table retry gate compares it against the same clock, so a failed dump
@@ -179,9 +190,17 @@ impl Engine {
         }
         if stats.is_empty() {
             if trace {
-                eprintln!("[reclaim] no table has unsealed rows or index tails");
+                eprintln!("[reclaim] no table holds unsealed rows, index tails or mappings");
             }
             return 0;
+        }
+        if trace {
+            for stat in &stats {
+                eprintln!(
+                    "[reclaim]   stat {} id={:?} footprint={} last_ts={} failures={}",
+                    stat.key, stat.table_id, stat.footprint, stat.last_ts, stat.dump_failures
+                );
+            }
         }
         let candidates: Vec<ReclaimCandidate> = stats
             .iter()
@@ -200,13 +219,14 @@ impl Engine {
                     // the only lever that frees a large amount of memory had no
                     // candidates and the tick reported "nothing left to
                     // release" while RSS sat above the critical watermark.
-                    self.table_has_unsealed(&stat.key)
+                    self.table_has_unsealed(&stat.key) || stat.footprint > 0
                 } else {
                     self.reclaim_candidate_eligible(stat)
                 }
             })
             .map(|stat| ReclaimCandidate {
                 key: stat.key.clone(),
+                table_id: stat.table_id,
                 bytes: stat.footprint,
                 // Pure commit-ts age: how long since the table last changed.
                 // A failing table recedes through its own backoff (which keeps
@@ -265,6 +285,38 @@ impl Engine {
             let usage_before = self.memory_usage();
             let started = std::time::Instant::now();
             let ok = self.dump_table(&key).await;
+            // The dump frees what was *unsealed*; the pages a read left
+            // resident are given back here. Both are part of the table's
+            // footprint, and the round ranks tables by the sum - so a round that
+            // only dumped would leave a read-only table's size arm unaddressed
+            // for ever.
+            //
+            // Released mappings count as progress: a table whose rows are all on
+            // disk has nothing for `dump_table` to write, so it reports `false`
+            // even though this round did free its pages. Without this the round
+            // would call itself a failure and back off from a table it had just
+            // helped.
+            // Table id `0` is a real table (the first one a fresh catalog
+            // creates), so this must not use it as a sentinel. `TableStat`
+            // carries `Option` instead.
+            //
+            // The symbols go **first**: a cached `Arc<MappedBlock>` holds the
+            // block's `MappedFile` handles, and a mapping with a handle is never
+            // idle - so unmapping before dropping them would free nothing
+            // (`docs/MAP_MANAGER_PLAN.md` §3.4, the same trap stage 3 hit). The
+            // next read resolves the block again.
+            let unmapped = match candidates[at].table_id {
+                Some(table_id) => {
+                    self.context
+                        .block_maps
+                        .lock()
+                        .unwrap()
+                        .retain_table(table_id);
+                    storage::mapped::unmap_idle_of(table_id)
+                }
+                None => 0,
+            };
+            let ok = ok || unmapped > 0;
             if trace {
                 let after = self.memory_usage();
                 eprintln!(
@@ -342,8 +394,15 @@ impl Engine {
     }
 
     /// Whether the round's goal is reached.
-    fn reclaim_target_met(&self, target: u64) -> bool {
-        self.budget_bytes() as u64 <= target
+    /// Whether the round has done enough.
+    ///
+    /// The figure is the ledger **plus the bytes the engine has mapped**: a
+    /// table whose rows are all on disk still charges the process for the pages
+    /// a scan left resident, and leaving that out would call a round finished
+    /// while a large mapping footprint remained
+    /// (`docs/MAP_MANAGER_PLAN.md` §4 stage 4).
+    pub(crate) fn reclaim_target_met(&self, target: u64) -> bool {
+        (self.budget_bytes() as u64 + storage::mapped::mapped_bytes() as u64) <= target
     }
 
     /// Whether a table should enter this round's candidate set.
@@ -355,7 +414,12 @@ impl Engine {
         // is the index seal, and `dump_index_transaction` checks that itself -
         // twice, the second time under `flush_lock`. Excluding the table here
         // only kept its memory resident for the whole import.
-        if !self.table_has_unsealed(&stat.key) {
+        //
+        // A table with **nothing unsealed but mappings** is also a candidate:
+        // its rows are all on disk, but the pages a scan left resident are a
+        // real part of its footprint and dropping the mappings is how the
+        // ladder gets them back (`docs/MAP_MANAGER_PLAN.md` §4 stage 4).
+        if !self.table_has_unsealed(&stat.key) && stat.footprint == 0 {
             return false;
         }
         if stat.dump_failures == 0 {
@@ -383,11 +447,34 @@ impl Engine {
     /// each index's own lock - see
     /// [`crate::engine::state::TableEntry::unsealed_marks`].
     fn unsealed_table_stats(&self) -> Vec<TableStat> {
+        // `db.table` -> numeric id, so a table's mappings can be charged to it.
+        // One catalog read for the whole round rather than a lookup per table:
+        // the round runs on a tick and the catalog call is a scan.
+        let ids: std::collections::HashMap<String, u64> = self
+            .storage
+            .catalog
+            .list_tables()
+            .unwrap_or_default()
+            .into_iter()
+            // `TableMeta::name` is already qualified (`default_db.t`), which is
+            // the same spelling `TableEntry` keys use.
+            .map(|meta| (meta.name.to_ascii_lowercase(), meta.id))
+            .collect();
+        let mapped = storage::mapped::mapped_bytes_by_table();
         let tables = self.tables.lock().unwrap();
         tables
             .iter()
             .filter_map(|(key, entry)| {
-                if entry.unsealed_bytes() == 0 && entry.unsealed_marks_are_empty() {
+                let unsealed = entry.unsealed_bytes() + entry.memindex_bytes;
+                let table_id = ids.get(key).copied();
+                let mapped_bytes = table_id
+                    .and_then(|id| mapped.get(&id).copied())
+                    .unwrap_or(0);
+                // A table is a candidate when it holds anything the round could
+                // release: unsealed rows, an index tail, **or** mappings. The
+                // last one is what a read-only table has - nothing to dump, but
+                // pages to give back (`docs/MAP_MANAGER_PLAN.md` §4 stage 4).
+                if unsealed == 0 && entry.unsealed_marks_are_empty() && mapped_bytes == 0 {
                     return None;
                 }
                 let marks: usize = entry
@@ -395,24 +482,28 @@ impl Engine {
                     .values()
                     .map(|mark| mark.load(Ordering::Relaxed) as usize)
                     .sum();
-                let footprint = entry.unsealed_bytes()
-                    + if marks > 0 {
-                        // The cached figure is what ordering uses; fall back to
-                        // the mark count when the cache has not caught up (a
-                        // `CREATE INDEX` never refreshes it).
-                        entry.memindex_bytes.max(marks)
-                    } else {
-                        entry.memindex_bytes
-                    };
-                // The newest append's commit ts is the table's last write.
-                let last_ts = entry
+                let memindex = if marks > 0 {
+                    // The cached figure is what ordering uses; fall back to the
+                    // mark count when the cache has not caught up (a
+                    // `CREATE INDEX` never refreshes it).
+                    entry.memindex_bytes.max(marks)
+                } else {
+                    entry.memindex_bytes
+                };
+                let footprint = (entry.unsealed_bytes() + memindex) as u64 + mapped_bytes;
+                // The newer of the last append and the last block read. A table
+                // read every second is not idle, and a write-only clock would
+                // put it at the head of every round.
+                let last_write = entry
                     .append_ts
                     .as_ref()
                     .and_then(|ts| ts.last().copied())
                     .unwrap_or(0);
+                let last_ts = last_write.max(entry.last_access_ts);
                 Some(TableStat {
                     key: key.clone(),
-                    footprint: footprint as u64,
+                    table_id,
+                    footprint,
                     last_ts,
                     last_attempt_ts: entry.last_attempt_ts,
                     dump_failures: entry.dump_failures,

@@ -19716,6 +19716,75 @@ mod tests {
         }
     }
 
+    /// A table with **nothing unsealed** but a live mapping is still a reclaim
+    /// candidate: its rows are all on disk, yet the pages a scan left resident
+    /// are part of its footprint, and dropping the mappings is how a round gets
+    /// them back (`docs/MAP_MANAGER_PLAN.md` §4 stage 4).
+    ///
+    /// Before this the candidate set was "has unsealed rows or index tails", so
+    /// a read-only table was never looked at and its pages stayed resident for
+    /// the life of the process.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the guard serialises the *whole* test
+    async fn a_table_that_only_holds_mappings_is_still_a_candidate() {
+        let _serialised = storage::mapped::test_guard();
+        storage::mapped::unmap_idle_mappings();
+        let dir = tempdir().unwrap();
+        let e = Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+        e.execute("CREATE TABLE om (id INTEGER)").await.unwrap();
+        let csv = dir.path().join("om.csv");
+        let text: String = (0..100).map(|i| format!("{i}\n")).collect();
+        std::fs::write(&csv, text).unwrap();
+        e.execute(&format!(
+            "COPY om FROM '{}' WITH (DELIMITER ',', FORMAT CSV);",
+            csv.display()
+        ))
+        .await
+        .unwrap();
+        e.flush().await.unwrap();
+        // Read the block, so the table has a mapping and nothing else.
+        assert_eq!(
+            rows(&e, "SELECT id FROM om WHERE id = 7;").await,
+            vec![vec!["7".to_string()]]
+        );
+        let key = e.table_key("default_db.om");
+        let unsealed = e
+            .tables
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|entry| entry.unsealed_bytes())
+            .unwrap_or(0);
+        assert_eq!(unsealed, 0, "the table holds nothing unsealed");
+        let table_id = e
+            .storage
+            .catalog
+            .get_table_by_name("default_db.om")
+            .unwrap()
+            .unwrap()
+            .id;
+        let mapped_before = storage::mapped::mapped_bytes_of(table_id);
+        assert!(mapped_before > 0, "the read left a mapping");
+
+        // The stats pass must see it as a candidate rather than dropping it for
+        // having no unsealed data.
+        e.set_unsealed_memory_quota(1);
+        let dumped = e.reclaim_unsealed().await;
+        assert_eq!(dumped, 1, "the mapped-only table was selected");
+        assert!(
+            storage::mapped::mapped_bytes_of(table_id) < mapped_before,
+            "the round released its mappings ({mapped_before} -> {})",
+            storage::mapped::mapped_bytes_of(table_id)
+        );
+        // And the rows are still there: the files were never touched.
+        assert_eq!(
+            rows(&e, "SELECT id FROM om WHERE id = 7;").await,
+            vec![vec!["7".to_string()]]
+        );
+    }
+
     /// A table over the target is drained, and its rows survive the move from
     /// the buffer into the block files.
     #[tokio::test]
@@ -20569,7 +20638,11 @@ mod tests {
     /// A table that has been reclaimed and not written since is not flushed
     /// again: with nothing unsealed it is not even a candidate.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the guard serialises the *whole* test
     async fn a_reclaimed_table_with_no_new_rows_is_not_flushed_twice() {
+        // The reclaim target now counts mapped bytes, and the mapping table is
+        // process-wide - so this needs the other mapping tests to be quiet.
+        let _serialised = storage::mapped::test_guard();
         let dir = tempdir().unwrap();
         let e = Engine::open_async(dir.path(), Default::default())
             .await
@@ -20744,7 +20817,11 @@ mod tests {
     /// The target is **half the quota**, and `quota == 0` disables the loop
     /// rather than making it drain everything.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the guard serialises the *whole* test
     async fn the_reclaim_target_is_half_the_quota() {
+        // The reclaim target now counts mapped bytes, and the mapping table is
+        // process-wide - so this needs the other mapping tests to be quiet.
+        let _serialised = storage::mapped::test_guard();
         let dir = tempdir().unwrap();
         let e = Engine::open_async(dir.path(), Default::default())
             .await
@@ -20761,9 +20838,12 @@ mod tests {
         assert_eq!(e.reclaim_target(), 0);
 
         e.set_unsealed_memory_quota(1 << 20);
+        // The target is half the quota, full stop - it is a threshold, not a
+        // prediction of whether a round will find anything. Whether the target
+        // is *met* also counts mapped bytes (`reclaim_target_met`), so it is not
+        // asserted here: a mapping left by another test in this binary would
+        // decide it.
         assert_eq!(e.reclaim_target(), 1 << 19, "half the quota");
-        // Half of 1 MiB is far above these rows, so still nothing to do.
-        assert_eq!(e.reclaim_unsealed().await, 0);
     }
 
     /// The write path only **raises a flag**; the tick performs the drain.

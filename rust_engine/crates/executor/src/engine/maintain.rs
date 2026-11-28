@@ -23,7 +23,12 @@
 pub(crate) struct ReclaimCandidate {
     /// `db.table`, the identity the winner is reported by.
     pub key: String,
-    /// Unsealed bytes right now: the size dimension.
+    /// The table's numeric id, so the round can release *its* mappings. `None`
+    /// when the catalog could not name it (a table with no layout record) - `0`
+    /// is a real id, so it cannot double as "unknown".
+    pub table_id: Option<u64>,
+    /// The table's whole footprint: unsealed bytes plus the bytes it has
+    /// mapped. The size dimension.
     pub bytes: u64,
     /// How long the table has been idle: the age dimension.
     pub age_ms: u64,
@@ -112,6 +117,7 @@ mod tests {
     fn cand(key: &str, bytes: u64, age_ms: u64) -> ReclaimCandidate {
         ReclaimCandidate {
             key: key.to_string(),
+            table_id: None,
             bytes,
             age_ms,
         }

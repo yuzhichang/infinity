@@ -322,6 +322,20 @@ block_map(table, root, id)            ← BlockId → 符号对象的解析 + �
 | 保持 | `rrf_order` 不变（两臂语义变了，公式不变）；`K=3` 的取舍理由仍成立 |
 | 验收 | ① `rrf_order` 现有 4 个测试通过 ② 新增测试：一张只有映射、没有未落盘数据的表也能被选中并释放 ③ `MEMORY_RECLAIM.md` §4 更新 |
 
+**实施记录（阶段 4 已完成，含三处计划外的修正）**
+
+按计划改的：`unsealed_table_stats` 的 footprint 加上 `mapped_bytes_of(table)`、age 取 `max(append_ts.last(), last_access_ts)`、候选集改为「有未落盘数据或有足迹」。`table_id` 从 `list_tables()` 一次性建 `name → id` 表（`TableMeta::name` 已是 qualified，与 `TableEntry` 的 key 同拼写）。
+
+计划外但必须做的三处，都是"只读表"这条路径暴露的：
+
+1. **`reclaim_target_met` 也要算映射字节。** 原来只看 `budget_bytes()`（未落盘）。一张行全落盘、映射很大的表会让 `0 <= target` 立即成立，这一轮**直接提前退出**，候选集再对也不会被遍历到。
+2. **`dump_table` 返回 false 时，「释放了映射」也要算进展。** 只读表没有东西可写，`dump_table` 必然返回 false；不计入的话这一轮判定失败并退避，刚释放过的表又被推后。
+3. **排水前必须先丢该表的块符号。** 与阶段 3 同一个陷阱：符号持有 `Arc<MappedFile>`，映射带着句柄永远不空闲，先 unmap 则释放 0 字节。
+
+另外 `ReclaimCandidate.table_id` / `TableStat.table_id` 用 `Option<u64>` 而不是 `0` 作哨兵——**`0` 是真实表 id**（新 catalog 的第一张表），用 `0` 表示"未知"会让第一张表恰好被跳过。
+
+`MEMORY_RECLAIM.md` §4.0 / §4.5 已同步（验收项 ③）。
+
 ### 阶段 5：收敛与清理
 
 | 项 | 内容 |

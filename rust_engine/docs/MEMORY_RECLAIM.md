@@ -105,8 +105,16 @@ reclaim_unsealed() -> usize:                          // 没有 now 参数：时
 
 | 量 | 来源 | 含义 |
 |---|---|---|
-| `bytes` | `entry.unsealed_bytes() + entry.memindex_bytes` | 排序用的近似足迹；**不是**"有没有数据"的判据（见下） |
-| `age` | `current_ts() - entry.append_ts.last()` | 距最后一次 commit 多少个 ts（纯 commit 时钟；失败退避另由 `last_attempt_ts` 的单调毫秒把关） |
+| `bytes` | `unsealed_bytes + memindex_bytes + mapped_bytes_of(table)` | 排序用的足迹，含**已映射字节**；**不是**"有没有数据"的判据（见下） |
+| `age` | `current_ts() - max(append_ts.last(), entry.last_access_ts)` | 距最后一次**读写**多少个 ts（纯 commit 时钟；失败退避另由 `last_attempt_ts` 的单调毫秒把关） |
+
+**这两臂在 `docs/MAP_MANAGER_PLAN.md` 阶段 4 里被补齐**，原方案只有未落盘字节与最后写入：
+
+- **size 臂加 `mapped_bytes_of(table)`**：一张只读表可以把块和索引页长期留在页缓存里，只算未落盘字节会把它看成"零足迹"，于是永远不会被选中。映射字节由 `storage::mapped` 按表统计（按引用数在共享对象间等分）。
+- **age 臂取读与写的较大者**：`last_access_ts` 由 `Engine::note_table_access` 在块读路径写入，取 `current_ts()`（**已提交**时钟，不是事务自己的 commit ts——后者提交前未发布、回滚后永不存在）。只用 `append_ts` 会把一张持续被读的表算成闲置。
+- **候选集不再要求"有未落盘数据"**：`unsealed > 0 || footprint > 0` 即可，于是只有映射的表也能进候选。
+- **`reclaim_target_met` 也计入映射字节**：否则一张行全落盘、但映射很大的表会让这一轮立刻判定"目标已达成"而提前退出。
+- **排水前先丢该表的块符号**（`BlockMapCache::retain_table`），再 `unmap_idle_of(table)`：符号持有 `Arc<MappedFile>`，映射带着句柄就永远不算空闲，顺序反了就一个字节也释放不掉（`MAP_MANAGER_PLAN.md` §3.4 记的就是这个陷阱）。释放到映射也算本轮有进展，否则只读表会被当成失败而退避。
 
 - `unsealed_bytes()` 是运行总量：行数据（`pending_bytes`）加每列的 `Vec<Value>` 头开销（`state.rs:4857-4866`）；空表返回 0，因此从没写过的表不占候选名额。`memindex_bytes` 是每张表的索引 tail 计费，由 `refresh_memindex_charge`（`index_build.rs:2459`）维护、`recompute_memindex_total`（`index_build.rs:2485`）全量重算。
 - **不把索引字节并进 `unsealed_bytes()`。** `budget_bytes()`（`index_build.rs:2448`）是 `全局 memindex_total + Σ unsealed_bytes`，并进去会重复计数。新增独立读法：
@@ -387,7 +395,7 @@ HNSW / 二级 / SPANN / 全文这四类不会无限增长：攒够上限就自�
 
 **IVF、BMP、PLAID 三类没有行数上限**，只能靠配额压力或周期路径排空。它们必须依赖周期路径；`unsealed_max_tables_per_round = 100` 的默认值保证一轮能覆盖相当多的表。§9 里列为未决的是"是否要给它们补行数触发"，判据见 §9。
 
-### 4.5 年龄的来源：`append_ts` 与 `last_attempt_ts`
+### 4.5 年龄的来源：`append_ts`、`last_access_ts` 与 `last_attempt_ts`
 
 排序用的年龄**不新造字段**，而是复用已有的 append 日志：
 
@@ -404,7 +412,9 @@ pub(crate) struct TableEntry {
 }
 ```
 
-`age = current_ts() - max(append_ts.last(), last_attempt_ts)`。
+`age = current_ts() - max(append_ts.last(), entry.last_access_ts)`。
+
+`last_access_ts` 是**块读**的时钟（`Engine::note_table_access` → `TableEntry::last_access_ts`），因此一张只被读的表不会显得闲置。失败退避的 `last_attempt_ts` 是另一套（单调毫秒），只在 `reclaim_candidate_eligible` 里把关，不进 `age`。
 
 **为什么用 commit ts 而不是墙上时钟。** 三个好处，缺一不可：
 
