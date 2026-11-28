@@ -13,7 +13,14 @@
 // limitations under the License.
 
 //! Mapping lifecycle: a block maps only its own files, and dropping the last
-//! handle takes its mappings off the process-wide counter.
+//! handle leaves the mapping **idle** - kept for reuse, bounded, and given back
+//! by an explicit reclaim (`unmap_idle_mappings`).
+//!
+//! That the mapping outlives its last handle is the point of the identity table
+//! (`buffer/mapped.rs`, `IDLE_MAPPING_LIMIT`): unmapping at once costs a
+//! page-table rebuild on the next open and a TLB shootdown per `munmap`, and a
+//! seek-heavy scan opens the same blocks over and over. The counter therefore
+//! tracks objects, and only a reclaim pass or the idle bound removes one.
 //!
 //! This is an integration test rather than a module unit test on purpose. It
 //! asserts on `storage::mapped::mapping_count()` / `mapped_bytes()`, which are
@@ -96,10 +103,22 @@ fn every_block_maps_only_its_own_files() {
             "the counter covers the mapped files, not the address space"
         );
     }
+    // Dropping the handles leaves the objects mapped: they are idle, not gone.
+    assert_eq!(
+        storage::mapped::mapping_count(),
+        before + 4,
+        "an idle mapping is kept for the next open"
+    );
+    assert_eq!(
+        storage::mapped::mapped_bytes(),
+        before_bytes + file_lens.iter().sum::<u64>() as usize,
+    );
+    // The explicit reclaim is what gives the address space back.
+    storage::mapped::unmap_idle_mappings();
     assert_eq!(
         storage::mapped::mapping_count(),
         before,
-        "dropping the last handle unmaps the block"
+        "unmap_idle_mappings releases the idle blocks"
     );
     assert_eq!(storage::mapped::mapped_bytes(), before_bytes);
 }

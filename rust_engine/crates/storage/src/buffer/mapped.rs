@@ -30,69 +30,257 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memmap2::Mmap;
 
-/// Live mappings in this process.
+/// Objects this process has mapped.
+///
+/// One per **file identity**, not per [`MappedFile`] handle: every reader of one
+/// file shares a single `Mmap`, so this is also the process's VMA count for
+/// engine data.
 static MAPPINGS: AtomicUsize = AtomicUsize::new(0);
-/// Bytes covered by the live mappings.
+/// Bytes covered by those mappings.
 static MAPPED_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Bytes whose resident pages have been dropped by [`MappedFile::release_pages`].
 static PAGES_RELEASED: AtomicUsize = AtomicUsize::new(0);
 
-/// Every live mapping, weakly, in a slot table.
+/// What identifies one mapped object: the file's identity, not its path.
 ///
-/// This is what lets a reclaim pass find the pages **without asking the
-/// filesystem**: the alternative - walk the data directory and `open` every file
-/// to `fadvise` it - costs one syscall per file on the tree, on a path that runs
-/// when the process is already at its memory limit.
+/// `(dev, ino)` is what the kernel itself uses, so two paths for one inode (a
+/// hard link, or an object that holds several parts) share a mapping - which is
+/// correct, since they are the same bytes in the same page cache. A file the
+/// engine **replaces** gets a new inode: every publisher writes a sibling temp
+/// file and renames it over the target (`definition::format::write_parts`), so a
+/// stale mapping can never be handed out under the new name.
 ///
-/// A slot, not a bare `Vec` that only prunes during a pass: a long-running
-/// server maps and unmaps blocks continuously (the block cache evicts, a scan
-/// remaps), and a dead weak entry per mapping would grow the table forever
-/// whenever the process stays under its watermark and no pass runs. Each
-/// [`MappedFile`] therefore owns one slot and frees it in its `Drop`, and the
-/// free list reuses the hole, so the table's length is the peak number of
-/// concurrent mappings rather than the number ever created.
-struct Registry {
-    slots: Vec<Option<std::sync::Weak<Mmap>>>,
-    free: Vec<usize>,
+/// The second field is a **disambiguator**, not a size: `(0, n)` for a file
+/// mapped through `open_path`, and `(1, n)` for an `Mmap` a caller built itself
+/// (`from_mmap`), where no inode is known. Keeping the two apart means a
+/// caller-made mapping can never be confused with a file whose device happens to
+/// be `0`.
+type ObjectKey = (u8, u64, u64);
+
+/// One mapped object and the readers holding it.
+struct Entry {
+    map: std::sync::Arc<Mmap>,
+    /// Handles currently holding this object through [`MappedFile`].
+    handles: usize,
+    /// `map.len()`, charged once per object.
+    bytes: usize,
 }
 
-static REGISTRY: std::sync::Mutex<Registry> = std::sync::Mutex::new(Registry {
-    slots: Vec::new(),
-    free: Vec::new(),
+/// Idle mappings kept after their last handle lets go, derived once from
+/// `vm.max_map_count`.
+///
+/// Not "none, released at once" and not "all, until memory pressure": both ends
+/// were measured and both are wrong.
+///
+/// **Releasing at once** costs a page-table rebuild on the next open and a TLB
+/// shootdown across cores at `munmap`. The syscall pair itself is cheap
+/// (measured: 5 us for an 8 MiB file, 7.5 us for 64 MiB), but it is per open, and
+/// a seek-heavy scan opens the same blocks repeatedly.
+///
+/// **Keeping everything** is not free either: a mapping is a VMA, and
+/// `vm.max_map_count` bounds them. A 20-column table of 1000 blocks is 20k-40k
+/// VMAs; a few of those reach the limit, and then `mmap` fails with `ENOMEM` - a
+/// query error, not a slowdown. Measured: 200 idle mappings of one file are 200
+/// VMAs.
+///
+/// So the table is bounded and unmap of the least recently released idle entry
+/// is what keeps it there. The bound is a sixteenth of the kernel's own limit:
+/// the rest is headroom for a working set, the shared libraries and every other
+/// mapping in the process. Clamped so a host with an unusually small limit still
+/// keeps a useful cache, and one with a huge limit does not grow the table
+/// without need.
+///
+/// A limit below 262144 is worth a warning: Elasticsearch asks for 1048576, and
+/// a container that inherits a small one will hit `ENOMEM` under a wide scan.
+const IDLE_MAPPING_FALLBACK: usize = 16_384;
+/// Lower clamp: below this the cache stops absorbing a seek-heavy scan.
+const IDLE_MAPPING_MIN: usize = 1_024;
+/// Upper clamp: no reason to hold more mappings than this, whatever the kernel
+/// allows.
+const IDLE_MAPPING_MAX: usize = 65_536;
+
+/// `vm.max_map_count`, or `None` where the platform has no such file.
+fn max_map_count() -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/sys/vm/max_map_count").ok()?;
+    let value: usize = text.trim().parse().ok()?;
+    (value > 0).then_some(value)
+}
+
+/// The idle bound, resolved once.
+static IDLE_MAPPING_LIMIT: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| match max_map_count() {
+        Some(kernel) => (kernel / 16).clamp(IDLE_MAPPING_MIN, IDLE_MAPPING_MAX),
+        None => IDLE_MAPPING_FALLBACK,
+    });
+
+/// The process's mapping table, keyed by [`ObjectKey`].
+///
+/// A second reader of one file reuses the mapping instead of creating a second
+/// VMA. That is not a page-cache optimisation - two mappings of one file already
+/// share the physical pages (measured: `RssFile` doubles, `Pss` does not move) -
+/// it removes the VMA and `mmap`/`munmap` churn per open, and it keeps the
+/// resident figure honest: RSS counts a shared page once **per mapping**, so one
+/// block mapped by two readers used to read as twice its size.
+///
+/// An entry survives its last handle so the next open skips the remap, but not
+/// without bound: see [`IDLE_MAPPING_LIMIT`]. Pages are *not* what is kept - a
+/// kept mapping's pages can still be dropped by [`release_mapped_pages`], which
+/// is the cheap lever the reclaim ladder reaches for first.
+struct Registry {
+    entries: std::collections::HashMap<ObjectKey, Entry>,
+    /// Idle keys, least recently released first. A key is pushed when its last
+    /// handle goes and removed when it is acquired again, so this tracks only
+    /// the entries an eviction may take.
+    idle: std::collections::VecDeque<ObjectKey>,
+}
+
+static REGISTRY: std::sync::LazyLock<std::sync::Mutex<Registry>> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(Registry {
+        entries: std::collections::HashMap::new(),
+        idle: std::collections::VecDeque::new(),
+    })
 });
 
-/// Registers `map` and returns its slot. `usize::MAX` when the registry lock is
-/// poisoned: a mapping that cannot be reclaimed is still a valid mapping.
-fn register(map: &std::sync::Arc<Mmap>) -> usize {
+/// Takes the mapping for `key`, reusing the live one when there is one.
+///
+/// Returns the mapping and whether this call created it, so the caller charges
+/// the counters only once per object. `create` runs only on a miss.
+fn acquire(
+    key: ObjectKey,
+    create: impl FnOnce() -> std::io::Result<std::sync::Arc<Mmap>>,
+) -> std::io::Result<(std::sync::Arc<Mmap>, bool)> {
     let Ok(mut registry) = REGISTRY.lock() else {
-        return usize::MAX;
+        // A poisoned table cannot hand out shared mappings. A private one is
+        // still correct, it just costs the VMA this table exists to avoid.
+        return create().map(|map| (map, true));
     };
-    let weak = std::sync::Arc::downgrade(map);
-    match registry.free.pop() {
-        Some(slot) => {
-            registry.slots[slot] = Some(weak);
-            slot
+    if let Some(entry) = registry.entries.get_mut(&key) {
+        entry.handles += 1;
+        let map = std::sync::Arc::clone(&entry.map);
+        // It is no longer a candidate for the bound.
+        if entry.handles == 1 {
+            registry.idle.retain(|idle| *idle != key);
         }
-        None => {
-            registry.slots.push(Some(weak));
-            registry.slots.len() - 1
+        return Ok((map, false));
+    }
+    // The lock is held across `mmap` on purpose: two readers of one file racing
+    // here would otherwise both map it and one mapping would be dropped
+    // immediately - exactly the churn this function removes. `mmap` is a cheap
+    // syscall, not I/O.
+    let map = create()?;
+    let bytes = map.len();
+    registry.entries.insert(
+        key,
+        Entry {
+            map: std::sync::Arc::clone(&map),
+            handles: 1,
+            bytes,
+        },
+    );
+    Ok((map, true))
+}
+
+/// Gives back one reader's reference to `key`.
+///
+/// The entry - and with it the mapping - stays idle, so the next open skips the
+/// remap; [`IDLE_MAPPING_LIMIT`] bounds how many such entries exist.
+/// [`release_mapped_pages`] can still drop its pages in the meantime, which is
+/// the cheap lever the reclaim ladder reaches for first - this function keeps
+/// address space, not memory.
+fn release(key: ObjectKey) {
+    let Ok(mut registry) = REGISTRY.lock() else {
+        return;
+    };
+    let Some(entry) = registry.entries.get_mut(&key) else {
+        return;
+    };
+    entry.handles = entry.handles.saturating_sub(1);
+    if entry.handles > 0 {
+        return;
+    }
+    registry.idle.push_back(key);
+    // Over the bound: unmaps the oldest idle entries, `key` included when it is
+    // the only one. Doing it here rather than on the next acquisition means a
+    // process that stops reading also stops holding address space.
+    let mut evicted = 0usize;
+    while registry.idle.len() > *IDLE_MAPPING_LIMIT {
+        let Some(oldest) = registry.idle.pop_front() else {
+            break;
+        };
+        let idle = registry
+            .entries
+            .get(&oldest)
+            .is_some_and(|entry| entry.handles == 0);
+        if !idle {
+            // Re-acquired while it sat on the queue; `acquire` normally removes
+            // the stamp, so this is only a race it lost.
+            continue;
+        }
+        if let Some(entry) = registry.entries.remove(&oldest) {
+            evicted += 1;
+            MAPPED_BYTES.fetch_sub(entry.bytes, Ordering::Relaxed);
+        }
+    }
+    if evicted > 0 {
+        MAPPINGS.fetch_sub(evicted, Ordering::Relaxed);
+    }
+}
+
+/// Drops every mapping no reader holds, returning the bytes unmapped.
+///
+/// This is the only place a mapping is unmapped before process exit, so it is
+/// what a "give the address space back" pass calls. A handle in flight keeps its
+/// own `Arc`, so an entry removed here while a reader still held one would leave
+/// that reader valid - the `handles` check exists to avoid that, not to paper
+/// over it.
+fn unmap_idle() -> usize {
+    let Ok(mut registry) = REGISTRY.lock() else {
+        return 0;
+    };
+    let idle: Vec<ObjectKey> = registry
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.handles == 0)
+        .map(|(key, _)| *key)
+        .collect();
+    let mut bytes = 0usize;
+    for key in idle {
+        if let Some(entry) = registry.entries.remove(&key) {
+            bytes += entry.bytes;
+            MAPPINGS.fetch_sub(1, Ordering::Relaxed);
+            MAPPED_BYTES.fetch_sub(entry.bytes, Ordering::Relaxed);
+        }
+    }
+    // Everything idle is gone, so the queue is too. (A key that was re-acquired
+    // during this pass keeps its entry and is back on the queue on release.)
+    registry.idle.clear();
+    bytes
+}
+
+/// `(dev, ino)` of an open file.
+#[cfg(unix)]
+fn object_key(file: &std::fs::File, path: &Path) -> ObjectKey {
+    use std::os::unix::fs::MetadataExt;
+    match file.metadata() {
+        Ok(meta) => (0, meta.dev(), meta.ino()),
+        // A metadata read cannot fail for an open descriptor on a supported
+        // filesystem. Falling back to a unique key keeps the read correct (a
+        // duplicate VMA at worst) instead of failing it.
+        Err(_) => {
+            static FALLBACK: AtomicUsize = AtomicUsize::new(1);
+            let _ = path;
+            (0, u64::MAX, FALLBACK.fetch_add(1, Ordering::Relaxed) as u64)
         }
     }
 }
 
-fn unregister(slot: usize) {
-    if slot == usize::MAX {
-        return;
-    }
-    let Ok(mut registry) = REGISTRY.lock() else {
-        return;
-    };
-    if let Some(entry) = registry.slots.get_mut(slot) {
-        if entry.is_some() {
-            *entry = None;
-            registry.free.push(slot);
-        }
-    }
+#[cfg(not(unix))]
+fn object_key(file: &std::fs::File, path: &Path) -> ObjectKey {
+    let _ = file;
+    // No stable identity to share by: every mapping is its own object.
+    static FALLBACK: AtomicUsize = AtomicUsize::new(1);
+    let _ = path;
+    (0, u64::MAX, FALLBACK.fetch_add(1, Ordering::Relaxed) as u64)
 }
 
 /// Where the next [`release_mapped_pages`] pass starts.
@@ -128,8 +316,9 @@ pub struct MappedFile {
     /// part_size` ([`Self::open_range`]). Every decoder slices whatever this
     /// buffer holds, so a range behaves exactly like a file of that length.
     range: std::ops::Range<usize>,
-    /// This mapping's [`Registry`] slot; `usize::MAX` for the empty mapping.
-    slot: usize,
+    /// The object this handle holds a reference to; `None` for the empty
+    /// mapping, which holds nothing and charges nothing.
+    key: Option<ObjectKey>,
 }
 
 impl MappedFile {
@@ -138,7 +327,7 @@ impl MappedFile {
         Self {
             map: None,
             range: 0..0,
-            slot: usize::MAX,
+            key: None,
         }
     }
 
@@ -155,6 +344,11 @@ impl MappedFile {
 
     /// Maps a real file, read-only.
     ///
+    /// A file the process already has mapped is **reused**: the caller gets a
+    /// second handle to the same `Mmap`, not a second VMA. Two mappings of one
+    /// file would share the physical pages anyway, but RSS charges each of them,
+    /// so without this one block read by two readers reads as twice its size.
+    ///
     /// The mapping stays valid even when the file is rewritten while it is
     /// alive: every publisher writes a sibling temp file and renames it over the
     /// target (`definition::format::write_synced`), which swaps the directory
@@ -162,16 +356,28 @@ impl MappedFile {
     /// in place instead would make the mapping fault with SIGBUS.
     #[allow(unsafe_code)]
     pub fn open_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
         let file = std::fs::File::open(path)?;
         // A zero-length file cannot be mapped; it is an empty mapping instead.
+        // Asked before the key so an empty file never takes a table entry.
         if file.metadata()?.len() == 0 {
             return Ok(Self::empty());
         }
+        let key = object_key(&file, path);
         // SAFETY: the mapping is read-only and the file is immutable while it
         // is mapped (see the function docs). `Mmap` keeps the mapping valid
         // after the descriptor is closed, so the file is dropped at once.
-        let map = unsafe { Mmap::map(&file)? };
-        Ok(Self::from_mmap(map))
+        let (map, created) = acquire(key, || unsafe { Mmap::map(&file) }.map(std::sync::Arc::new))?;
+        if created {
+            MAPPINGS.fetch_add(1, Ordering::Relaxed);
+            MAPPED_BYTES.fetch_add(map.len(), Ordering::Relaxed);
+        }
+        let len = map.len();
+        Ok(Self {
+            map: Some(map),
+            range: 0..len,
+            key: Some(key),
+        })
     }
 
     /// Maps `path` read-only and exposes `offset..offset + len` of it.
@@ -187,6 +393,7 @@ impl MappedFile {
         if len == 0 {
             return Ok(Self::empty());
         }
+        let path = path.as_ref();
         let file = std::fs::File::open(path)?;
         let file_len = file.metadata()?.len() as usize;
         let end = offset
@@ -201,34 +408,62 @@ impl MappedFile {
                     ),
                 )
             })?;
+        let key = object_key(&file, path);
         // SAFETY: the mapping is read-only and the object file is immutable
         // while it is mapped (a persisted object is replaced, never truncated
         // in place).
-        let map = unsafe { Mmap::map(&file)? };
-        let map = std::sync::Arc::new(map);
-        MAPPINGS.fetch_add(1, Ordering::Relaxed);
-        MAPPED_BYTES.fetch_add(len, Ordering::Relaxed);
-        let slot = register(&map);
+        let (map, created) = acquire(key, || unsafe { Mmap::map(&file) }.map(std::sync::Arc::new))?;
+        if created {
+            MAPPINGS.fetch_add(1, Ordering::Relaxed);
+            // The whole object is what can become resident, so it is charged
+            // whole: the charge is what `release_mapped_pages` reclaims, and
+            // that is a property of the mapping, not of the window one reader
+            // looks at.
+            MAPPED_BYTES.fetch_add(map.len(), Ordering::Relaxed);
+        }
         Ok(Self {
             map: Some(map),
             range: offset..end,
-            slot,
+            key: Some(key),
         })
     }
 
-    /// Takes an already-created mapping (the index readers map their file and
-    /// hand the result here, so every mapping in the process is counted the
-    /// same way).
+    /// Takes an already-created mapping (a reader that mapped its own file hands
+    /// the result here, so every mapping in the process is counted the same
+    /// way).
+    ///
+    /// The caller's `Mmap` was built from a descriptor this function never sees,
+    /// so there is no inode to share by: each call is its own object. Prefer
+    /// [`Self::open_path`], which dedups.
     pub fn from_mmap(map: Mmap) -> Self {
         let len = map.len();
         MAPPINGS.fetch_add(1, Ordering::Relaxed);
         MAPPED_BYTES.fetch_add(len, Ordering::Relaxed);
         let map = std::sync::Arc::new(map);
-        let slot = register(&map);
+        // A key no `open_path` can produce: the disambiguator is 1.
+        static UNIQUE: AtomicUsize = AtomicUsize::new(1);
+        let key = (1u8, u64::MAX, UNIQUE.fetch_add(1, Ordering::Relaxed) as u64);
+        let Ok(mut registry) = REGISTRY.lock() else {
+            return Self {
+                map: Some(map),
+                range: 0..len,
+                key: None,
+            };
+        };
+        registry.entries.insert(
+            key,
+            Entry {
+                map: std::sync::Arc::clone(&map),
+                handles: 1,
+                bytes: len,
+            },
+        );
+        // No idle stamp: this handle is the object's first reference, and the
+        // queue is filled on release.
         Self {
             map: Some(map),
             range: 0..len,
-            slot,
+            key: Some(key),
         }
     }
 
@@ -330,12 +565,10 @@ impl Deref for MappedFile {
 
 impl Drop for MappedFile {
     fn drop(&mut self) {
-        if self.map.is_some() {
-            MAPPINGS.fetch_sub(1, Ordering::Relaxed);
-            MAPPED_BYTES.fetch_sub(self.range.len(), Ordering::Relaxed);
-            // Free the slot before the `Arc` goes: a reclaim pass holding the
-            // registry lock cannot miss this mapping halfway through its drop.
-            unregister(self.slot);
+        // Only the handle goes: the object stays mapped (and counted) so the
+        // next reader reuses it. See [`release`].
+        if let Some(key) = self.key.take() {
+            release(key);
         }
     }
 }
@@ -363,41 +596,72 @@ pub fn pages_released_bytes() -> usize {
     PAGES_RELEASED.load(Ordering::Relaxed)
 }
 
+/// How many mappings are idle (no reader holds them) and kept for reuse.
+///
+/// Bounded by [`idle_mapping_limit`]; a reclaim pass can give them back through
+/// [`unmap_idle_mappings`].
+pub fn idle_mapping_count() -> usize {
+    let Ok(registry) = REGISTRY.lock() else {
+        return 0;
+    };
+    registry
+        .entries
+        .values()
+        .filter(|entry| entry.handles == 0)
+        .count()
+}
+
+/// The idle bound in force, derived from `vm.max_map_count` where the platform
+/// publishes one.
+pub fn idle_mapping_limit() -> usize {
+    *IDLE_MAPPING_LIMIT
+}
+
+/// `vm.max_map_count` as the kernel reports it, or `None` off Linux.
+///
+/// Exposed for diagnostics: a value below 262144 is worth a warning at startup
+/// (Elasticsearch asks for 1048576), because a wide scan over many blocks will
+/// otherwise hit `ENOMEM` and fail a query rather than slow it down.
+pub fn kernel_max_map_count() -> Option<usize> {
+    max_map_count()
+}
+
 /// Drops the resident pages of live mappings until `want` bytes have been
 /// released (all of them for [`usize::MAX`]), returning what was released.
 ///
-/// The pass walks [`REGISTRY`] - an in-memory vector - instead of the data
-/// directory, so it costs one `madvise` per mapping and no `open`/`stat` per
-/// file. Every index reader in the process goes through [`MappedFile`], so one
-/// call covers the block files, the SPANN chunks, the text segments and the
+/// The pass walks [`REGISTRY`] - an in-memory table - instead of the data
+/// directory, so it costs one `madvise` per object and no `open`/`stat` per
+/// file. Every reader in the process goes through [`MappedFile`], so one call
+/// covers the block files, the index chunks, the text segments and the
 /// secondary structures alike.
+///
+/// One `madvise` per **object**, not per handle: readers of one file now share
+/// a mapping, so a file read ten times is advised once. (Before the table was
+/// keyed by identity the same file could appear several times, and each copy
+/// was advised separately for the same pages.)
 ///
 /// Correct while readers hold a mapping: `MADV_DONTNEED` on a read-only mapping
 /// of an immutable file only drops clean pages, and the next access faults them
 /// back in.
 #[allow(unsafe_code)]
 pub fn release_mapped_pages(want: usize) -> usize {
-    let Ok(mut registry) = REGISTRY.lock() else {
+    let Ok(registry) = REGISTRY.lock() else {
         return 0;
     };
-    // Prune the owners that are gone. `MappedFile::drop` frees its slot itself,
-    // so a dead entry only survives a poisoned lock on that path; collecting it
-    // here keeps the table from keeping the hole forever. A pass is bounded by
-    // the target, not by the number of mappings: the caller is over its limit
-    // and does not need the whole address space re-read afterwards.
-    for slot in 0..registry.slots.len() {
-        let dead = registry.slots[slot]
-            .as_ref()
-            .is_some_and(|weak| weak.strong_count() == 0);
-        if dead {
-            registry.slots[slot] = None;
-            registry.free.push(slot);
-        }
-    }
-    let len = registry.slots.len();
-    if len == 0 {
+    if registry.entries.is_empty() {
         return 0;
     }
+    // Collect first, advise outside the lock: `madvise` on a large mapping is a
+    // syscall, and holding the table's lock across it would stall every reader
+    // that is opening a file. The `Arc`s keep each mapping alive while the lock
+    // is not held.
+    let maps: Vec<std::sync::Arc<Mmap>> = registry
+        .entries
+        .values()
+        .map(|entry| std::sync::Arc::clone(&entry.map))
+        .collect();
+    drop(registry);
+    let len = maps.len();
     // Start where the last pass stopped (see [`RELEASE_CURSOR`]) and wrap, so a
     // tree larger than one pass's target is covered over successive passes
     // instead of the same head being advised every second.
@@ -407,12 +671,7 @@ pub fn release_mapped_pages(want: usize) -> usize {
         if released >= want {
             break;
         }
-        let Some(map) = registry.slots[(start + step) % len]
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        else {
-            continue;
-        };
+        let map = &maps[(start + step) % len];
         #[cfg(unix)]
         {
             // SAFETY: the mapping is read-only over an immutable file (a
@@ -428,4 +687,15 @@ pub fn release_mapped_pages(want: usize) -> usize {
         PAGES_RELEASED.fetch_add(map.len(), Ordering::Relaxed);
     }
     released
+}
+
+/// Unmaps every object no reader is holding, returning the bytes released.
+///
+/// The counterpart of [`release_mapped_pages`] one level up: that one keeps the
+/// mapping and drops its pages (cheap to undo, faults back in), this one gives
+/// the address space back. A reclaim pass that cannot get far enough reaches for
+/// it; ordinary steady-state reclaim should not, because the next read pays a
+/// fresh `mmap`.
+pub fn unmap_idle_mappings() -> usize {
+    unmap_idle()
 }

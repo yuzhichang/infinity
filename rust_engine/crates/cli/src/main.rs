@@ -413,6 +413,22 @@ async fn configure_server(
         "starting in {mode} mode; configuration in effect: {}",
         config::settings_json(&resolved.resolved_settings())
     ));
+    // `vm.max_map_count` bounds how many files the mapping table may hold at
+    // once. Coming in under it does not fail anything at startup - it fails a
+    // wide scan later, as an `ENOMEM` on `mmap`, which reads as a query error
+    // rather than the resource question it is. Elasticsearch's documented value
+    // is 1048576; warn below that so the operator sees it in the log they
+    // already read, not in a stack trace.
+    if let Some(kernel) = storage::mapped::kernel_max_map_count() {
+        const RECOMMENDED: usize = 1_048_576;
+        if kernel < RECOMMENDED {
+            log_info(&format!(
+                "warning: vm.max_map_count is {kernel}; a scan wide enough to map more \
+                 files than that will fail with ENOMEM. {RECOMMENDED} is recommended \
+                 (`sysctl -w vm.max_map_count={RECOMMENDED}`)"
+            ));
+        }
+    }
     Ok(())
 }
 
