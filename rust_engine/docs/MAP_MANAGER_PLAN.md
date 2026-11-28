@@ -702,3 +702,55 @@ decoded blocks=0 B   decoded chunks=0 B    ivf segments=0 B
 3. **`table_id = 0` 当哨兵**（阶段 4）：`0` 是真实 id（新 catalog 的第一张表），用 `0` 表示"未知"会让那张表恰好跳过自己的映射。
 
 三处都已修正并写入各阶段的实施记录。
+
+## 13. 后续四项重构（已完成）
+
+### 13.1 废弃 `row_cache`
+
+`row_cache` 把一张标量表的行保存为已解码的 `Value`（每表最多 64 MiB），让全表扫描可以省掉解码。但它有两个致命问题：**每次命中都整体 `clone()`**（100 万行就是 100 万次 `Vec<Value>` 分配），而它省下的重读页本来就在 mmap 的页缓存里。
+
+扫描改为每次读块镜像。连带删除：`RowCache`、`ROW_CACHE_BUDGET_BYTES`、`scalar_only`、`is_blob_type`、`note_row_cache`、`invalidate_row_cache`、`cache_row_set` 及全部调用点。`live_rows` 保留（有独立维护路径 `note_live_rows`）。
+
+### 13.2 索引全部零拷贝，`evict_table_caches` 随之删除
+
+| 索引 | 改造前 | 改造后 |
+|---|---|---|
+| HNSW vectors/graph/labels | 映射（前几轮已改） | — |
+| HNSW `levels` | `Vec<usize>`，每节点 8 字节 | **从映射按需读**：`layer_count` 就在 level-0 record 的头 4 字节 |
+| IVF plain | `read_file` + 逐向量 `Vec<f32>` | 映射 + `MappedWindow`，`IvfPart` 只留 part 头 |
+| SPANN / PLAID | 映射 | — |
+| 全文 | 映射 | — |
+
+`evict_table_caches` 淘汰的东西于是全是映射，删除它、`escalate` 里对应的一步，以及 `spann_release_pages_forced` 在 cheap levers 里的调用（SPANN chunk 也是映射，`release_mapped_pages` 已经覆盖）。`spann_release_pages_forced` 本身保留给 cleanup 路径。
+
+**验证方式**：`ivf_index_mirror_roundtrips_the_vectors` 不只比值，还断言每个 part 和 centroid 表都是 `is_mapped()`、`heap_bytes() < 4 KiB`；把 `is_mapped` 改成 `false` 会让它报 `part 0 was copied instead of mapped`。`a_loaded_hnsw_chunk_reports_levels_from_its_mapping` 断言加载后的层号有非零值、不超 `max_level`、越界返回 0。
+
+### 13.3 `flush_lock` 粒度
+
+dump 原本要 `flush_lock.write()`，理由只是「同一 segment 的两个 dump 会选同一个 `chunk_{n}.idx`」。根因是 `next_index_chunk_id` 读最大值再 +1，不是原子操作。
+
+修在根因：`seal_index_tail` 改用 `Catalog::take_next_chunk_id`（加锁读、`atomic_batch` 递增）。id 不再撞车后，dump 只需要与 checkpoint 的 chunk 发布互斥，于是改成 **`read()`** —— 两个 dump 可以并发，checkpoint 仍然排除所有 dump。
+
+`concurrent_chunk_id_allocation_never_repeats` 用 8 线程争抢同一 segment 的 id，断言无重复。
+
+### 13.4 tick 拆成三条并行链
+
+原来一个循环串行跑所有步骤，于是两个分钟的 checkpoint 会让内存治理和 WAL flush 停两分钟；反过来，`reclaim_unsealed` 持 `flush_lock` 也会卡住 checkpoint。
+
+现在按锁分组：
+
+```
+storage  checkpoint -> WAL flush          (flush_lock 写)
+memory   上限检查 -> unsealed drain        (flush_lock 读)
+index    压缩 / 优化 / 清理                (表级 gate)
+```
+
+同一链内仍串行（真的共享锁），但一条链慢不再饿死其它链。
+
+顺带修两处：`reclaim_memory` 的 drain 改为按压力判定（此前 `budget_bytes() > 0` 就 drain，会和 tick 的 `reclaim_unsealed` 在同一 tick 里排队两次）；`memory_tick` 在无配额时也写 `memory_checked_at`（此前提前返回不写，让无配额引擎看起来像 tick 停了——`the_memory_chain_ticks_independently_of_the_others` 正是读这个戳）。
+
+### 13.5 溢出到并行测试里的一处断言
+
+`reclaim_honours_the_round_cap` 原本断言 `reclaim_unsealed()` 累计返回 3。这个返回值把「只释放了映射」也算作成功（`unmap_idle_of(table_id)`），而映射登记表是按 **table id** 索引的：每个引擎的前三张表都是 id 0/1/2，于是同一测试二进制里另一个引擎映射了一个 block，这台的 `mapped` 臂就非零，一轮会多记一次释放。
+
+改成断言这台引擎自己的账：`pending()`（`unsealed_bytes`）归零。cap 控制的本来就是「几台表被 drain」，而它才是这台引擎的私有状态。改前 15 次连跑失败 7 次，改后 15 次全过。
