@@ -1790,6 +1790,63 @@ mod tests {
         assert_eq!(rows, vec![vec!["12345".to_string()]]);
     }
 
+    /// Reading a table's blocks charges the access to that table, which is the
+    /// age arm of the reclaim fusion (`docs/MAP_MANAGER_PLAN.md` §6 decision 4).
+    ///
+    /// Without it a table read every second would look as idle as one nobody
+    /// has touched since it was written, and the fusion would evict the busy
+    /// one - its size arm would be the only signal left.
+    #[tokio::test]
+    async fn reading_a_table_advances_its_access_clock() {
+        let dir = tempdir().unwrap();
+        let e = Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+        e.execute("CREATE TABLE ac (id INTEGER)").await.unwrap();
+        let csv = dir.path().join("ac.csv");
+        // One block reads back from the block files rather than the buffer.
+        let text: String = (0..100).map(|i| format!("{i}\n")).collect();
+        std::fs::write(&csv, text).unwrap();
+        e.execute(&format!(
+            "COPY ac FROM '{}' WITH (DELIMITER ',', FORMAT CSV);",
+            csv.display()
+        ))
+        .await
+        .unwrap();
+        // A checkpoint puts the rows in block files, so the scan below maps a
+        // block. That is the case this clock exists for: the fusion ranks tables
+        // that hold *mappings*, and a table whose rows are still in the append
+        // buffer is already covered by the unsealed arm.
+        e.flush().await.unwrap();
+        let key = e.table_key("default_db.ac");
+        let clock = |e: &Engine| {
+            e.tables
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|entry| entry.last_access_ts)
+                .unwrap_or(0)
+        };
+        let before = clock(&e);
+        assert!(before > 0, "the copy itself already touched the table");
+
+        // A later commit, so the clock has somewhere to move to: it is stamped
+        // with `current_ts`, which advances only when a commit lands.
+        e.execute("INSERT INTO ac VALUES (1000);").await.unwrap();
+        let got = rows(&e, "SELECT id FROM ac WHERE id = 42;").await;
+        assert_eq!(got, vec![vec!["42".to_string()]]);
+
+        let after = clock(&e);
+        assert!(
+            after > before,
+            "the read must advance the table's access clock ({before} -> {after})"
+        );
+        assert!(
+            after <= e.current_ts(),
+            "the stamp is a committed ts, never ahead of the engine's own clock"
+        );
+    }
+
     /// A scan that carries a range predicate prunes whole blocks through their
     /// `blk|…|fast_rough_filter` record: a block whose min/max refutes the
     /// predicate is never decoded, and the rows the answer needs still come

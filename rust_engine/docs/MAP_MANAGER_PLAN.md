@@ -181,8 +181,16 @@ impl MapManager {
 | 新增 | `storage::format::table_of_path(&Path) -> Option<u64>`：解析 `tbl_(\d+)`；`storage::format::db_of_path` 同理 |
 | 改造 | `MapManager::open` 带上 `TableKey`（由调用方从路径解析后传入，或由 MapManager 自行解析——二选一，见 §6 决策 1） |
 | 新增 | `TableMappings { mapped_bytes, last_access_ts }`，`open` 与命中时更新 |
-| 新增 | `last_access_ts` 的写入接口：`MapManager::touch(table, commit_ts)`，由 executor 在语句提交/读取时调用 |
+| 新增 | `last_access_ts` 的写入接口：**`TableEntry::last_access_ts`** + `Engine::note_table_access(table)`，在块读取路径调用 |
 | 验收 | ① 两张表各读自己的块，`mapped_bytes` 各自正确、互不串 ② 提交一次读后 `last_access_ts` 前进 ③ 单测覆盖「同一 persistence 对象里两个表的 chunk」 |
+
+**实施记录（阶段 2 已完成）**
+
+- `storage::format::table_of_path` / `db_of_path`：从路径的 `tbl_{id}` / `db_{id}` 分量解析归属。块（`…/tbl_t/seg_s/blk_b/`）与索引 chunk（`…/tbl_t/idx_i/seg_s/`）共用同一条解析。无归属（catalog、WAL、persistence blob）返回 `None`，调用方按「不可归属」处理，不是错误。
+- `Entry.tables: Vec<(u64, usize)>`，按引用数**等分**：`bytes * mine / total`。`tables` 的计数是**累积**的——只有对象被 unmap 时才为零。这一点起初写成了「按活动句柄数」，导致空闲映射全部报 0 归属，而空闲正是回收最关心的状态；`unmap_idle_of_a_table_leaves_the_other_alone` 抓到了它。
+- 新增 `mapped_bytes_of(table)`、`mapped_bytes_by_table()`、`unmap_idle_of(table)`。
+- **access clock 放在 `TableEntry`，不是全局 map**（见下方决策 4 的修正）。`Engine::note_table_access(table)` 写 `TableEntry::last_access_ts`，取 `current_ts()`（已提交时钟），单调更新。调用点在 `Engine::block_map`，覆盖块读的命中与未命中两条路径。
+- 测试：`mapping_identity.rs` 9 个用例（新增表归属、共享等分、按表 unmap 三个）；`reading_a_table_advances_its_access_clock` 验证读推进时钟。
 
 ### 阶段 3：区块缓存改由 MapManager 承载
 
@@ -331,7 +339,12 @@ VMA 数量是**硬上限**：
 
 1. **age 用 ts 差是可行的**——`now_ts` 在 checkpoint 推动下会前进，闲置表的 age 会增长。
 2. **但不能假设「age 增长意味着这张表被写过」**。age 是相对量，RRF 只用它的**序**（`maintain.rs:59-105` 只排序、不做绝对判断），所以 checkpoint 推进 ts 不会破坏排序语义，只是整体一起前移。**这一点必须在阶段 4 用测试固定**：构造「只有 checkpoint、没有数据写入」的时间线，确认年龄序不变。
-3. **`last_access_ts` 应记录「读发生的那个快照 ts」，而不是 `now_ts`**。记录 `now_ts` 会让「读」和「checkpoint」混为一谈；记录读自己的 `read_ts` 则语义精确：该表在 ts 这个快照被访问过。
+3. **`last_access_ts` 记录 `current_ts()`（已提交时钟），不是事务自己的 commit ts，也不是语句的 `read_ts`。**
+   - 事务自己的 commit ts **不可用**：提交前未发布，回滚时永不存在，把它写进一个供回收排序的字段就是写入了无人能比较的时间。
+   - 语句的 `read_ts` 是 `current_ts() + 1`，读多个快照会来回跳，且不是单调的。
+   - `current_ts()` 是「本进程已完成的最近一次提交」，正是 `now_ts - last_access` 所对照的时钟，且单调。
+
+   **存储位置**：`TableEntry::last_access_ts`，不是 `MapManager` 里的全局表。理由有三：回收本来就在遍历 `self.tables`，属性放在被遍历的对象上最直接；进程级全局表会让不同引擎实例（测试里同时存在多个）互相串号；表被 DROP 时随 `TableEntry` 一起消失，不用额外清理。
 
 ---
 

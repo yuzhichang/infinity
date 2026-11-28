@@ -367,3 +367,113 @@ fn idle_mappings_are_capped() {
         "the reclaim pass gives the objects back"
     );
 }
+
+/// A data path with the engine's own layout, under a temp root.
+fn table_path(root: &std::path::Path, db: u64, table: u64, name: &str) -> PathBuf {
+    let dir = root.join(format!("data/db_{db}/tbl_{table}/seg_0/blk_0"));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(name)
+}
+
+#[test]
+fn a_mapping_is_charged_to_its_table() {
+    let _guard = exclusive();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    storage::mapped::unmap_idle_mappings();
+
+    let a = table_path(root, 1, 7, "0.col");
+    let b = table_path(root, 1, 8, "0.col");
+    write_file(&a, 1 << 20);
+    write_file(&b, 2 << 20);
+    assert_eq!(storage::format::table_of_path(&a), Some(7));
+    assert_eq!(storage::format::table_of_path(&b), Some(8));
+    assert_eq!(storage::format::db_of_path(&a), Some(1));
+
+    let _held_a = storage::mapped::MappedFile::open_path(&a).unwrap();
+    let _held_b = storage::mapped::MappedFile::open_path(&b).unwrap();
+    assert_eq!(storage::mapped::mapped_bytes_of(7), 1 << 20);
+    assert_eq!(storage::mapped::mapped_bytes_of(8), 2 << 20);
+    assert_eq!(
+        storage::mapped::mapped_bytes_of(9),
+        0,
+        "a table with no mapping is charged nothing"
+    );
+
+    // An unowned file (no `tbl_` component) is charged to no table at all.
+    let loose = root.join("catalog.db");
+    std::fs::write(&loose, vec![b'x'; 4096]).unwrap();
+    let _held = storage::mapped::MappedFile::open_path(&loose).unwrap();
+    assert_eq!(storage::format::table_of_path(&loose), None);
+}
+
+#[test]
+fn a_shared_object_is_split_between_tables() {
+    // A persistence object packs several parts into one file, and those parts
+    // can belong to different tables. Charging the object's full size to each
+    // would make the per-table figures add up to more than the process holds.
+    let _guard = exclusive();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    storage::mapped::unmap_idle_mappings();
+
+    // One object file, reached through two paths: `open_range` on the same file
+    // with different windows is exactly the persistence case.
+    let object = table_path(root, 1, 11, "object.obj");
+    write_file(&object, 4096);
+    // The second "table" reads the same inode through a hard link, which is what
+    // the object store gives two parts of one blob. Its path names table 12.
+    let link = table_path(root, 1, 12, "object.obj");
+    std::fs::hard_link(&object, &link).unwrap();
+
+    let a = storage::mapped::MappedFile::open_range(&object, 0, 1024).unwrap();
+    let b = storage::mapped::MappedFile::open_range(&link, 1024, 1024).unwrap();
+    // Same inode, so one object and one VMA.
+    let inode = inode_of(&object);
+    assert_eq!(vm_as_for_inode(inode).len(), 1, "one object");
+    let by_table = storage::mapped::mapped_bytes_by_table();
+    assert_eq!(by_table.get(&11).copied(), Some(2048), "half the object");
+    assert_eq!(by_table.get(&12).copied(), Some(2048), "the other half");
+    // The split adds up to the object, not to twice it.
+    let total: u64 = by_table
+        .iter()
+        .filter(|(t, _)| **t == 11 || **t == 12)
+        .map(|(_, v)| *v)
+        .sum();
+    assert_eq!(total, 4096);
+    drop(a);
+    drop(b);
+}
+
+#[test]
+fn unmap_idle_of_a_table_leaves_the_other_alone() {
+    let _guard = exclusive();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    storage::mapped::unmap_idle_mappings();
+
+    let a = table_path(root, 1, 21, "0.col");
+    let b = table_path(root, 1, 22, "0.col");
+    write_file(&a, 1 << 20);
+    write_file(&b, 1 << 20);
+    let held_a = storage::mapped::MappedFile::open_path(&a).unwrap();
+    let held_b = storage::mapped::MappedFile::open_path(&b).unwrap();
+    drop(held_a);
+    drop(held_b);
+
+    let inode_a = inode_of(&a);
+    let inode_b = inode_of(&b);
+    let released = storage::mapped::unmap_idle_of(21);
+    assert_eq!(released, 1 << 20, "only table 21's idle bytes");
+    assert!(
+        vm_as_for_inode(inode_a).is_empty(),
+        "table 21's mapping is gone"
+    );
+    assert_eq!(
+        vm_as_for_inode(inode_b).len(),
+        1,
+        "table 22's mapping is untouched"
+    );
+    assert_eq!(storage::mapped::mapped_bytes_of(21), 0);
+    assert_eq!(storage::mapped::mapped_bytes_of(22), 1 << 20);
+}

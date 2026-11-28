@@ -1561,6 +1561,30 @@ impl Engine {
 
     /// The key of a table's [`TableEntry`]: the fully-qualified lower-case
     /// name (the C++ catalog's `db.table` key).
+    /// Records that `table` was just accessed, for the reclaim fusion's age arm.
+    ///
+    /// The stamp is [`Self::current_ts`] - the newest **committed** ts - not the
+    /// calling transaction's own commit ts. The latter is not published until
+    /// that commit lands (and never, if it rolls back), so it would write a time
+    /// no other reader can compare against into a figure the reclaim loop ranks.
+    ///
+    /// A table with no entry yet is ignored: nothing is cached for it, so there
+    /// is nothing to age.
+    pub(crate) fn note_table_access(&self, table: &str) {
+        let now = self.current_ts();
+        let key = self.table_key(table);
+        let Ok(mut tables) = self.tables.lock() else {
+            return;
+        };
+        if let Some(entry) = tables.get_mut(&key) {
+            // Monotonic: a long transaction that finishes late reads an older
+            // snapshot and must not move the clock back.
+            if now > entry.last_access_ts {
+                entry.last_access_ts = now;
+            }
+        }
+    }
+
     pub(crate) fn table_key(&self, table: &str) -> String {
         if table.contains('.') {
             table.to_ascii_lowercase()

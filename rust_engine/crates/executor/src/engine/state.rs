@@ -5498,6 +5498,7 @@ impl Default for TableEntry {
             unsealed_marks: Default::default(),
             last_attempt_ts: 0,
             dump_failures: 0,
+            last_access_ts: 0,
             row_counter: None,
             append_totals: None,
             append_ts: None,
@@ -5906,6 +5907,22 @@ pub(crate) struct TableEntry {
     /// Row ids deleted since the table was created (`dellog:{table}`), loaded
     /// on first use.
     pub(crate) deleted_ids: Option<Vec<u64>>,
+    /// When this table was last read or written, on the engine's committed
+    /// clock (`TxnManager::current_ts`).
+    ///
+    /// The age arm of the reclaim fusion (`docs/MAP_MANAGER_PLAN.md` §6
+    /// decision 4): a table nobody has touched in a long time is the first one a
+    /// reclaim round should take, and the size arm alone would keep picking a
+    /// large table that is in active use.
+    ///
+    /// A **committed** ts, not the accessing transaction's own: that one is not
+    /// published until its commit lands, so a write would stamp a time no other
+    /// reader can compare against, and a rolled-back one would stamp a time that
+    /// never existed. `current_ts` is the newest commit this process has
+    /// finished, which is exactly the clock `now_ts - last_access` is measured
+    /// against. Monotonic, so a statement that reads an older snapshot after a
+    /// newer one cannot move it backwards.
+    pub(crate) last_access_ts: u64,
     /// [`Self::deleted_ids`] as a bitmap, so a single row's tombstone is one
     /// container lookup instead of a linear scan of the journal.
     ///

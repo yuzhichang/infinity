@@ -64,6 +64,50 @@ struct Entry {
     handles: usize,
     /// `map.len()`, charged once per object.
     bytes: usize,
+    /// Which tables this object belongs to, with a count each.
+    ///
+    /// Usually one. A persistence object packs several chunks into one file
+    /// (`PersistentChunkStore::resolve` returns the same object with different
+    /// offsets), and those parts can belong to different tables - so the charge
+    /// is split, each table paying `bytes * mine / total`.
+    ///
+    /// A table's count is **cumulative**, not the number of live handles: it
+    /// goes to zero only when the object is unmapped. An idle mapping is still
+    /// charged to its table - that is the whole point, since a reclaim pass
+    /// decides from that figure which table's idle mappings to drop. Using the
+    /// live handle count would report zero for every idle object, which is the
+    /// state a reclaim pass is most interested in.
+    tables: Vec<(u64, usize)>,
+}
+
+impl Entry {
+    fn hold(&mut self, table: Option<u64>) {
+        let Some(table) = table else {
+            return;
+        };
+        match self.tables.iter_mut().find(|(id, _)| *id == table) {
+            Some((_, count)) => *count += 1,
+            None => self.tables.push((table, 1)),
+        }
+    }
+
+    /// This table's share of the object: `bytes * mine / total`.
+    fn share_of(&self, table: u64) -> usize {
+        let mine = self
+            .tables
+            .iter()
+            .find(|(id, _)| *id == table)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        if mine == 0 {
+            return 0;
+        }
+        let total: usize = self.tables.iter().map(|(_, count)| *count).sum();
+        if total == 0 {
+            return 0;
+        }
+        self.bytes * mine / total
+    }
 }
 
 /// Idle mappings kept after their last handle lets go, derived once from
@@ -147,6 +191,7 @@ static REGISTRY: std::sync::LazyLock<std::sync::Mutex<Registry>> = std::sync::La
 /// the counters only once per object. `create` runs only on a miss.
 fn acquire(
     key: ObjectKey,
+    table: Option<u64>,
     create: impl FnOnce() -> std::io::Result<std::sync::Arc<Mmap>>,
 ) -> std::io::Result<(std::sync::Arc<Mmap>, bool)> {
     let Ok(mut registry) = REGISTRY.lock() else {
@@ -156,6 +201,7 @@ fn acquire(
     };
     if let Some(entry) = registry.entries.get_mut(&key) {
         entry.handles += 1;
+        entry.hold(table);
         let map = std::sync::Arc::clone(&entry.map);
         // It is no longer a candidate for the bound.
         if entry.handles == 1 {
@@ -169,14 +215,14 @@ fn acquire(
     // syscall, not I/O.
     let map = create()?;
     let bytes = map.len();
-    registry.entries.insert(
-        key,
-        Entry {
-            map: std::sync::Arc::clone(&map),
-            handles: 1,
-            bytes,
-        },
-    );
+    let mut entry = Entry {
+        map: std::sync::Arc::clone(&map),
+        handles: 1,
+        bytes,
+        tables: Vec::new(),
+    };
+    entry.hold(table);
+    registry.entries.insert(key, entry);
     Ok((map, true))
 }
 
@@ -367,7 +413,10 @@ impl MappedFile {
         // SAFETY: the mapping is read-only and the file is immutable while it
         // is mapped (see the function docs). `Mmap` keeps the mapping valid
         // after the descriptor is closed, so the file is dropped at once.
-        let (map, created) = acquire(key, || unsafe { Mmap::map(&file) }.map(std::sync::Arc::new))?;
+        let table = crate::format::table_of_path(path);
+        let (map, created) = acquire(key, table, || {
+            unsafe { Mmap::map(&file) }.map(std::sync::Arc::new)
+        })?;
         if created {
             MAPPINGS.fetch_add(1, Ordering::Relaxed);
             MAPPED_BYTES.fetch_add(map.len(), Ordering::Relaxed);
@@ -412,7 +461,10 @@ impl MappedFile {
         // SAFETY: the mapping is read-only and the object file is immutable
         // while it is mapped (a persisted object is replaced, never truncated
         // in place).
-        let (map, created) = acquire(key, || unsafe { Mmap::map(&file) }.map(std::sync::Arc::new))?;
+        let table = crate::format::table_of_path(path);
+        let (map, created) = acquire(key, table, || {
+            unsafe { Mmap::map(&file) }.map(std::sync::Arc::new)
+        })?;
         if created {
             MAPPINGS.fetch_add(1, Ordering::Relaxed);
             // The whole object is what can become resident, so it is charged
@@ -456,6 +508,7 @@ impl MappedFile {
                 map: std::sync::Arc::clone(&map),
                 handles: 1,
                 bytes: len,
+                tables: Vec::new(),
             },
         );
         // No idle stamp: this handle is the object's first reference, and the
@@ -615,6 +668,84 @@ pub fn idle_mapping_count() -> usize {
 /// publishes one.
 pub fn idle_mapping_limit() -> usize {
     *IDLE_MAPPING_LIMIT
+}
+
+/// Bytes the mapping table holds on `table`'s behalf.
+///
+/// The size arm of the table-level reclaim fusion: a table's footprint is what
+/// it holds unsealed **plus** what it has mapped, because a scan over a large
+/// index leaves the pages resident and dropping the table's mappings is one of
+/// the ways to get them back.
+///
+/// Sums each object's [`Entry::share_of`], so an object shared by two tables
+/// (a persistence object holding both their chunks) is split between them
+/// instead of counted twice.
+pub fn mapped_bytes_of(table: u64) -> u64 {
+    let Ok(registry) = REGISTRY.lock() else {
+        return 0;
+    };
+    registry
+        .entries
+        .values()
+        .map(|entry| entry.share_of(table) as u64)
+        .sum()
+}
+
+/// Every table with at least one live mapping, and what it holds.
+///
+/// One pass for the whole fusion rather than a call per table: the reclaim loop
+/// needs the mapped size of every candidate, and a per-table query would walk
+/// the registry once per table.
+pub fn mapped_bytes_by_table() -> std::collections::HashMap<u64, u64> {
+    let Ok(registry) = REGISTRY.lock() else {
+        return std::collections::HashMap::new();
+    };
+    let mut out: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for entry in registry.entries.values() {
+        // The total shares of one object add up to its bytes exactly, so the
+        // per-table figures sum to `mapped_bytes()`.
+        let total: usize = entry.tables.iter().map(|(_, count)| *count).sum();
+        if total == 0 {
+            continue;
+        }
+        for (table, count) in &entry.tables {
+            *out.entry(*table).or_default() += (entry.bytes * count / total) as u64;
+        }
+    }
+    out
+}
+
+/// Unmaps every idle mapping that belongs to `table`, returning the bytes
+/// released.
+///
+/// The per-table counterpart of [`unmap_idle_mappings`]: a reclaim pass that has
+/// picked its victim needs to give *that* table's address space back, not the
+/// process's. A mapping a reader holds is left alone.
+pub fn unmap_idle_of(table: u64) -> usize {
+    let Ok(mut registry) = REGISTRY.lock() else {
+        return 0;
+    };
+    let victims: Vec<ObjectKey> = registry
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.handles == 0 && entry.tables.iter().any(|(id, _)| *id == table))
+        .map(|(key, _)| *key)
+        .collect();
+    let mut bytes = 0usize;
+    let mut evicted = 0usize;
+    for key in victims {
+        if let Some(entry) = registry.entries.remove(&key) {
+            bytes += entry.bytes;
+            evicted += 1;
+            MAPPED_BYTES.fetch_sub(entry.bytes, Ordering::Relaxed);
+        }
+    }
+    if evicted > 0 {
+        MAPPINGS.fetch_sub(evicted, Ordering::Relaxed);
+        let live: std::collections::HashSet<ObjectKey> = registry.entries.keys().copied().collect();
+        registry.idle.retain(|key| live.contains(key));
+    }
+    bytes
 }
 
 /// `vm.max_map_count` as the kernel reports it, or `None` off Linux.

@@ -365,6 +365,49 @@ pub fn block_dir(db_id: u64, table_id: u64, segment_id: u32, block_id: u16) -> S
     format!("db_{db_id}/tbl_{table_id}/seg_{segment_id}/blk_{block_id}")
 }
 
+/// The table a data file belongs to, read from its path.
+///
+/// Every per-table file the engine writes lives under `db_{db}/tbl_{table}/`,
+/// and this walks the components to find that one - blocks
+/// (`…/tbl_{t}/seg_{s}/blk_{b}/{col}.col`) and index chunks
+/// (`…/tbl_{t}/idx_{i}/seg_{s}/chunk_{n}.idx`) alike.
+///
+/// Returned for a memory-reclaim pass that needs to charge a mapping to the
+/// table that owns it: the alternative is a registry the writers must maintain,
+/// which is one more thing a new file family can forget to update. The path
+/// already says it, so it is read from there.
+///
+/// `None` when no component is a table directory - a catalog file, a WAL
+/// segment, a persistence object that holds several tables' parts, or a path
+/// outside the engine root entirely. Callers treat that as "not attributable",
+/// never as an error.
+pub fn table_of_path(path: &std::path::Path) -> Option<u64> {
+    for component in path.components() {
+        let text = component.as_os_str().to_str()?;
+        if let Some(id) = text.strip_prefix("tbl_") {
+            // `tbl_12` is a table; `tbl_12_tmp` is not.
+            if let Ok(id) = id.parse::<u64>() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// The database a data file belongs to, read from its path. See
+/// [`table_of_path`].
+pub fn db_of_path(path: &std::path::Path) -> Option<u64> {
+    for component in path.components() {
+        let text = component.as_os_str().to_str()?;
+        if let Some(id) = text.strip_prefix("db_") {
+            if let Ok(id) = id.parse::<u64>() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 /// `{column_id}.col` inside a block directory.
 pub fn column_file(column_id: u64) -> String {
     format!("{column_id}.col")

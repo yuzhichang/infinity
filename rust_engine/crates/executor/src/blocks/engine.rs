@@ -4612,6 +4612,10 @@ impl Engine {
         root: &Path,
         id: BlockId,
     ) -> std::io::Result<Arc<MappedBlock>> {
+        // Charge this access to the table, for the age arm of the reclaim
+        // fusion. Done here because every block read passes through, on both the
+        // hit and the miss path.
+        self.note_table_access(table);
         // One load per call, whether the block is cached or not: the budget can
         // be lowered after mappings were made (a config applied to a running
         // engine maps the catalog's blocks during open), and a hit never
