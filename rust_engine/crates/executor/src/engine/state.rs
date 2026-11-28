@@ -7084,6 +7084,13 @@ pub(crate) fn process_rss_bytes() -> u64 {
     pages * 4096
 }
 
+/// The process's resident memory, split where the platform publishes a split.
+///
+/// The implementation lives in `storage`, next to the other platform probes
+/// (`page_size`, `physical_memory_bytes`); this re-export keeps the call sites
+/// in the engine reading familiarly.
+pub(crate) use storage::process_rss_split;
+
 /// Anonymous (heap) resident bytes on Linux, `None` where the split is not
 /// exposed.
 ///

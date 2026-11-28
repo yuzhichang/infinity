@@ -509,3 +509,32 @@ fn unmap_idle_of_a_table_leaves_the_other_alone() {
     assert_eq!(storage::mapped::mapped_bytes_of(21), 0);
     assert!(storage::mapped::mapped_bytes_of(22) > 0);
 }
+
+/// The reclaim plan log prints a resident split, and a split is only usable if
+/// its parts add up to the total.
+///
+/// `VmRSS = RssAnon + RssFile + RssShmem` is the kernel's own identity, so a
+/// reader of that line can tell which lever moved. Where the platform reports no
+/// split, `has_split` is false rather than a set of zeroes that would read as a
+/// measurement.
+#[test]
+fn the_resident_split_adds_up_where_the_platform_has_one() {
+    let split = storage::process_rss_split();
+    assert!(split.vm_rss > 0, "a running process has resident memory");
+    if split.has_split {
+        let sum = split.rss_anon + split.rss_file + split.rss_shmem;
+        assert_eq!(
+            sum, split.vm_rss,
+            "Anon + File + Shmem must equal VmRSS ({split})"
+        );
+        // This process maps files, so the file half is not zero on Linux.
+        assert!(
+            split.rss_file > 0,
+            "file-backed pages are resident: {split}"
+        );
+    } else {
+        assert_eq!(split.rss_anon, 0);
+        assert_eq!(split.rss_file, 0);
+        assert_eq!(split.rss_shmem, 0);
+    }
+}

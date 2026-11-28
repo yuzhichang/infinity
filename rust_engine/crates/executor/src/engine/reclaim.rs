@@ -61,6 +61,22 @@ pub(crate) fn monotonic_now_ms() -> u64 {
         .max(1)
 }
 
+/// A byte count as a short human string: `512 B`, `3 KiB`, `42 MiB`.
+///
+/// MiB alone would print every sub-megabyte figure as `0 MiB`, and a reclaim
+/// plan whose per-table numbers all read zero says nothing.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// The monotonic deadline `wait` from now.
 fn monotonic_deadline(wait: std::time::Duration) -> u64 {
     monotonic_now_ms().saturating_add(wait.as_millis() as u64)
@@ -85,6 +101,14 @@ struct TableStat {
     ///
     /// Cached index bytes only affect *ordering*, never the decision to reclaim.
     footprint: u64,
+    /// The unsealed part of `footprint`: buffered rows plus index tails. Kept
+    /// apart from the mapped part so a reclaim plan can say which lever applies
+    /// to which table - a dump frees this, dropping mappings frees that.
+    unsealed: u64,
+    /// The mapped part of `footprint`: resident pages behind this table's
+    /// mappings. Zero on a platform that cannot report per-region residency
+    /// (`storage::mapped`), which is honest rather than an estimate.
+    mapped: u64,
     /// The table's last touch: the newer of its last append and its last block
     /// read, in commit ts. A table under constant read load is not idle even
     /// when nothing is written, which a write-only clock would report as idle.
@@ -267,6 +291,13 @@ impl Engine {
             return 0;
         }
         let order = rrf_order(&candidates);
+        // The round's **plan**, at info level: what it saw, who it picked and
+        // what it expects to get back. A reclaim decision that only shows up as
+        // an RSS curve is not checkable - "the process dropped 2 GiB" does not
+        // say which lever did it, and `RssAnon` (the allocator) and `RssFile`
+        // (the mappings) move for different reasons. Logging the split before
+        // and the expectation after makes a round attributable.
+        self.log_reclaim_plan(&stats, &candidates, &order, now_ts, cap);
 
         let mut dumped = 0usize;
         let mut progressed = false;
@@ -334,6 +365,16 @@ impl Engine {
         if trace {
             eprintln!("[reclaim] round done: dumped={dumped} progressed={progressed} cap={cap}");
         }
+        // The outcome, in the same terms as the plan: the process's split after
+        // the round and the two ledgers it acts on. A plan line without this one
+        // cannot be checked - it says what was expected, not what happened.
+        eprintln!(
+            "info: reclaim result: {} table(s) dumped; after {}  unsealed={} mapped={}",
+            dumped,
+            crate::engine::state::process_rss_split(),
+            human_bytes(self.budget_bytes() as u64),
+            human_bytes(storage::mapped::mapped_bytes() as u64),
+        );
         // A round that released nothing must not be repeated on the next slot: it
         // would walk the same hopeless candidates and pay one `list_indexes()`
         // per table, for ever.
@@ -474,6 +515,89 @@ impl Engine {
     /// fields there. Index tails are read through the atomic marks rather than
     /// each index's own lock - see
     /// [`crate::engine::state::TableEntry::unsealed_marks`].
+    /// One info line describing the round it is about to run.
+    ///
+    /// The three figures it reports are the three that can be checked against
+    /// the outcome: the process's resident split **now**, what the selected
+    /// tables hold (`mapped` and `unsealed` separately, because a dump frees the
+    /// second and dropping mappings frees the first), and what the process
+    /// should read afterwards if both levers land.
+    ///
+    /// The estimate subtracts every selected table's mapped bytes - the mapping
+    /// release is unconditional for an idle table - and its unsealed bytes,
+    /// which a dump can only realise if that table's rows are all committable at
+    /// this round's bound. A table with a staging import keeps its tail, so the
+    /// projection is an upper bound on the release, stated as such.
+    fn log_reclaim_plan(
+        &self,
+        stats: &[TableStat],
+        candidates: &[ReclaimCandidate],
+        order: &[usize],
+        now_ts: u64,
+        cap: usize,
+    ) {
+        let before = crate::engine::state::process_rss_split();
+        let quota = self.rss_quota();
+        let low = quota * crate::memory::LOW_PERCENT / 100;
+        // Cap the plan to what this round will actually visit.
+        let visits = if cap == 0 {
+            order.len()
+        } else {
+            order.len().min(cap)
+        };
+        let mut planned_unsealed = 0u64;
+        let mut planned_mapped = 0u64;
+        for at in order.iter().take(visits) {
+            if let Some(stat) = stats.iter().find(|s| s.key == candidates[*at].key) {
+                planned_unsealed = planned_unsealed.saturating_add(stat.unsealed);
+                planned_mapped = planned_mapped.saturating_add(stat.mapped);
+            }
+        }
+        eprintln!(
+            "info: reclaim plan: {} table(s) hold unsealed data or mappings, {} selected{}; \
+             now {}  unsealed={} mapped={}; \
+             selected unsealed={} mapped={}; \
+             projected {} minus >= {}",
+            stats.len(),
+            candidates.len(),
+            if cap == 0 {
+                String::new()
+            } else {
+                format!(" (round cap {cap})")
+            },
+            before,
+            human_bytes(self.budget_bytes() as u64),
+            human_bytes(storage::mapped::mapped_bytes() as u64),
+            human_bytes(planned_unsealed),
+            human_bytes(planned_mapped),
+            before,
+            human_bytes(planned_unsealed.saturating_add(planned_mapped)),
+        );
+        // Per-table detail for the ones this round will visit, so a later
+        // comparison has the inputs and not just the totals.
+        for at in order.iter().take(visits) {
+            let key = &candidates[*at].key;
+            if let Some(stat) = stats.iter().find(|s| s.key == *key) {
+                eprintln!(
+                    "info: reclaim plan:   {key} unsealed={} mapped={} age={} ts id={:?}",
+                    human_bytes(stat.unsealed),
+                    human_bytes(stat.mapped),
+                    now_ts.saturating_sub(stat.last_ts),
+                    stat.table_id
+                );
+            }
+        }
+        // The two thresholds the round is judged against, so the numbers above
+        // can be read without knowing the configuration.
+        eprintln!(
+            "info: reclaim plan: goals unsealed<={} (quota/2) and \
+             mapped+unsealed<={} (rss_quota*{}%)",
+            human_bytes(self.reclaim_target()),
+            human_bytes(low),
+            crate::memory::LOW_PERCENT,
+        );
+    }
+
     fn unsealed_table_stats(&self) -> Vec<TableStat> {
         // `db.table` -> numeric id, so a table's mappings can be charged to it.
         // One catalog read for the whole round rather than a lookup per table:
@@ -532,6 +656,8 @@ impl Engine {
                     key: key.clone(),
                     table_id,
                     footprint,
+                    unsealed: (entry.unsealed_bytes() + memindex) as u64,
+                    mapped: mapped_bytes,
                     last_ts,
                     last_attempt_ts: entry.last_attempt_ts,
                     dump_failures: entry.dump_failures,

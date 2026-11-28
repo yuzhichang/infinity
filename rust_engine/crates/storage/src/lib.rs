@@ -64,6 +64,182 @@ pub fn page_size() -> usize {
     4096
 }
 
+/// A process's resident memory, split into its parts where the platform
+/// publishes a split.
+///
+/// Lives here rather than in the executor because every part of it is a
+/// platform question - which `/proc` file to read, which `task_info` flavour to
+/// ask for, which Windows counter to look at - and this crate is where the
+/// other platform probes live (`page_size`, `physical_memory_bytes`). The
+/// executor only formats the result.
+///
+/// **Per platform:**
+///
+/// * **Linux** - `/proc/self/status` publishes `VmRSS` with `RssAnon`,
+///   `RssFile` and `RssShmem`; all four fields are real.
+/// * **macOS** - `task_info(TASK_BASIC_INFO)` publishes the total
+///   (`resident_size`) only. The parts would need `TASK_VM_INFO`'s ledger
+///   fields, which are not a stable ABI.
+/// * **Windows** - `GetProcessMemoryInfo` reports `WorkingSetSize`; the
+///   identity `working set = private + shareable` is not exposed.
+///
+/// Where the split is missing, [`RssSplit::has_split`] is false and a log line
+/// prints the total without inventing a breakdown - `Anon=0` would read as a
+/// measurement rather than as a missing one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RssSplit {
+    /// The resident total: `VmRSS` / `resident_size` / `WorkingSetSize`.
+    pub vm_rss: u64,
+    /// Anonymous (heap) resident bytes; 0 when `has_split` is false.
+    pub rss_anon: u64,
+    /// File-backed resident bytes - the page cache behind the engine's
+    /// mappings; 0 when `has_split` is false.
+    pub rss_file: u64,
+    /// Shared-memory resident bytes; 0 when `has_split` is false.
+    pub rss_shmem: u64,
+    /// Whether the three parts are real or merely absent. A flag, not "all
+    /// zero": a process with no shared memory has `RssShmem == 0` on Linux too.
+    pub has_split: bool,
+}
+
+impl std::fmt::Display for RssSplit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const MIB: u64 = 1024 * 1024;
+        if self.has_split {
+            write!(
+                f,
+                "VmRSS={} MiB (Anon={} File={} Shmem={})",
+                self.vm_rss / MIB,
+                self.rss_anon / MIB,
+                self.rss_file / MIB,
+                self.rss_shmem / MIB
+            )
+        } else {
+            write!(
+                f,
+                "VmRSS={} MiB (no split on this platform)",
+                self.vm_rss / MIB
+            )
+        }
+    }
+}
+
+/// The process's resident memory, split where the platform allows it. See
+/// [`RssSplit`].
+#[cfg(target_os = "linux")]
+pub fn process_rss_split() -> RssSplit {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        // No `/proc/self/status`: fall back to `statm`'s resident page count,
+        // the same fallback the executor's own reader uses.
+        let pages = std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|statm| {
+                statm
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        return RssSplit {
+            vm_rss: pages * page_size() as u64,
+            ..Default::default()
+        };
+    };
+    let mut split = RssSplit::default();
+    for line in status.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let kb: u64 = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        match key {
+            "VmRSS" => split.vm_rss = kb * 1024,
+            "RssAnon" => split.rss_anon = kb * 1024,
+            "RssFile" => split.rss_file = kb * 1024,
+            "RssShmem" => split.rss_shmem = kb * 1024,
+            _ => {}
+        }
+    }
+    // The three `Rss*` lines arrived together in Linux 4.5; their presence is
+    // what says the split is there, not a non-zero value.
+    split.has_split = status.contains("RssAnon:");
+    split
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn process_rss_split() -> RssSplit {
+    const TASK_BASIC_INFO: u32 = 4;
+    const TASK_BASIC_INFO_COUNT: u32 = 10;
+    let mut info = libc::mach_task_basic_info {
+        virtual_size: 0,
+        resident_size: 0,
+        resident_size_max: 0,
+        user_time: libc::time_value_t {
+            seconds: 0,
+            microseconds: 0,
+        },
+        system_time: libc::time_value_t {
+            seconds: 0,
+            microseconds: 0,
+        },
+        policy: 0,
+        suspend_count: 0,
+    };
+    let mut count: libc::mach_msg_type_number_t = TASK_BASIC_INFO_COUNT;
+    // SAFETY: `info` is a local of the type `TASK_BASIC_INFO` writes and
+    // `count` is its word count - exactly what the call expects.
+    let kr = unsafe {
+        libc::task_info(
+            libc::mach_task_self_,
+            TASK_BASIC_INFO,
+            &mut info as *mut _ as libc::task_info_t,
+            &mut count,
+        )
+    };
+    RssSplit {
+        vm_rss: if kr == libc::KERN_SUCCESS {
+            info.resident_size
+        } else {
+            0
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn process_rss_split() -> RssSplit {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `counters` is a correctly sized local; the pseudo-handle from
+    // `GetCurrentProcess` is not owned and needs no closing.
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    RssSplit {
+        vm_rss: if ok != 0 {
+            counters.WorkingSetSize as u64
+        } else {
+            0
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn process_rss_split() -> RssSplit {
+    RssSplit::default()
+}
+
 /// Total physical memory reported by the operating system, in bytes.
 #[cfg(unix)]
 #[allow(unsafe_code)]

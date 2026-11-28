@@ -579,6 +579,40 @@ awk '/^[0-9a-f]+-[0-9a-f]+/ {seg=$0; rss=0} /^Rss:/ {rss+=$2; if (seg!="") {prin
 
 ---
 
+## 11.5 回收计划的可观测性（已实现）
+
+回收决策原本只体现在 RSS 曲线上——"进程掉了 2 GiB"说不清是哪个杠杆做的，而 `RssAnon`（分配器堆）与 `RssFile`（映射页缓存）因完全不同的原因变化。
+
+现在每一轮在**确定候选集之后**打一条 info，记录三组数字：
+
+```
+info: reclaim plan: N table(s) hold unsealed data or mappings, M selected (round cap C);
+     now VmRSS=.. MiB (Anon=.. File=.. Shmem=..)  unsealed=.. mapped=..;
+     selected unsealed=.. mapped=..; projected <same split> minus >= ..
+info: reclaim plan:   db.table unsealed=.. mapped=.. age=.. ts id=..
+info: reclaim plan: goals unsealed<=.. (quota/2) and mapped+unsealed<=.. (rss_quota*70%)
+info: reclaim result: K table(s) dumped; after VmRSS=.. (Anon=.. File=.. Shmem=..)  unsealed=.. mapped=..
+```
+
+- **现在的 RSS 分项**是"因"，**selected 的 unsealed/mapped** 是"计划"，**result 的分项**是"果"。三者对齐才能判断某个杠杆是否真的生效。
+- 每张被选中的表单独一行，`unsealed` 与 `mapped` **分开**：dump 释放前者，丢映射释放后者，混在一起就无法归因。
+- 目标阈值也打印，读日志不必回查配置。
+- `projected ... minus >= X` 是**释放量的上界**：映射释放对空闲表是无条件的，而 unsealed 只有在表的所有行都能在本轮 bound 前提交时才兑现；staging import 会留尾巴。
+
+### 跨平台的 RSS 分项
+
+`storage::RssSplit` + `storage::process_rss_split()`，与 `page_size` / `physical_memory_bytes` 放在一起（平台探针都归 storage）：
+
+| 平台 | 来源 | 分项 |
+|---|---|---|
+| Linux | `/proc/self/status` 的 `VmRSS`/`RssAnon`/`RssFile`/`RssShmem` | 全部真实 |
+| macOS | `task_info(TASK_BASIC_INFO)` 的 `resident_size` | **只有总数**（分项要 `TASK_VM_INFO` 的 ledger 字段，非稳定 ABI） |
+| Windows | `GetProcessMemoryInfo` 的 `WorkingSetSize` | **只有总数**（`working set = private + shareable` 未暴露） |
+
+`has_split` 是一个**独立的布尔**而不是"三个字段都为零"：Linux 上无共享内存的进程 `RssShmem` 也是 0，靠值区分不了"没有"和"不报"。没有分项时 `Display` 打印 `(no split on this platform)`，不会打出 `Anon=0 File=0` 这种像测量结果的假数据。
+
+Linux 上 `the_resident_split_adds_up_where_the_platform_has_one` 断言 `Anon + File + Shmem == VmRSS`——内核恒等式，这行日志的可用性就建立在这上面。
+
 ## 12. 实施完成
 
 五个阶段全部落地，提交依次为：
