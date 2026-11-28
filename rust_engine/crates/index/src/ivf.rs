@@ -26,14 +26,159 @@
 
 use crate::vector::l2_sq;
 
+/// One centroid's assigned vectors: a parallel offset array plus the vectors
+/// themselves.
+///
+/// Two layouts for the same thing. A chunk being **built** owns both arrays. A
+/// chunk being **loaded** points them at the chunk's mapping: the on-disk form
+/// is `[count][offsets…][dims × f32, row-major]`, with each region contiguous
+/// and 4-byte aligned, so there is nothing to decode. That is the same shape the
+/// HNSW loader takes (`docs/MAP_MANAGER_PLAN.md` §13.2) - without it an IVF
+/// chunk cost one `Vec<f32>` per vector, which no mapping reclaim could ever
+/// give back.
+#[derive(Default)]
+pub struct IvfPart {
+    offsets: PassThrough<u32>,
+    vectors: PassThrough<f32>,
+}
+
+impl IvfPart {
+    /// A part held in the heap (a chunk being built).
+    pub fn owned(offsets: Vec<u32>, vectors: Vec<f32>) -> Self {
+        Self {
+            offsets: PassThrough::Owned(offsets),
+            vectors: PassThrough::Owned(vectors),
+        }
+    }
+
+    /// A part pointing into a mapped chunk.
+    ///
+    /// `offsets` and `vectors` are windows of the same mapping; `dims` is what
+    /// separates one vector from the next.
+    pub fn mapped(offsets: PassThrough<u32>, vectors: PassThrough<f32>, dims: usize) -> Self {
+        let _ = dims;
+        Self { offsets, vectors }
+    }
+
+    pub fn offsets(&self) -> &[u32] {
+        self.offsets.as_slice()
+    }
+
+    /// The `index`-th vector, or `None` past the end.
+    pub fn vector(&self, index: usize, dims: usize) -> Option<&[f32]> {
+        self.vectors
+            .as_slice()
+            .get(index * dims..index * dims + dims)
+    }
+
+    /// Every `(offset, vector)` in this part.
+    pub fn iter(&self, dims: usize) -> impl Iterator<Item = (u32, &[f32])> + '_ {
+        self.offsets
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, offset)| self.vector(i, dims).map(|vector| (*offset, vector)))
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.as_slice().len()
+    }
+
+    /// Whether both arrays are windows into the chunk mapping rather than won
+    /// allocations. A test asserts on this: comparing the vectors would pass for
+    /// either layout.
+    pub fn is_mapped(&self) -> bool {
+        self.offsets.is_mapped() && self.vectors.is_mapped()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A `T` array that is either owned or a window into a mapped chunk.
+///
+/// The same two-layout idea as `plaid::MappedSlice`, kept local because an IVF
+/// part needs its offsets and vectors to live in *separate* windows while still
+/// naming one owner.
+pub enum PassThrough<T> {
+    Owned(Vec<T>),
+    Mapped(MappedWindow<T>),
+}
+
+impl<T> Default for PassThrough<T> {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl<T: bytemuck::Pod> PassThrough<T> {
+    pub fn as_slice(&self) -> &[T] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped(w) => w.as_slice(),
+        }
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped(_))
+    }
+}
+
+impl<T: bytemuck::Pod> std::ops::Deref for PassThrough<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+/// A `T` window inside a mapped chunk: the owner, the byte range, and the
+/// element type's alignment.
+pub struct MappedWindow<T> {
+    owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+    range: std::ops::Range<usize>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: bytemuck::Pod> MappedWindow<T> {
+    /// A window over `range` of `owner`, or `None` when the range is not a whole
+    /// number of `T`s or is misaligned for one.
+    pub fn new(
+        owner: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+        range: std::ops::Range<usize>,
+    ) -> Option<Self> {
+        let len = range.end.checked_sub(range.start)?;
+        if len % std::mem::size_of::<T>() != 0 {
+            return None;
+        }
+        let bytes = owner.as_ref().as_ref();
+        let slice = bytes.get(range.clone())?;
+        // `try_cast_slice` refuses a misaligned slice rather than reading it:
+        // the IVF chunk's regions follow 4-byte counts, so a `f32` window is
+        // aligned but a `u64` one would not be.
+        bytemuck::try_cast_slice::<u8, T>(slice).ok()?;
+        Some(Self {
+            owner,
+            range,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        let bytes = &self.owner.as_ref().as_ref()[self.range.clone()];
+        bytemuck::cast_slice(bytes)
+    }
+}
+
 /// One IVF chunk in memory (plain storage).
 pub struct IvfIndex {
     pub dims: usize,
-    /// `centroid_count * dims` floats, row-major.
-    pub centroids: Vec<f32>,
+    /// `centroid_count * dims` floats, row-major. A window when loaded.
+    pub centroids: PassThrough<f32>,
     pub centroid_count: usize,
-    /// Per centroid: `(segment_offset, vector)` for every assigned embedding.
-    pub parts: Vec<Vec<(u32, Vec<f32>)>>,
+    /// Per centroid: its assigned embeddings.
+    pub parts: Vec<IvfPart>,
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -45,16 +190,49 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 impl IvfIndex {
-    pub fn new(
+    /// A chunk whose centroid table and parts are all in the heap.
+    ///
+    /// The build path's entry point. A loaded chunk uses [`Self::new`] with
+    /// windows instead, so neither layout has to know about the other.
+    pub fn from_owned(
         dims: usize,
         centroid_count: usize,
         centroids: Vec<f32>,
         parts: Vec<Vec<(u32, Vec<f32>)>>,
     ) -> Self {
+        Self::new(
+            dims,
+            centroid_count,
+            PassThrough::Owned(centroids),
+            parts
+                .into_iter()
+                .map(|part| {
+                    let mut offsets = Vec::with_capacity(part.len());
+                    let mut vectors = Vec::with_capacity(part.len() * dims);
+                    for (offset, vector) in part {
+                        offsets.push(offset);
+                        vectors.extend_from_slice(&vector);
+                    }
+                    IvfPart::owned(offsets, vectors)
+                })
+                .collect(),
+        )
+    }
+
+    /// A chunk from its centroid table and parts.
+    ///
+    /// Both may be owned (the build path) or windows into a mapped chunk (the
+    /// load path); the caller decides, and nothing here copies either way.
+    pub fn new(
+        dims: usize,
+        centroid_count: usize,
+        centroids: PassThrough<f32>,
+        parts: Vec<IvfPart>,
+    ) -> Self {
         Self {
             dims,
-            centroids,
             centroid_count,
+            centroids,
             parts,
         }
     }
@@ -115,15 +293,15 @@ impl IvfIndex {
         let mut hits: Vec<(u32, f32)> = Vec::new();
         for (c, _) in centroids.into_iter().take(nprobe) {
             if let Some(part) = self.parts.get(c) {
-                for (offset, vector) in part {
+                for (offset, vector) in part.iter(self.dims) {
                     // `SatisfyFilter` before `AddResult`: a rejected row never
                     // fills a slot, so the top-k stays exact among the admitted
                     // rows instead of being truncated and then filtered.
-                    if allowed.is_some_and(|mask| !mask.contains(u64::from(*offset))) {
+                    if allowed.is_some_and(|mask| !mask.contains(u64::from(offset))) {
                         continue;
                     }
                     if vector.len() == self.dims {
-                        hits.push((*offset, self.score(query, vector, metric)));
+                        hits.push((offset, self.score(query, vector, metric)));
                     }
                 }
             }
@@ -412,13 +590,17 @@ impl IvfSegment {
         match self {
             Self::Plain(index) => {
                 vec_bytes(index.centroids.len(), 4)
+                    // Only an owned part costs heap; a mapped one is a window
+                    // into the chunk, and `heap_bytes` reports what the engine
+                    // allocates, not what it maps.
                     + index
                         .parts
                         .iter()
+                        .filter(|part| !part.is_mapped())
                         .map(|part| {
                             vec_bytes(part.len(), std::mem::size_of::<(u32, Vec<f32>)>())
                                 + part
-                                    .iter()
+                                    .iter(index.dims)
                                     .map(|(_, v)| vec_bytes(v.len(), 4))
                                     .sum::<usize>()
                         })
@@ -488,7 +670,7 @@ impl IvfSegment {
             IvfSegment::Plain(index) => index
                 .parts
                 .iter()
-                .flat_map(|p| p.iter().map(|(offset, _)| *offset))
+                .flat_map(|p| p.offsets().iter().copied())
                 .collect(),
             IvfSegment::Scalar(index) => index.offsets().collect(),
             IvfSegment::Product(index) => index.offsets().collect(),
@@ -855,7 +1037,7 @@ mod tests {
 
     fn sample() -> IvfIndex {
         // Two centroids; the first owns vectors near [1, 0], the second [0, 1].
-        IvfIndex::new(
+        IvfIndex::from_owned(
             2,
             2,
             vec![1.0, 0.0, 0.0, 1.0],

@@ -844,6 +844,25 @@ impl MappedGraph {
         self.max_layer
     }
 
+    /// How many layers above level 0 `node` appears in, read from its level-0
+    /// record.
+    ///
+    /// The count is the first `i32` of that record (`GraphGeometry`'s layout:
+    /// `count` then `layers_p`, then the ids), so it is available without
+    /// decoding anything - which is what lets a loaded index answer `level_of`
+    /// without a per-node `Vec`.
+    fn layer_count(&self, node: usize) -> usize {
+        let bytes = self.bytes();
+        let Some(record) = node.checked_mul(self.l0_stride) else {
+            return 0;
+        };
+        let at = 8 + record;
+        let Some(raw) = bytes.get(at..at + 4) else {
+            return 0;
+        };
+        i32::from_le_bytes(raw.try_into().expect("4 bytes")).max(0) as usize
+    }
+
     fn bytes(&self) -> &[u8] {
         &self.backing.as_ref().as_ref()[self.region_at..]
     }
@@ -1168,8 +1187,20 @@ impl HnswIndex {
     }
 
     /// How many layers above level 0 `node` appears in.
+    ///
+    /// A **building** index keeps this in `levels`; a **loaded** one does not
+    /// keep it at all - the count is the first field of the vertex's level-0
+    /// record, so it is read out of the mapping. That is why a loaded chunk has
+    /// no per-node heap beyond the graph itself: `levels` is empty and this
+    /// answer costs four bytes of a page that is already resident.
     pub fn level_of(&self, node: usize) -> usize {
-        self.levels.get(node).copied().unwrap_or(0)
+        if let Some(level) = self.levels.get(node) {
+            return *level;
+        }
+        if let GraphLinks::Mapped(graph) = &self.flat_links {
+            return graph.layer_count(node);
+        }
+        0
     }
 
     /// Neighbours of `node` on `layer` (empty when absent).

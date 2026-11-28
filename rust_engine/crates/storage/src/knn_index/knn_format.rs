@@ -718,6 +718,87 @@ pub fn decode_ivf_plain_chunk(
     Ok((header, centroids, parts))
 }
 
+/// One part of a plain IVF chunk, as **byte ranges** instead of copies.
+///
+/// The on-disk form is `[count u32][offsets u32 × n][dims × f32 × n]`, each
+/// region contiguous and 4-byte aligned, so a reader can point at them - which
+/// is what a mapped chunk should do. `decode_ivf_plain_chunk` copies for the
+/// build path; this reports where the data already is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvfPlainPartRange {
+    /// Window of the part's `segment_offsets`.
+    pub offsets: std::ops::Range<usize>,
+    /// Window of the part's vector bytes.
+    pub vectors: std::ops::Range<usize>,
+}
+
+/// A plain IVF chunk as ranges, plus the header and the centroid region.
+///
+/// Same layout as [`decode_ivf_plain_chunk`], no copy. `bytes` must be the
+/// chunk's own bytes; the caller keeps the mapping alive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvfPlainChunkRanges {
+    pub header: IvfChunkHeader,
+    /// Window of `centroid_count * dimension` `f32`s.
+    pub centroids: std::ops::Range<usize>,
+    pub parts: Vec<IvfPlainPartRange>,
+}
+
+/// Locates the regions [`decode_ivf_plain_chunk`] would copy out of, rejecting
+/// a truncated chunk the same way it does.
+pub fn ivf_plain_chunk_ranges(
+    bytes: &[u8],
+    element_size: usize,
+) -> Result<IvfPlainChunkRanges, FormatError> {
+    let short = |need: usize| FormatError::Truncated {
+        need,
+        got: bytes.len(),
+    };
+    if bytes.len() < 16 {
+        return Err(short(16));
+    }
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let header = IvfChunkHeader {
+        row_count: u32_at(0),
+        embedding_count: u32_at(4),
+        dimension: u32_at(8),
+        centroid_count: u32_at(12),
+    };
+    let centroid_floats = header.centroid_count as usize * header.dimension as usize;
+    let mut at = 16;
+    if bytes.len() < at + centroid_floats * 4 {
+        return Err(short(at + centroid_floats * 4));
+    }
+    let centroids = at..at + centroid_floats * 4;
+    at += centroid_floats * 4;
+
+    let mut parts = Vec::with_capacity(header.centroid_count as usize);
+    for _ in 0..header.centroid_count {
+        if bytes.len() < at + 4 {
+            return Err(short(at + 4));
+        }
+        let n = u32_at(at) as usize;
+        at += 4;
+        if bytes.len() < at + n * 4 {
+            return Err(short(at + n * 4));
+        }
+        let offsets = at..at + n * 4;
+        at += n * 4;
+        let vec_len = n * header.dimension as usize * element_size;
+        if bytes.len() < at + vec_len {
+            return Err(short(at + vec_len));
+        }
+        let vectors = at..at + vec_len;
+        at += vec_len;
+        parts.push(IvfPlainPartRange { offsets, vectors });
+    }
+    Ok(IvfPlainChunkRanges {
+        header,
+        centroids,
+        parts,
+    })
+}
+
 /// One scalar-quantized part (spec §9.2 `kScalarQuantization`): the shared
 /// `common_vec_a`/`common_vec_b` live in the chunk base, each part carries its
 /// quantized codes plus their dot product with the query vector.

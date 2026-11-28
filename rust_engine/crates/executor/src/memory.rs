@@ -639,14 +639,9 @@ impl super::Engine {
             );
         }
         if forced {
-            let spann = self.spann_release_pages_forced() as u64;
-            released += spann;
-            if spann > 0 {
-                eprintln!(
-                    "info: reclaim lever: dropped {} of SPANN pages",
-                    crate::engine::reclaim::human_bytes(spann)
-                );
-            }
+            // No separate SPANN page release: a SPANN chunk is a mapping like
+            // any other and `release_mapped_pages` above already advised every
+            // mapping in the registry (`docs/MAP_MANAGER_PLAN.md` §13.2).
             // Pure copies: a query that needs them recomputes them.
             let cached = self.result_cache.lock().unwrap().len();
             self.result_cache.lock().unwrap().clear();
@@ -664,89 +659,27 @@ impl super::Engine {
         released
     }
 
-    /// Steps 4-5: unmapping idle block mappings, then evicting reloadable table
-    /// caches. Shared by both calls of [`Self::reclaim_cheap_levers`].
+    /// Step 4: unmapping idle block mappings. Shared by both calls of
+    /// [`Self::reclaim_cheap_levers`].
     ///
     /// `already` is what the steps above released; the target is "meet `want`,
     /// or get under the low watermark, whichever asks for more".
+    ///
+    /// This used to have a second step - evicting decoded table caches - which
+    /// is gone: the loaded HNSW chunk keeps its vectors, graph, labels and
+    /// levels in the mapping, the IVF segment's parts are mapping windows, and
+    /// the decoded row cache no longer exists
+    /// (`docs/MAP_MANAGER_PLAN.md` §13.2). There is nothing left in those caches
+    /// that is not page cache.
     fn escalate(&self, already: u64, want: u64, forced: bool) -> u64 {
         let (_, cgroup) = cgroup_snapshot();
         let pressure = self.measure_pressure(cgroup.as_ref());
         if !(forced || pressure != Pressure::Ok || already < want) {
             return 0;
         }
-        let mut released = 0u64;
         let over = self.memory_usage().saturating_sub(self.memory_low());
         let remaining = want.saturating_sub(already).max(over);
-        released += self.release_idle_mappings(remaining as usize) as u64;
-        if forced || pressure != Pressure::Ok {
-            let over = self.memory_usage().saturating_sub(self.memory_low());
-            let remaining = want
-                .saturating_sub(already.saturating_add(released))
-                .max(over);
-            if remaining > 0 {
-                let evicted = self.evict_table_caches(remaining as usize, forced) as u64;
-                if evicted > 0 {
-                    released += evicted;
-                    storage::trim_allocator();
-                }
-            }
-        }
-        released
-    }
-
-    /// Evicts reloadable table-level caches (`row_cache`, decoded HNSW chunk
-    /// graphs in `vector`, and when `forced`, decoded `ivf` segments) up to
-    /// `want` bytes. Dropped `Arc`s are collected and freed outside `self.tables`
-    /// so concurrent readers/writers are not stalled during deallocation.
-    fn evict_table_caches(&self, want: usize, forced: bool) -> usize {
-        if want == 0 {
-            return 0;
-        }
-        let mut freed = 0usize;
-        let mut dropped_vectors = Vec::new();
-        let mut dropped_ivf = Vec::new();
-        {
-            let mut tables = self.tables.lock().unwrap();
-            for entry in tables.values_mut() {
-                if freed >= want {
-                    break;
-                }
-                let mut empty_ids = Vec::new();
-                for (&id, list) in &mut entry.vector {
-                    while freed < want {
-                        let Some(chunk) = list.pop() else {
-                            break;
-                        };
-                        freed = freed.saturating_add(chunk.bytes);
-                        dropped_vectors.push(chunk);
-                    }
-                    if list.is_empty() {
-                        empty_ids.push(id);
-                    }
-                    if freed >= want {
-                        break;
-                    }
-                }
-                for id in empty_ids {
-                    entry.vector.remove(&id);
-                }
-            }
-            if forced && freed < want {
-                for entry in tables.values_mut() {
-                    if !entry.ivf.is_empty() {
-                        dropped_ivf.push(std::mem::take(&mut entry.ivf));
-                    }
-                }
-            }
-        }
-        let had_ivf = !dropped_ivf.is_empty();
-        drop(dropped_vectors);
-        drop(dropped_ivf);
-        if freed == 0 && had_ivf {
-            return 1;
-        }
-        freed
+        self.release_idle_mappings(remaining as usize) as u64
     }
 
     /// The low watermark: the level a pass reclaims down to. `0` when no

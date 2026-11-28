@@ -2874,6 +2874,56 @@ mod tests {
         assert_eq!(back[2], (2, vec![7.0, 8.0, 9.0]));
     }
 
+    /// A loaded chunk reports a per-vertex level, read from the mapping.
+    ///
+    /// `level_of` is the one figure a loaded index used to keep in the heap
+    /// (`n * 8` bytes per chunk). It now reads the count from the vertex's
+    /// level-0 record, so this asserts two things a wrong offset would break:
+    /// some vertex is on an upper layer (with every level 0 an offset of zero
+    /// would pass), and every level is within the graph's own maximum.
+    #[tokio::test]
+    async fn a_loaded_hnsw_chunk_reports_levels_from_its_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open_async(dir.path(), Default::default())
+            .await
+            .unwrap();
+        engine
+            .execute("CREATE TABLE lv (id INT, v EMBEDDING(FLOAT,4));")
+            .await
+            .unwrap();
+        // Enough rows that the graph has upper layers.
+        let values: Vec<String> = (0..500)
+            .map(|i| format!("({i},[{i}.0,{}.0,{}.0,{}.0])", i + 1, i + 2, i + 3))
+            .collect();
+        engine
+            .execute(&format!("INSERT INTO lv VALUES {};", values.join(",")))
+            .await
+            .unwrap();
+        engine
+            .execute("CREATE INDEX lv_idx ON lv (v) USING HNSW;")
+            .await
+            .unwrap();
+        engine.write_hnsw_index("lv", "lv_idx").await.unwrap();
+
+        let loaded = engine.load_vector_index("lv", "lv_idx").unwrap();
+        let index = loaded.index.index();
+        let max_level = index.max_level();
+        assert!(max_level > 0, "the graph has no upper layer to report");
+        let levels: Vec<usize> = (0..loaded.labels.len())
+            .map(|node| index.level_of(node))
+            .collect();
+        assert!(
+            levels.iter().any(|level| *level > 0),
+            "every vertex reads level 0, so a wrong offset would go unnoticed"
+        );
+        assert!(
+            levels.iter().all(|level| *level <= max_level),
+            "a level above the graph's maximum means the record was misread: {levels:?}"
+        );
+        // A vertex past the graph reports nothing rather than panicking.
+        assert_eq!(index.level_of(loaded.labels.len() + 10), 0);
+    }
+
     #[tokio::test]
     async fn a_persisted_hnsw_index_answers_vector_search() {
         let dir = tempfile::tempdir().unwrap();
@@ -2956,6 +3006,34 @@ mod tests {
                 (2, vec![10.0, 10.0]),
                 (3, vec![10.0, 11.0]),
             ]
+        );
+
+        // The values above come back either way - a copy and a window hold the
+        // same numbers - so the layout itself is asserted here. A loaded plain
+        // chunk must point into the mapping: one `Vec<f32>` per vector is
+        // exactly what this loader exists to avoid
+        // (`docs/MAP_MANAGER_PLAN.md` §13.2).
+        let segments = engine.load_ivf_indexes("iv", "iv_idx");
+        assert_eq!(segments.len(), 1, "one chunk was dumped");
+        match &segments[0] {
+            index::ivf::IvfSegment::Plain(plain) => {
+                assert!(!plain.parts.is_empty(), "the chunk has no parts to check");
+                for (at, part) in plain.parts.iter().enumerate() {
+                    assert!(part.is_mapped(), "part {at} was copied instead of mapped");
+                }
+                assert!(
+                    plain.centroids.is_mapped(),
+                    "the centroid table was copied instead of mapped"
+                );
+            }
+            _ => panic!("plain storage must load as an IvfSegment::Plain"),
+        }
+        // And the decoded form costs no heap: `heap_bytes` reports what the
+        // engine allocates, so a mapped chunk reports only its part headers.
+        assert!(
+            segments[0].heap_bytes() < 4096,
+            "a mapped chunk must hold no per-vector heap: {} bytes",
+            segments[0].heap_bytes()
         );
     }
 

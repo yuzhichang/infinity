@@ -8095,22 +8095,12 @@ impl Engine {
         // offsets for layer 0 count every vertex, so the level is one less than
         // the number of layers whose offset grew at this node.
         // The chunk has no level array: a vertex's level is how many upper
-        // layers its record reaches, which the geometry can answer from the
-        // mapping directly.
-        let levels: Vec<usize> = (0..parts.n)
-            .map(|node| {
-                let bytes = backing.as_ref().as_ref();
-                let mut level = 0usize;
-                while parts
-                    .graph
-                    .upper_record(node, level + 1, &bytes[parts.graph_at..])
-                    .is_some()
-                {
-                    level += 1;
-                }
-                level
-            })
-            .collect();
+        // No per-node level vector: `HnswIndex::level_of` reads the count out of
+        // the vertex's level-0 record, which is in the mapping. Building this
+        // `Vec<usize>` was `n * 8` bytes of heap per chunk and one walk of every
+        // vertex's layers at load, for an answer four bytes of page already
+        // carried (`docs/MAP_MANAGER_PLAN.md` §13.2).
+        let levels: Vec<usize> = Vec::new();
         let entry = parts.enterpoint.map(|e| e.min(parts.n.saturating_sub(1)));
         // The flat region is already the CSR the index searches with, so it is
         // moved straight in. Rebuilding a nested `Vec<Vec<Vec<usize>>>` here
@@ -8118,7 +8108,10 @@ impl Engine {
         // The adjacency is mapped, not held, so it costs no heap; the figure is
         // only for the buffer budget's accounting.
         let graph_bytes = parts.graph.len;
-        let bytes = parts.records.len() + parts.labels.len() * 4 + levels.len() * 8 + graph_bytes;
+        // The charge is what the chunk *maps*: records, labels and the graph
+        // region. `levels` is gone, and every other byte here is page cache
+        // behind the mapping rather than heap.
+        let bytes = parts.records.len() + parts.labels.len() * 4 + graph_bytes;
         let index = HnswIndex::from_chunk_parts(
             parts.dims,
             parts.m.max(1) as usize,
@@ -8798,7 +8791,22 @@ impl Engine {
         let Some(index_id) = self.index_position(table, index_name).ok() else {
             return Vec::new();
         };
+        let plain = !options.storage.eq_ignore_ascii_case("scalar_quantization")
+            && !options.storage.eq_ignore_ascii_case("product_quantization");
         for (_, _, path) in self.catalog_index_files(table, index_id as u64) {
+            if plain {
+                // A plain chunk is `[header][centroids][count|offsets|vectors]…`
+                // with every region contiguous and 4-byte aligned, so the
+                // segment can point at the mapping instead of decoding it. That
+                // is the difference between one `Vec<f32>` per vector and none
+                // (`docs/MAP_MANAGER_PLAN.md` §13.2).
+                if let Some(segment) = Self::open_ivf_plain_chunk_mapped(&path) {
+                    out.push(segment);
+                    continue;
+                }
+                // A chunk this cannot map (unreadable, or a layout the ranges
+                // reject) falls back to the decoding path below.
+            }
             let Ok(bytes) = storage::chunk_store::read_file(&path) else {
                 continue;
             };
@@ -8814,43 +8822,95 @@ impl Engine {
                 }
                 continue;
             }
-            let Ok((header, flat, parts)) = knn_format::decode_ivf_plain_chunk(&bytes, 4) else {
-                continue;
-            };
-            let dims = header.dimension as usize;
-            if dims == 0 {
-                continue;
+            if let Some(segment) = Self::decode_ivf_plain_chunk(&bytes) {
+                out.push(segment);
             }
-            let parts: Vec<Vec<(u32, Vec<f32>)>> = parts
-                .into_iter()
-                .map(|part| {
-                    part.segment_offsets
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, offset)| {
-                            let at = i * dims * 4;
-                            let vector = (0..dims)
-                                .map(|d| {
-                                    f32::from_le_bytes(
-                                        part.vectors[at + d * 4..at + d * 4 + 4]
-                                            .try_into()
-                                            .unwrap(),
-                                    )
-                                })
-                                .collect();
-                            (offset, vector)
-                        })
-                        .collect()
-                })
-                .collect();
-            out.push(index::ivf::IvfSegment::Plain(index::ivf::IvfIndex::new(
-                dims,
-                header.centroid_count as usize,
-                flat,
-                parts,
-            )));
         }
         out
+    }
+
+    /// Decodes a plain IVF chunk into the heap.
+    ///
+    /// The fallback for a chunk the mapping path cannot take (an unreadable
+    /// file, or a layout the range check rejects). Copies every vector, so it is
+    /// not the path a normal load takes.
+    fn decode_ivf_plain_chunk(bytes: &[u8]) -> Option<index::ivf::IvfSegment> {
+        use index::ivf::{IvfIndex, IvfSegment};
+        let (header, flat, parts) = storage::knn_format::decode_ivf_plain_chunk(bytes, 4).ok()?;
+        let dims = header.dimension as usize;
+        if dims == 0 {
+            return None;
+        }
+        let parts: Vec<Vec<(u32, Vec<f32>)>> = parts
+            .into_iter()
+            .map(|part| {
+                part.segment_offsets
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, offset)| {
+                        let at = i * dims * 4;
+                        let vector = (0..dims)
+                            .map(|d| {
+                                f32::from_le_bytes(
+                                    part.vectors[at + d * 4..at + d * 4 + 4].try_into().unwrap(),
+                                )
+                            })
+                            .collect();
+                        (offset, vector)
+                    })
+                    .collect()
+            })
+            .collect();
+        Some(IvfSegment::Plain(IvfIndex::from_owned(
+            dims,
+            header.centroid_count as usize,
+            flat,
+            parts,
+        )))
+    }
+
+    /// Maps a plain IVF chunk and points its parts at the mapping.
+    ///
+    /// The vectors and offsets stay in the page cache; the only allocation is
+    /// the `Vec` of parts itself (one per centroid), not one per vector.
+    fn open_ivf_plain_chunk_mapped(path: &std::path::Path) -> Option<index::ivf::IvfSegment> {
+        use index::ivf::{IvfIndex, IvfPart, IvfSegment, MappedWindow, PassThrough};
+        let map = storage::mapped::MappedFile::open(path).ok()?;
+        if map.is_empty() {
+            return None;
+        }
+        let backing: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = std::sync::Arc::new(map);
+        let bytes = backing.as_ref().as_ref();
+        // `element_size` is 4: a plain chunk stores `f32`.
+        let ranges = storage::knn_format::ivf_plain_chunk_ranges(bytes, 4).ok()?;
+        let dims = ranges.header.dimension as usize;
+        if dims == 0 {
+            return None;
+        }
+        let centroids = PassThrough::Mapped(MappedWindow::<f32>::new(
+            std::sync::Arc::clone(&backing),
+            ranges.centroids,
+        )?);
+        let mut parts = Vec::with_capacity(ranges.parts.len());
+        for part in ranges.parts {
+            parts.push(IvfPart::mapped(
+                PassThrough::Mapped(MappedWindow::<u32>::new(
+                    std::sync::Arc::clone(&backing),
+                    part.offsets,
+                )?),
+                PassThrough::Mapped(MappedWindow::<f32>::new(
+                    std::sync::Arc::clone(&backing),
+                    part.vectors,
+                )?),
+                dims,
+            ));
+        }
+        Some(IvfSegment::Plain(IvfIndex::new(
+            dims,
+            ranges.header.centroid_count as usize,
+            centroids,
+            parts,
+        )))
     }
 
     /// The index's IVF options (`IndexIVFStorageOption` + the centroid option),
