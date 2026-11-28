@@ -222,13 +222,15 @@ impl BlockVersion {
             create_size -= 1;
             is_modified = true;
         }
-        let created = self.created[..create_size]
-            .iter()
-            .map(|f| crate::format::VersionCreate {
-                create_ts: f.create_ts,
-                cumulative_row_count: f.row_count,
-            })
-            .collect();
+        let created = crate::format::CreatedRecords::Owned(
+            self.created[..create_size]
+                .iter()
+                .map(|f| crate::format::VersionCreate {
+                    create_ts: f.create_ts,
+                    cumulative_row_count: f.row_count,
+                })
+                .collect(),
+        );
         let deleted: Vec<TxnTimeStamp> = self
             .deleted
             .iter()
@@ -253,14 +255,15 @@ impl BlockVersion {
 
     /// C++: `BlockVersion::SpillToFile` — the serialized `version` file.
     pub fn spill_to_file(&self) -> Vec<u8> {
-        let created = self
-            .created
-            .iter()
-            .map(|f| crate::format::VersionCreate {
-                create_ts: f.create_ts,
-                cumulative_row_count: f.row_count,
-            })
-            .collect();
+        let created = crate::format::CreatedRecords::Owned(
+            self.created
+                .iter()
+                .map(|f| crate::format::VersionCreate {
+                    create_ts: f.create_ts,
+                    cumulative_row_count: f.row_count,
+                })
+                .collect(),
+        );
         BlockVersionFile {
             created,
             deleted: crate::format::DeletedSlots::Owned(self.deleted.clone()),
@@ -272,9 +275,8 @@ impl BlockVersion {
     pub fn load_from_file(bytes: &[u8]) -> Result<Self> {
         let file = BlockVersionFile::decode(bytes)
             .map_err(|e| Error::Storage(format!("block version file: {e:?}")))?;
-        let created = file
-            .created
-            .iter()
+        let created = (0..file.created.len())
+            .filter_map(|i| file.created.get(i))
             .map(|c| CreateField {
                 create_ts: c.create_ts,
                 row_count: c.cumulative_row_count,

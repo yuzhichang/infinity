@@ -3565,7 +3565,7 @@ impl Engine {
                 .map(|c| c.cumulative_row_count.max(0) as usize)
                 .unwrap_or(0);
             let mut seen = 0u64;
-            for create in &version.created {
+            for create in version.created.iter() {
                 let cumulative = create.cumulative_row_count.max(0) as u64;
                 let added = cumulative.saturating_sub(seen);
                 seen = cumulative;
@@ -4340,10 +4340,13 @@ impl Engine {
     /// How many rows of `version` exist at `read_ts` (`cumulative_row_count` of
     /// the newest `create` the reader can see).
     pub(crate) fn created_at(version: &BlockVersionFile, read_ts: u64) -> usize {
-        version
-            .created
-            .iter()
-            .rfind(|c| c.create_ts <= read_ts)
+        // Backwards, because the answer is the newest create that has landed -
+        // and a mapped section reads each record in place, so walking from the
+        // end touches only the ones this read_ts needed.
+        (0..version.created.len())
+            .rev()
+            .filter_map(|index| version.created.get(index))
+            .find(|c| c.create_ts <= read_ts)
             .map(|c| c.cumulative_row_count.max(0) as usize)
             .unwrap_or(0)
     }
@@ -4762,7 +4765,7 @@ impl Engine {
                 .map(|c| c.cumulative_row_count.max(0) as u64)
                 .unwrap_or(0);
             let mut seen = 0u64;
-            for create in &version.created {
+            for create in version.created.iter() {
                 let cumulative = create.cumulative_row_count.max(0) as u64;
                 let added = cumulative.saturating_sub(seen);
                 seen = cumulative;

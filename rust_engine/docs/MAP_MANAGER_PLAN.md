@@ -209,7 +209,27 @@ impl MapManager {
 
 **踩到的坑（重要）**：`DeletedSlots::get()` 对映射形态返回 `None`（拿不到引用），而 9 处可见性判断都写成 `deleted.get(slot).copied().unwrap_or(0) == 0` —— 于是映射块的墓碑全部读成"未删除"，`blocks_reconstruct_a_table_after_its_rows_are_deleted` 立刻抓到（删掉的行复活了）。现在所有可见性判断统一走 `stamp(slot)`，`get()` 的文档也写明它不能用于可见性判断。
 
-**实测收益**：每块堆占用从 64 KiB 降到 < 4 KiB（只剩 create 记录）；`a_sealed_block_is_mapped_once_and_shared` 断言了这两点，并额外断言映射里的槽位数，防止"读不到所以报得少"。
+**实测收益**：每块堆占用从 64 KiB 降到 0 —— `created` 也做成了映射（见下）。`a_sealed_block_is_mapped_once_and_shared` 断言 `heap_bytes() == 0`，并额外断言映射里的槽位数，防止"读不到所以报得少"。
+
+### 阶段 2.6：`created` 记录也零拷贝（已完成）
+
+`deleted` 之外还有一段：`created`（每个 append 一条，`{u64 ts, i64 cumulative}`）。它的**内存**很小，但代价是**每次开块的分配**。实测（release，`decode` 带分配 vs `decode_mapped`）：
+
+| appends | created 堆 | decode | decode_mapped |
+|---|---|---|---|
+| 1 | 16 B | 6465 ns | **37 ns** |
+| 8 | 128 B | 6394 ns | 39 ns |
+| 64 | 1 KiB | 6456 ns | 84 ns |
+| 128 | 2 KiB | 6518 ns | 146 ns |
+| 512 | 8 KiB | 6891 ns | 447 ns |
+
+改法与 `deleted` 同构：`CreatedRecords::{Owned, Mapped}`，`MappedCreates` 存 `(backing, offset, len)` 按需读；`VersionCreate` 加 `#[repr(C)] + Pod` 让磁盘布局显式。偏移同样是 4 字节对齐（create 段紧跟在 u16 计数后），继续用 `pod_read_unaligned`。
+
+`BlockVersionFile::heap_bytes()` 对映射形态报 0：一个读出来的块现在**完全**是页缓存。
+
+`locate_sections` 把"两个段在哪、各多长"从 `parse_header` 里分出来，映射形态因此不需要先解析出 `Vec` 再丢掉。
+
+调用侧需要一个 `CreatedRecords::iter()`（3 处 `for create in &version.created`）和一个从后往前的查找（`created_at` 原本用 `rfind`，改成倒序索引，对映射形态更自然）。
 
 ---
 

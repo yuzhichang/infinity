@@ -1110,10 +1110,10 @@ mod tests {
         // The `version` is mapped, not decoded into the heap: an 8192-slot
         // block's delete array alone is 64 KiB, and it used to be the largest
         // per-block heap charge. What remains is the handful of create records.
-        assert!(
-            first.heap_bytes() < 4096,
-            "the version must stay in the mapping, not the heap: {} bytes",
-            first.heap_bytes()
+        assert_eq!(
+            first.heap_bytes(),
+            0,
+            "a mapped version holds no heap: both sections are windows into the mapping"
         );
         // And the mapping really holds the delete array: a version whose slots
         // were never readable would also report a small heap, so the slot count
