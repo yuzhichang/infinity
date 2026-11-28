@@ -8686,7 +8686,17 @@ impl Engine {
                 source: e,
             })?;
             // `GetAndSetNextChunkID`: the counter, never a literal `chunk_0`.
-            let chunk_id = self.next_index_chunk_id(&set, &index_id.to_string(), segment);
+            // **Allocated atomically** (`take_next_chunk_id` takes a lock and
+            // bumps the tag in the same batch), so two seals of one segment
+            // cannot be handed the same id and overwrite each other's file.
+            // That is what let `dump_index_transaction` drop its global
+            // `flush_lock` for this step
+            // (`docs/MAP_MANAGER_PLAN.md` §13.3).
+            let chunk_id = self
+                .storage
+                .catalog
+                .take_next_chunk_id(&set.db_id, &set.table_id, index_id as u64, segment)
+                .unwrap_or_else(|_| self.next_index_chunk_id(&set, &index_id.to_string(), segment));
             let name = format!("chunk_{chunk_id}.idx");
             storage::definition::format::write_synced(&dir.join(&name), &chunk).map_err(|e| {
                 Error::Io {

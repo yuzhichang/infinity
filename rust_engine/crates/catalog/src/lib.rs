@@ -3000,6 +3000,45 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Two threads taking ids for one segment never get the same one.
+    ///
+    /// This is what lets an index dump seal without excluding every other dump:
+    /// the old code read the highest id on disk and added one, so two seals of
+    /// one segment chose the same `chunk_{id}.idx` and one write replaced the
+    /// other - which is why `dump_index_transaction` needed the global
+    /// `flush_lock` in write mode (`docs/MAP_MANAGER_PLAN.md` §13.3).
+    /// `take_next_chunk_id` raises the counter under a lock and in one batch, so
+    /// the exclusion belongs here and not around the whole seal.
+    #[test]
+    fn concurrent_chunk_id_allocation_never_repeats() {
+        let dir = tempdir().unwrap();
+        let store: Arc<dyn MetaStore> = Arc::new(RocksMetaStore::open(dir.path()).unwrap());
+        let c = Arc::new(Catalog::with_store_catalog_only(store));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = Arc::clone(&c);
+            handles.push(std::thread::spawn(move || {
+                let mut taken = Vec::new();
+                for _ in 0..16 {
+                    taken.push(c.take_next_chunk_id("1", "1", 7, 0).unwrap());
+                }
+                taken
+            }));
+        }
+        let mut all: Vec<u32> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let count = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            count,
+            "two seals were handed the same chunk id: {all:?}"
+        );
+    }
+
     #[test]
     fn cpp_only_catalog_writes_only_the_cpp_key_space() {
         let dir = tempdir().unwrap();

@@ -1509,14 +1509,18 @@ impl Engine {
             // the blocking leaf, and it runs on the blocking pool while the
             // lock is held.
             //
-            // **Exclusive, not read**: two dumps of one index must not run
-            // together. Each counts the files already on disk to pick its
-            // chunk's path, so two concurrent dumps of the same segment choose
-            // the same name and one write replaces the other - the index then
-            // misses rows the other dump had sealed. A read lock let that
-            // happen (dump and checkpoint only exclude each other, not two
-            // dumps), so this takes the same `write()` the checkpoint does.
-            let _serial = self.storage.flush_lock.write().await;
+            // **Read, not write**: what this guard has to exclude is the
+            // checkpoint's own chunk publication (`publish_spann_chunks`,
+            // `publish_plaid_chunks`), and those take the lock for writing. It
+            // used to be exclusive so that two dumps of one index could not pick
+            // the same file name - both counted the files on disk to choose a
+            // path. That race is gone at its cause: the id now comes from
+            // `take_next_chunk_id`, which bumps a counter under a lock and in one
+            // atomic batch, so two dumps get different ids without excluding
+            // each other (`docs/MAP_MANAGER_PLAN.md` §13.3). A read lock is what
+            // lets two different indexes of one bulk FLUSH seal concurrently -
+            // which the checkpoint's shared lock already allows.
+            let _serial = self.storage.flush_lock.read().await;
             // The decisive read, with imports excluded: `stage_import` holds
             // this lock to raise the marker, so a marker that is absent here
             // cannot appear before the seal finishes.
